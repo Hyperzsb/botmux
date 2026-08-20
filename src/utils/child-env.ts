@@ -368,6 +368,15 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   // CLI-specific non-interactive/resume startup controls.
   'CLAUDE_CODE_RESUME_TOKEN_THRESHOLD',
   'CJADK_INTERACTIVE',
+  // Per-user tool-auth isolation (HOME override). The worker sets this to the
+  // per-owner-identity tool HOME; buildBotmuxEnvAssignments re-emits it as an
+  // authoritative `HOME=<toolHome>` at the post-rcfile `/usr/bin/env` step so
+  // auxiliary tools (bytedcli / lark-cli / larkdev) resolve their auth per user.
+  // Being on this list makes tmuxEnv()/PANE_ENV_UNSET strip a stale value from the
+  // shared server global + pane. HOME itself is deliberately NOT listed (unsetting
+  // it before rcfile load would break rcfiles that read $HOME). See
+  // core/per-user-tool-home.ts.
+  'BOTMUX_TOOL_HOME',
 ] as const;
 
 /** Proxy env vars that must reach the CLI child process so it can dial the

@@ -89,6 +89,8 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'autoStartOnNewTopic', configKey: 'autoStartOnNewTopic', kind: 'boolean', effect: 'immediate', clearable: false, hint: '话题群每个新话题自动开工 on|off' },
   { key: 'worktreeMultiPicker', configKey: 'worktreeMultiPicker', kind: 'boolean', effect: 'immediate', clearable: false, hint: 'repo 卡片 worktree 选择器默认多仓库模式 on|off（卡片「切换多仓库选择器」按钮同款）' },
   { key: 'disableCliBypass', configKey: 'disableCliBypass', kind: 'boolean', effect: 'next-session', clearable: false, hint: '不加 CLI 审批/sandbox 绕过参数 on|off' },
+  { key: 'perUserToolAuth', configKey: 'perUserToolAuth', kind: 'boolean', effect: 'next-session', clearable: true, hint: '按用户隔离 CLI 工具鉴权（HOME 覆盖）：每个飞书用户各自的 bytedcli/lark-cli/larkdev 登录态独立，不再共用一份宿主账号 on|off；unset 回全局默认（默认开）' },
+  { key: 'perUserToolAuthPaths', configKey: 'perUserToolAuthPaths', kind: 'stringList', effect: 'next-session', clearable: true, hint: '追加按用户隔离的工具鉴权目录（HOME 相对路径，逗号/空格分隔，如 .mytool），叠加在内置白名单之上；unset 回仅内置' },
   { key: 'codexAppCleanInput', configKey: 'codexAppCleanInput', kind: 'boolean', effect: 'immediate', clearable: false, hint: '实验性：Codex App 用户气泡只保留真实输入，Botmux 元数据走隐藏上下文；默认 off，从下一次 turn 派发生效，不改已有历史' },
   { key: 'envelopeInjection', configKey: 'envelopeInjection', kind: 'enum', effect: 'immediate', clearable: true, enumValues: ['auto', 'off'], hint: '每轮上下文注入方式：auto=支持的 CLI（claude-code）把提醒/白板经 hook 注入为系统提醒，输入框只留消息本身，不支持的自动回退｜off=内联（默认）；unset 回 off' },
   { key: 'restrictGrantCommands', configKey: 'restrictGrantCommands', kind: 'boolean', effect: 'immediate', clearable: false, hint: '被授权人仅能纯对话、拦截斜杠命令 on|off' },

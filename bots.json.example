@@ -5,6 +5,7 @@
     "cliId": "claude-code",
     "model": "sonnet",
     "disableCliBypass": true,
+    "perUserToolAuth": true,
     "allowedUsers": ["alice@company.com"],
     "allowedChatGroups": ["oc_xxx_team"],
     "workingDir": "~/projects",

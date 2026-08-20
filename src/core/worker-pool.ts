@@ -8867,6 +8867,12 @@ export function forkWorker(
     // frozen from botCfg.sandbox at create time, so "follow local sandbox" holds.
     readIsolation: botCfg.readIsolation === true,
     readDenyExtraPaths: botCfg.readDenyExtraPaths ?? [],
+    // Per-user CLI-tool auth isolation (HOME override). Tri-state per-bot value:
+    // undefined follows the fleet default; the worker resolves the effective
+    // decision + owner identity (ownerUnionId ?? ownerOpenId). Only affects
+    // NON-sandboxed sessions. See core/per-user-tool-home.ts.
+    ...(typeof botCfg.perUserToolAuth === 'boolean' ? { perUserToolAuth: botCfg.perUserToolAuth } : {}),
+    ...(botCfg.perUserToolAuthPaths?.length ? { perUserToolAuthPaths: botCfg.perUserToolAuthPaths } : {}),
     // Identifies THIS daemon lifetime. Stamped onto isolated panes so the worker
     // can tell a suspend→resume reattach (same boot id, still isolated) from a
     // stale pane surviving a daemon restart (different id → kill + cold-spawn).
@@ -8910,6 +8916,9 @@ export function forkWorker(
     forkSession: ds.session.pendingForkSession === true,
     cliSessionId: ds.session.cliSessionId,
     ownerOpenId: ds.ownerOpenId,
+    // Tenant-stable owner identity — the worker prefers it over ownerOpenId when
+    // keying the per-user tool HOME (same human reuses one auth across bots).
+    ...(ds.session.ownerUnionId ? { ownerUnionId: ds.session.ownerUnionId } : {}),
     webPort: ds.session.webPort,
     larkAppId: botCfg.larkAppId,
     // Freeze on the session transport capability: a no-transport session

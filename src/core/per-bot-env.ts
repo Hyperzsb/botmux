@@ -71,6 +71,11 @@ const RESERVED_ENV_KEYS = new Set<string>([
   'GROK_HOME',
   'CLAUDE_CODE_RESUME_TOKEN_THRESHOLD',
   'CJADK_INTERACTIVE',
+  // HOME is worker-managed: per-user tool-auth isolation may override it to a
+  // per-owner-identity tool home. A per-bot `env: { HOME }` would clobber that
+  // override (and, without isolation, could point every session's CLI at an
+  // attacker-chosen home). Set the launch home via the OS account / launchShell.
+  'HOME',
 ]);
 
 /** Whether `key` is botmux-controlled and therefore rejected from per-bot env. */

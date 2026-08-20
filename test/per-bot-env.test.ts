@@ -84,6 +84,9 @@ describe('isReservedPerBotEnvKey()', () => {
       'CLAUDE_CODE_ENTRYPOINT', 'CLAUDE_CODE_EXECPATH', 'CLAUDE_PID',
       'CODEX_HOME', 'GROK_HOME',
       'CJADK_INTERACTIVE', 'IS_SANDBOX', 'SESSION_DATA_DIR', '__OWNER_OPEN_ID',
+      // Worker-managed launch home: a per-bot env must not clobber the per-user
+      // tool-auth HOME override (nor point every CLI at an attacker home).
+      'HOME',
     ]) {
       expect(isReservedPerBotEnvKey(k), k).toBe(true);
     }

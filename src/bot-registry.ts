@@ -1325,6 +1325,23 @@ export interface BotConfig {
    */
   sandbox?: boolean;
   /**
+   * Per-user CLI-tool auth isolation (HOME override). Fleet default is ON (see
+   * config.perUserToolAuth / BOTMUX_PER_USER_TOOL_AUTH). Set `false` to opt THIS
+   * bot out — its sessions keep the shared host HOME so all Feishu users of the
+   * bot share one `bytedcli` / `lark-cli` / `larkdev` auth. `true` / unset follow
+   * the fleet default. Only affects NON-sandboxed sessions (the file sandbox sets
+   * its own canonical HOME); see core/per-user-tool-home.ts.
+   */
+  perUserToolAuth?: boolean;
+  /**
+   * Extra HOME-relative tool auth dirs to isolate per user, appended to the
+   * built-in allowlist (DEFAULT_ISOLATED_TOOL_HOME_RELPATHS). Use for a tool that
+   * keeps its login under a dir botmux doesn't cover by default (e.g. a custom
+   * CLI's `~/.mytool`). Paths are HOME-relative (`~/` / `/` prefixes stripped);
+   * `..` segments are rejected. Only consulted when per-user tool auth is on.
+   */
+  perUserToolAuthPaths?: string[];
+  /**
    * User增量 three-tier path lists layered ON TOP of the baseline preset
    * (never replacing it). Deepest matching rule wins, so nested black/white
    * lists work (readOnly a tree, deny a subdir inside it). Same semantics on
@@ -2934,6 +2951,13 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       sandboxNetwork: typeof entry.sandboxNetwork === 'boolean' ? entry.sandboxNetwork : undefined,
       readIsolation: entry.readIsolation === true,
       readDenyExtraPaths: normalizeStringList(entry.readDenyExtraPaths),
+      // Per-user tool-auth isolation opt-out (tri-state): only persist an explicit
+      // boolean so `undefined` keeps following the fleet default.
+      perUserToolAuth: typeof entry.perUserToolAuth === 'boolean' ? entry.perUserToolAuth : undefined,
+      perUserToolAuthPaths: (() => {
+        const list = normalizeStringList(entry.perUserToolAuthPaths);
+        return list.length > 0 ? list : undefined;
+      })(),
       backendType: entry.backendType,
       riff: entry.riff && typeof entry.riff === 'object' ? entry.riff : undefined,
       mojo: entry.mojo && typeof entry.mojo === 'object' ? entry.mojo : undefined,

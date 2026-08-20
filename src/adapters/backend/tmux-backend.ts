@@ -655,6 +655,15 @@ export function buildBotmuxEnvAssignments(
       if (val === undefined) continue;
       out.push(`${key}=${val}`);
     }
+    // Per-user tool-auth isolation: when the worker chose a per-owner-identity
+    // tool HOME, re-assert it as an authoritative HOME override at this post-
+    // rcfile `/usr/bin/env` step. The pane's login shell derives HOME from the OS
+    // account, so a client-env HOME would be overwritten by rcfile load; emitting
+    // it here (after rcfiles) is what makes bytedcli / lark-cli / larkdev resolve
+    // per-user auth. HOME itself is not in BOTMUX_INJECTED_ENV_KEYS (never unset
+    // in-pane), so this is the ONLY place it is (re)applied. See
+    // core/per-user-tool-home.ts + BOTMUX_TOOL_HOME in child-env.ts.
+    if (env.BOTMUX_TOOL_HOME) out.push(`HOME=${env.BOTMUX_TOOL_HOME}`);
   }
   // Per-bot env (bots.json `env`): appended AFTER the botmux-managed keys so a
   // bot's provider creds win over any same-named leftover, and emitted ONLY
