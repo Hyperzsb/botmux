@@ -425,6 +425,15 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   'EBSD_BOTMUX_SUBJECT',
   'EBSD_BOTMUX_REPOSITORY_ROOT',
   'EBSD_NO_UPDATE_CHECK',
+  // Per-user tool-auth isolation (HOME override). The worker sets this to the
+  // per-owner-identity tool HOME; buildBotmuxEnvAssignments re-emits it as an
+  // authoritative `HOME=<toolHome>` at the post-rcfile `/usr/bin/env` step so
+  // auxiliary tools (bytedcli / lark-cli / larkdev) resolve their auth per user.
+  // Being on this list makes tmuxEnv()/PANE_ENV_UNSET strip a stale value from the
+  // shared server global + pane. HOME itself is deliberately NOT listed (unsetting
+  // it before rcfile load would break rcfiles that read $HOME). See
+  // core/per-user-tool-home.ts.
+  'BOTMUX_TOOL_HOME',
 ] as const;
 
 /**

@@ -342,6 +342,15 @@ export const config = {
   // stored `false` disables it. The daemon ANDs this with each bot's
   // `!disableCliBypass` before handing it to the adapter (see worker init).
   get bypassCodexHookTrust(): boolean { return readGlobalConfig().dashboard?.bypassCodexHookTrust !== false; },
+  // Per-user CLI-tool auth isolation (HOME override). Default ON: a session's CLI
+  // child gets a per-owner-identity HOME so auxiliary tools (bytedcli / lark-cli /
+  // larkdev …) keep separate auth per Feishu user instead of all sharing the one
+  // host account. BOTMUX_PER_USER_TOOL_AUTH=0/false/off force-disables fleet-wide
+  // (kill switch); a per-bot `perUserToolAuth:false` opts a single bot out. See
+  // core/per-user-tool-home.ts.
+  perUserToolAuth: (process.env.BOTMUX_PER_USER_TOOL_AUTH ?? '').trim().toLowerCase() !== '0'
+    && (process.env.BOTMUX_PER_USER_TOOL_AUTH ?? '').trim().toLowerCase() !== 'false'
+    && (process.env.BOTMUX_PER_USER_TOOL_AUTH ?? '').trim().toLowerCase() !== 'off',
 };
 
 // allowedUsers is mutable — daemon resolves email prefixes to open_ids at startup

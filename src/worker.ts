@@ -47,6 +47,11 @@ import {
   type IsolationCapability,
 } from './adapters/cli/read-isolation.js';
 import { buildFsPolicy, compileToSeatbelt, migrateLegacySandboxFields, resolveRedirectedAdapterAuthPaths, resolveLarkCliLinuxStoreDir, larkCliChildDataRoot, FsPolicyConfigError } from './adapters/cli/fs-policy.js';
+import {
+  perUserToolAuthEnabled,
+  resolveToolAuthIdentity,
+  provisionToolHome,
+} from './core/per-user-tool-home.js';
 import { buildCloseResultMessage, normalizeDestroyResult, mayRestoreWriteAdmission, interpretAbortOutcome, classifyRestartTeardown, type RestartTeardownOutcome } from './adapters/backend/destroy-result.js';
 import { isRemoteBackendType, killPersistentBackendTarget, killPersistentSession, probePersistentBackendTarget, probePersistentSession, shouldRejectPersistentPostKillProbe, type PersistentBackendType } from './core/persistent-backend.js';
 import { finalizeRawCommandDelivery, writeRawCommandLine } from './core/raw-command-writer.js';
@@ -14182,6 +14187,61 @@ async function spawnCli(
   if (cliAdapter.id === 'ebsd') assertEbsdPerBotEnv(perBotInjectEnv);
   const perBotInjectKeys = Object.keys(perBotInjectEnv);
   if (perBotInjectKeys.length) log(`Injecting ${perBotInjectKeys.length} per-bot env var(s): ${perBotInjectKeys.join(', ')}`);
+
+  // ── Per-user CLI-tool auth isolation (HOME override) ──
+  // Give this session's CLI child (and every Bash subprocess) a per-owner-identity
+  // HOME so auxiliary tools (bytedcli / lark-cli / larkdev …) keep SEPARATE auth
+  // per Feishu user instead of all sharing the one host account. The per-identity
+  // HOME mirrors the real HOME via symlinks (PATH / rcfiles / toolchains AND the
+  // agent CLI's own login stay SHARED) except a small allowlist of tool auth dirs
+  // that become fresh per-identity dirs. See core/per-user-tool-home.ts.
+  //
+  // Gated OFF whenever the file sandbox / credential-only wrapper is active: those
+  // set their own canonical HOME + enforce a real Seatbelt/bwrap boundary, and the
+  // agent CLI data is redirected into BOT_HOME there. This override is a per-user
+  // convenience boundary for plain sessions only — not a security boundary.
+  const perUserToolAuthOn = !sandboxRequested
+    && !credentialBoundaryActive
+    && !cfg.adoptMode
+    && perUserToolAuthEnabled({ perBot: cfg.perUserToolAuth, env: process.env });
+  if (perUserToolAuthOn) {
+    const identity = resolveToolAuthIdentity({
+      ownerUnionId: cfg.ownerUnionId,
+      ownerOpenId: cfg.ownerOpenId,
+    });
+    if (!identity) {
+      // Ownerless / foreign-bot session: no user to isolate per — keep the shared
+      // host HOME (the tools behave exactly as before this feature).
+      log('[per-user-tool-home] no owner identity — keeping shared host HOME');
+    } else {
+      const botmuxHome = process.env.SESSION_DATA_DIR
+        ? dirname(process.env.SESSION_DATA_DIR)
+        : defaultBotmuxHome;
+      const toolHome = provisionToolHome({
+        realHome: homedir(),
+        botmuxHome,
+        identity,
+        extraRelPaths: cfg.perUserToolAuthPaths,
+        log,
+      });
+      if (toolHome) {
+        // HOME reaches the pty child directly via childEnv; persistent backends
+        // (tmux/zellij/zmx) inject it via the per-pane `/usr/bin/env` prefix from
+        // BOTMUX_TOOL_HOME (see buildBotmuxEnvAssignments). The agent CLI's OWN
+        // login stays shared automatically: `~/.claude`, `~/.claude.json`,
+        // `~/.codex`, `~/.grok` are top-level HOME entries that the mirror
+        // symlinks back to the real host HOME (they are NOT in the isolated tool
+        // allowlist) — so NO CLAUDE_CONFIG_DIR/CODEX_HOME override is needed here
+        // (setting CLAUDE_CONFIG_DIR=~/.claude would wrongly re-trigger onboarding
+        // by reading $CLAUDE_CONFIG_DIR/.claude.json — see child-env.ts).
+        childEnv.HOME = toolHome;
+        childEnv.BOTMUX_TOOL_HOME = toolHome;
+        log(`[per-user-tool-home] HOME → ${toolHome} (identity=${identity})`);
+      } else {
+        log('[per-user-tool-home] provisioning failed — keeping shared host HOME');
+      }
+    }
+  }
   const hermesUsesBotmuxSessionProfile = basename(cfg.cliPathOverride ?? '') === 'hermes-botmux-session';
   hermesBridgeDbPath = cfg.cliId === 'hermes'
     ? resolveHermesStateDbPath(

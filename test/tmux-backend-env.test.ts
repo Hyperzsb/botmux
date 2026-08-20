@@ -276,6 +276,27 @@ describe('buildBotmuxEnvAssignments()', () => {
     expect(out).toContain('HTTP_PROXY=');
   });
 
+  // ── Per-user tool-auth HOME override (BOTMUX_TOOL_HOME → HOME=) ─────────────
+  it('re-asserts HOME from BOTMUX_TOOL_HOME so the tool home survives rcfile load', () => {
+    const out = buildBotmuxEnvAssignments({
+      BOTMUX: '1',
+      BOTMUX_TOOL_HOME: '/home/u/.botmux/tool-homes/on_x',
+    });
+    // The marker rides through as a BOTMUX_* injected key AND is re-emitted as an
+    // authoritative HOME override (the pane's login shell would otherwise reset
+    // HOME to the OS account during rcfile load).
+    expect(out).toContain('BOTMUX_TOOL_HOME=/home/u/.botmux/tool-homes/on_x');
+    expect(out).toContain('HOME=/home/u/.botmux/tool-homes/on_x');
+    // HOME comes AFTER the injected keys so it wins over anything earlier.
+    expect(out.indexOf('HOME=/home/u/.botmux/tool-homes/on_x'))
+      .toBeGreaterThan(out.indexOf('BOTMUX_TOOL_HOME=/home/u/.botmux/tool-homes/on_x'));
+  });
+
+  it('injects no HOME override when BOTMUX_TOOL_HOME is unset (shared host HOME)', () => {
+    const out = buildBotmuxEnvAssignments({ BOTMUX: '1', SESSION_DATA_DIR: '/d' });
+    expect(out.some(s => s.startsWith('HOME='))).toBe(false);
+  });
+
   it('skips proxy keys whose value is undefined (no proxy configured)', () => {
     const out = buildBotmuxEnvAssignments({
       BOTMUX: '1',
