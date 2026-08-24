@@ -85,14 +85,15 @@ export function parseAskOptions(raw: string | undefined): AskOption[] {
 
 /** Parse `--timeout <seconds>` → milliseconds. Bounds match §7:
  *   - lower bound: 10s (sub-10s asks are almost always a bug)
- *   - upper bound: 3600s (1h — past that, recovery should kick in v0.1.8)
+ *   - upper bound: 86400s (24h — long-running human confirmations for on-call
+ *     / alarm-triage flows are legitimate; recovery still kicks in past that)
  *   - default: 300s (caller passes `undefined` to use it) */
 export function parseAskTimeoutSeconds(
   raw: string | undefined,
   defaults: { default: number; min: number; max: number } = {
     default: 300,
     min: 10,
-    max: 3600,
+    max: 86400,
   },
 ): number {
   if (raw === undefined) return defaults.default * 1000;

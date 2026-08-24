@@ -412,7 +412,7 @@ function installClaudeSettings(
  *     OpenCode 是「单 server 多 worktree 实例」模型，client 自带 `x-opencode-directory`
  *     头把 reply 路由到发起 question 的那个实例，且其传输在 daemon 里实际可达
  *     （裸 fetch 到 `localhost:4096` 在 daemon 里连不上 + 缺 directory 头 → 永远卡 picker）。
- *   - **异步**作答：飞书侧作答可能耗时很久（默认上限 1h），绝不能用 spawnSync 同步阻塞
+ *   - **异步**作答：飞书侧作答可能耗时很久（默认上限 24h），绝不能用 spawnSync 同步阻塞
  *     OpenCode 的单线程事件总线（会冻结整个 TUI）。改用异步 spawn + fire-and-forget。
  *   - stdout 为空（passthrough：daemon 不可达 / 超时 / 非 botmux 会话）→ 不 reply，把问题
  *     留给 OpenCode 原生 picker（botmux web 终端里仍可人工作答）。
