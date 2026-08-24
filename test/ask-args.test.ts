@@ -111,9 +111,9 @@ describe('parseAskTimeoutSeconds', () => {
     expect(() => parseAskTimeoutSeconds('1.5')).toThrowError(/必须是整数秒数/);
   });
 
-  it('rejects values outside [10, 3600]', () => {
+  it('rejects values outside [10, 86400]', () => {
     expect(() => parseAskTimeoutSeconds('5')).toThrowError(/范围/);
-    expect(() => parseAskTimeoutSeconds('7200')).toThrowError(/范围/);
+    expect(() => parseAskTimeoutSeconds('86401')).toThrowError(/范围/);
   });
 
   it('accepts custom bounds', () => {
