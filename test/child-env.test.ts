@@ -432,6 +432,10 @@ describe('scrubSessionTurnMarkerEnv()', () => {
       'BOTMUX_LARK_APP_ID',
       'BOTMUX_SESSION_SCOPE',
       'BOTMUX_SEND_RELAY',
+      // Per-session per-user tool HOME: injected per pane, gated by the separate
+      // BOTMUX_PER_USER_TOOL_AUTH switch — an inherited copy is a stale foreign
+      // user's HOME that must never be baked fleet-wide.
+      'BOTMUX_TOOL_HOME',
     ]) {
       expect(SESSION_TURN_MARKER_ENV_KEYS, key).toContain(key);
     }

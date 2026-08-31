@@ -503,6 +503,14 @@ export const SESSION_TURN_MARKER_ENV_KEYS = [
   // Per-app value pinned by the ecosystemConfig env block; an inherited copy
   // is untrusted (the daemon resolves its bot via BOTMUX_BOT_INDEX).
   'BOTMUX_LARK_APP_ID',
+  // Per-session per-user tool HOME (worker computes it from the session owner's
+  // identity and injects it per pane; tmux-backend re-asserts HOME from it). Its
+  // ONLY channel is per-session injection — the ON/OFF knob is the SEPARATE
+  // BOTMUX_PER_USER_TOOL_AUTH kill switch, never this path. So an inherited copy
+  // (e.g. a `botmux restart` issued from inside one user's session) is always a
+  // stale foreign user's HOME that must not be baked fleet-wide. See
+  // core/per-user-tool-home.ts + BOTMUX_TOOL_HOME in the injected-keys list.
+  'BOTMUX_TOOL_HOME',
   // cjadk wrapper-branch knob, set/deleted per spawn by the worker.
   'CJADK_INTERACTIVE',
 ] as const;
