@@ -1509,10 +1509,6 @@ let sessionMcpGatewayHost: SessionMcpGatewayHost | null = null;
  *  unaffected. */
 let consecutiveInWorkerRestarts = 0;
 let tmuxRestartTimer: NodeJS.Timeout | null = null;
-/** Guard: user_notify for "resume → fresh fallback" is sent once per worker
- *  lifecycle so a 4× crash loop does not spam the Lark thread with 4 copies
- *  of the same warning. */
-let resumeFallbackNotified = false;
 /** Skill catalog to attach to the first user turn after a prompt-less CLI restart. */
 let deferredPluginSkillCatalog: string | null = null;
 
@@ -13626,7 +13622,7 @@ async function spawnCli(
   // Supersedes the claude-family-only inline probe (PR #189) with a
   // general adapter-owned check (cleaner boundary) + a numeric safety net.
   //
-  // User impact: losing context is better than a 4× daemon-side crash loop
+  // User impact: losing context is better than a daemon-side crash loop
   // that leaves the bot stuck in "crashed N times" state until the human
   // re-closes the session. Skipped entirely when reattaching to a live
   // persistent pane (no spawn happens, no context is lost).
@@ -13720,19 +13716,9 @@ async function spawnCli(
       (backend as TmuxBackend | PtyBackend | ZellijBackend).claudeJsonlPath =
         claudeJsonlPathForSession(effectiveAdapterSessionId, cfg.workingDir, claudeDataDir);
     }
-    // Single human-visible warning. Spam guard: at most once per worker
-    // lifecycle (a 4× crash loop otherwise duplicates the notice).
-    if (!resumeFallbackNotified) {
-      resumeFallbackNotified = true;
-      send({
-        type: 'user_notify',
-        turnId: currentBotmuxTurnId,
-        message:
-          `⚠️  历史会话（${(cfg.cliSessionId ?? cfg.originalSessionId ?? cfg.sessionId).substring(0, 16)}…）` +
-          `无法恢复，已为你**新起一个干净会话**（原因：${reason}）。\n` +
-          `之前的上下文不会带到本轮，需要的话请简述背景。`,
-      });
-    }
+    // Keep this recovery internal. Startup failures can traverse this branch
+    // repeatedly; the user only needs the eventual result, not an intermediate
+    // "history could not be resumed" notification on every recovery attempt.
     // Reset the counter so the fresh spawn gets a clean 2-attempt budget in
     // case IT crashes later for an unrelated reason.
     consecutiveInWorkerRestarts = 0;

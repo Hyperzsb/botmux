@@ -2841,6 +2841,9 @@ async function closeWithdrawnSessionIfLedgerEmpty(
 // ─── Restart rate-limiting ──────────────────────────────────────────────────
 
 export const restartCounts = new Map<string, { count: number; lastAt: number }>();
+/** Keep retrying through transient launch failures (for example, temporary
+ * token-exchange network errors) while retaining a finite crash-loop guard. */
+export const CLI_CRASH_LIMIT_PER_MINUTE = 100;
 
 // ─── Skills installation ────────────────────────────────────────────────────
 
@@ -11924,7 +11927,7 @@ function setupWorkerHandlers(
         rc.lastAt = now;
         restartCounts.set(key, rc);
 
-        if (rc.count > 3) {
+        if (rc.count >= CLI_CRASH_LIMIT_PER_MINUTE) {
           logger.warn(`[${t}] ${sessionCliDisplayName(ds, botCfg)} crashed ${rc.count} times in 1 min, not auto-restarting`);
           const keepDiagnosticWorker = !!msg.canParkDiagnostic && !!ds.worker && !ds.worker.killed;
           // Freeze the last streaming card so it doesn't stay at "working"

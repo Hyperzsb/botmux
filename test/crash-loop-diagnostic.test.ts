@@ -1,5 +1,6 @@
 /**
- * Daemon-side crash-loop handling — worker-pool `case 'claude_exit'`, rc.count > 3.
+ * Daemon-side crash-loop handling — worker-pool `case 'claude_exit'`,
+ * CLI_CRASH_LIMIT_PER_MINUTE = 100.
  *
  *   - canParkDiagnostic:true   → KEEP the worker (ask it to park via park_diagnostic),
  *     reset the restart counter, status → idle, and mark the session
@@ -110,7 +111,13 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 
 // ─── Imports under test ──────────────────────────────────────────────────────
 
-import { initWorkerPool, __testOnly_setupWorkerHandlers, restartCounts, sendWorkerInput } from '../src/core/worker-pool.js';
+import {
+  CLI_CRASH_LIMIT_PER_MINUTE,
+  initWorkerPool,
+  __testOnly_setupWorkerHandlers,
+  restartCounts,
+  sendWorkerInput,
+} from '../src/core/worker-pool.js';
 import type { DaemonSession } from '../src/core/types.js';
 import { getBot } from '../src/bot-registry.js';
 
@@ -216,14 +223,19 @@ describe("crash-loop diagnostic terminal (daemon 'claude_exit' handler)", () => 
     expect(sessionReplyMock).not.toHaveBeenCalled();
   });
 
-  it('after >3 tmux crashes: keeps the worker + marks lazy cold-resume (survives restart)', async () => {
+  it('retries the first 99 crashes and parks on crash 100', async () => {
     const worker = makeFakeWorker();
     const ds = makeDs('sid-diag-keep', worker);
     __testOnly_setupWorkerHandlers(ds, worker);
 
-    await crashTimes(worker, 4, true);
+    await crashTimes(worker, CLI_CRASH_LIMIT_PER_MINUTE - 1, true);
 
-    // First 3 auto-restart in place; the 4th asks the worker to park a
+    expect(worker.send).not.toHaveBeenCalledWith({ type: 'park_diagnostic' });
+    expect(restartCounts.get('sid-diag-keep')?.count).toBe(99);
+
+    await crashTimes(worker, 1, true);
+
+    // The first 99 crashes auto-restart in place; crash 100 asks the worker to park a
     // diagnostic shell (deferred park) and keeps it alive (no close).
     // auto-restart 捎带最新 per-bot env + 最新模型（本 fixture 的 mock getBot
     // 两者都没配 → 均为 null，即「明确清空快照」），并标记 reason: 'cli_crash'
@@ -247,7 +259,7 @@ describe("crash-loop diagnostic terminal (daemon 'claude_exit' handler)", () => 
     const ds = makeDs('sid-diag-model', worker);
     __testOnly_setupWorkerHandlers(ds, worker);
 
-    await crashTimes(worker, 4, true);
+    await crashTimes(worker, CLI_CRASH_LIMIT_PER_MINUTE, true);
     expect(ds.crashDiagnosticParked).toBe(true);
 
     // The user changes the bot's model while the session sits parked.
@@ -274,7 +286,7 @@ describe("crash-loop diagnostic terminal (daemon 'claude_exit' handler)", () => 
     const ds = makeDs('sid-diag-cleared', worker);
     __testOnly_setupWorkerHandlers(ds, worker);
 
-    await crashTimes(worker, 4, true);
+    await crashTimes(worker, CLI_CRASH_LIMIT_PER_MINUTE, true);
     expect(ds.session.suspendedColdResume).toBe(true); // parked → marked for restart survival
 
     // The in-place retry (worker.ts) respawns the CLI WITHOUT going through
@@ -285,12 +297,12 @@ describe("crash-loop diagnostic terminal (daemon 'claude_exit' handler)", () => 
     expect(ds.session.suspendedColdResume).toBeFalsy();
   });
 
-  it('after >3 crashes with NO diagnostic terminal: kills the worker (historical path)', async () => {
+  it('on crash 100 with NO diagnostic terminal: kills the worker (historical path)', async () => {
     const worker = makeFakeWorker();
     const ds = makeDs('sid-diag-nokeep', worker);
     __testOnly_setupWorkerHandlers(ds, worker);
 
-    await crashTimes(worker, 4, undefined);
+    await crashTimes(worker, CLI_CRASH_LIMIT_PER_MINUTE, undefined);
 
     expect(worker.send).toHaveBeenCalledWith({ type: 'close' });
     expect(ds.session.suspendedColdResume).toBeFalsy();

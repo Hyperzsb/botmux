@@ -10,9 +10,8 @@
  *      resume receipt) use to distinguish "route reactivated" from "CLI
  *      history restored".
  *   2. Worker source-lock — resume-without-id is routed through the existing
- *      fresh-demotion branch (effectiveResume=false + user_notify), so the
- *      cold-recovery path is observable instead of silently launching a blank
- *      session while the UI claims history is back.
+ *      fresh-demotion branch (effectiveResume=false) without emitting an
+ *      intermediate user notification during automatic recovery.
  *   3. Card-handler source-lock — the resume receipt picks the fresh variant.
  *
  * Run: pnpm vitest run test/resume-fresh-policy.test.ts
@@ -56,8 +55,7 @@ describe('resumeStartsFresh', () => {
 // spawnCli is not exported for unit testing; the repo convention for its
 // internal wiring is source-lock tests (see config-dir.test.ts). These assert
 // the missing-exact-id case is routed through the EXISTING fresh-demotion
-// branch — the one that flips effectiveResume=false and emits the
-// "历史会话无法恢复，已为你新起一个干净会话" user_notify — instead of leaving
+// branch — the one that flips effectiveResume=false — instead of leaving
 // effectiveResume=true while the adapter silently launches a blank session.
 describe('worker spawnCli resume demotion (source lock)', () => {
   const workerSource = readFileSync(resolvePath('src/worker.ts'), 'utf8');
@@ -74,20 +72,20 @@ describe('worker spawnCli resume demotion (source lock)', () => {
     expect(block).toContain('missingExactResumeId');
   });
 
-  it('demotes effectiveResume + emits the existing fresh-demotion user_notify', () => {
-    // The tier must land inside the `if (fallBackToFresh)` block that already
-    // drops resume and notifies — not a parallel silent path.
+  it('demotes effectiveResume without emitting an intermediate user notification', () => {
+    // The tier must land inside the shared `if (fallBackToFresh)` block and
+    // silently drop resume rather than generating chat noise during recovery.
     const fbStart = workerSource.indexOf('if (fallBackToFresh) {');
     expect(fbStart).toBeGreaterThan(-1);
     const block = workerSource.slice(fbStart, fbStart + 2200);
     expect(block).toContain('effectiveResume = false;');
     expect(block).toContain('effectiveCliSessionId = undefined;');
-    expect(block).toContain('resumeFallbackNotified');
-    expect(block).toContain('user_notify');
-    expect(block).toContain('新起一个干净会话');
+    expect(block).not.toContain('resumeFallbackNotified');
+    expect(block).not.toContain("type: 'user_notify'");
+    expect(block).not.toContain('新起一个干净会话');
   });
 
-  it('gives the missing-id case its own reason in the notice', () => {
+  it('gives the missing-id case its own internal log reason', () => {
     expect(workerSource).toContain('no persisted CLI session id');
   });
 
