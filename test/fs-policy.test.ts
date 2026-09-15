@@ -1724,7 +1724,7 @@ describe('buildFsPolicy — trigger-user CLI identity', () => {
 
   it('grants this session\'s identity files read-only', () => {
     const p = buildFsPolicy(ctx({ sessionId: 'sess-mine' }));
-    for (const tool of ['lark-cli', 'bytedcli']) {
+    for (const tool of ['lark-cli', 'bytedcli', 'larkdev']) {
       expect(accessForPath(p.rules, `${dataDir}/cli-identity/sess-mine.${tool}.env`).access)
         .toBe('readOnly');
     }

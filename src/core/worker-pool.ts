@@ -4029,6 +4029,14 @@ async function closeWithdrawnSessionIfLedgerEmpty(
 
 export const restartCounts = new Map<string, { count: number; lastAt: number }>();
 
+/** Number of crashes inside one minute that stops automatic CLI recovery.
+ * TraeX startup can fail transiently while exchanging a gateway token, so it
+ * gets the wider retry budget carried by the Byte Approval deployment. Other
+ * adapters retain upstream's conservative fourth-crash stop. */
+export function cliCrashStopCount(cliId: string): number {
+  return cliId === 'traex' ? 100 : 4;
+}
+
 // ─── Skills installation ────────────────────────────────────────────────────
 
 /** Track which CLI adapters have had skills installed this daemon lifecycle */
@@ -13563,7 +13571,7 @@ function setupWorkerHandlers(
         rc.lastAt = now;
         restartCounts.set(key, rc);
 
-        if (rc.count > 3) {
+        if (rc.count >= cliCrashStopCount(effectiveCliId)) {
           ds.managedTurnOrigin = undefined;
           logger.warn(`[${t}] ${sessionCliDisplayName(ds, botCfg)} crashed ${rc.count} times in 1 min, not auto-restarting`);
           const keepDiagnosticWorker = !!msg.canParkDiagnostic && !!ds.worker && !ds.worker.killed;

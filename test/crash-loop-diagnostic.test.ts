@@ -110,7 +110,13 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 
 // ─── Imports under test ──────────────────────────────────────────────────────
 
-import { initWorkerPool, __testOnly_setupWorkerHandlers, restartCounts, sendWorkerInput } from '../src/core/worker-pool.js';
+import {
+  cliCrashStopCount,
+  initWorkerPool,
+  __testOnly_setupWorkerHandlers,
+  restartCounts,
+  sendWorkerInput,
+} from '../src/core/worker-pool.js';
 import type { DaemonSession } from '../src/core/types.js';
 import { getBot } from '../src/bot-registry.js';
 
@@ -174,6 +180,27 @@ describe("crash-loop diagnostic terminal (daemon 'claude_exit' handler)", () => 
       getActiveCount: () => 1,
       closeSession: vi.fn(),
     } as any);
+  });
+
+  it('keeps upstream limits for other CLIs and gives only TraeX the extended retry budget', () => {
+    expect(cliCrashStopCount('claude-code')).toBe(4);
+    expect(cliCrashStopCount('codex')).toBe(4);
+    expect(cliCrashStopCount('traex')).toBe(100);
+  });
+
+  it('retries TraeX through crash 99 and parks it on crash 100', async () => {
+    const worker = makeFakeWorker();
+    const ds = makeDs('sid-traex-retry', worker);
+    ds.session.cliId = 'traex';
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    await crashTimes(worker, cliCrashStopCount('traex') - 1, true);
+    expect(worker.send).not.toHaveBeenCalledWith({ type: 'park_diagnostic' });
+    expect(restartCounts.get('sid-traex-retry')?.count).toBe(99);
+
+    await crashTimes(worker, 1, true);
+    expect(worker.send).toHaveBeenCalledWith({ type: 'park_diagnostic' });
+    expect(restartCounts.has('sid-traex-retry')).toBe(false);
   });
 
   it('does not auto-restart a crashed Riff worker and tells the user how to recover', async () => {

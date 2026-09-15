@@ -185,6 +185,34 @@ describe('publishTurnCliIdentity — withholding removes, never inherits', () =>
     expect(body).toContain("BYTEDCLI_USER_CODE_JWT='code-alice'");
   });
 
+  it('publishes the same sender-scoped ByteCloud JWT for larkdev', async () => {
+    bytedcliJwts.set(ALICE, { cloudJwt: 'cloud-alice', codeJwt: 'code-alice' });
+    const config = botConfig({ enabled: true, tools: ['larkdev'] });
+    const outcomes = await publish(config, ALICE);
+
+    expect(outcomes.find(o => o.tool === 'larkdev')?.state).toBe('user');
+    const body = readFileSync(sessionIdentityPath(dir, SESSION, 'larkdev'), 'utf8');
+    expect(body).toContain("BYTECLOUD_CLI_API_JWT_TOKEN='cloud-alice'");
+    expect(body).not.toContain('code-alice');
+  });
+
+  it('mints the sender ByteCloud identity once when bytedcli and larkdev are both enabled', async () => {
+    const { mintBytedcliJwts } = await import('../src/services/bytedcli-auth.js');
+    vi.mocked(mintBytedcliJwts).mockClear();
+    bytedcliJwts.set(ALICE, { cloudJwt: 'cloud-alice' });
+    await publish(botConfig({ enabled: true, tools: ['bytedcli', 'larkdev'] }), ALICE);
+    expect(vi.mocked(mintBytedcliJwts)).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses larkdev without ByteCloud authorization and points to the shared login flow', async () => {
+    const outcomes = await publish(botConfig({ enabled: true, tools: ['larkdev'] }), ALICE);
+    expect(outcomes.find(o => o.tool === 'larkdev')?.state).toBe('needs-authorization');
+    const body = readFileSync(sessionIdentityPath(dir, SESSION, 'larkdev'), 'utf8');
+    expect(body).toContain('ByteCloud');
+    expect(body).toContain('/login bytedcli');
+    expect(body).not.toContain('BYTECLOUD_CLI_API_JWT_TOKEN=');
+  });
+
   // Alice authorized, Bob did not. Bob's turn must not inherit her JWT.
   it('never hands one person\'s ByteCloud JWT to another', async () => {
     bytedcliJwts.set(ALICE, { cloudJwt: 'cloud-alice' });

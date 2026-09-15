@@ -14368,7 +14368,11 @@ async function spawnCli(
     }
     // Single human-visible warning. Spam guard: at most once per worker
     // lifecycle (a 4× crash loop otherwise duplicates the notice).
-    if (!resumeFallbackNotified) {
+    // TraeX may traverse this recovery branch repeatedly while a transient
+    // token exchange recovers. Keep those intermediate retries internal; the
+    // user only needs the eventual result. Preserve upstream's notice for every
+    // other adapter.
+    if (cfg.cliId !== 'traex' && !resumeFallbackNotified) {
       resumeFallbackNotified = true;
       send({
         type: 'user_notify',

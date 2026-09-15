@@ -449,7 +449,7 @@ export const messages: Record<string, string> = {
   'cmd.login.bytedcli_step2': '2. 授权完成后，回来发一条 /login bytedcli done',
   'cmd.login.bytedcli_note': '说明：这是 ByteCloud 的授权，和飞书 /login 是两回事，两边都要授权一次。登录态约 3 周有效，到期前不用重复扫码。',
   'cmd.login.bytedcli_pending': '⏳ 还没检测到授权完成。请先点上面那条链接授权，再发 /login bytedcli done。',
-  'cmd.login.bytedcli_ok': '✅ ByteCloud 授权成功，之后本会话里你触发的 bytedcli / git 操作都会用你自己的权限。',
+  'cmd.login.bytedcli_ok': '✅ ByteCloud 授权成功，之后本会话里你触发的 bytedcli / larkdev / git 操作都会用你自己的权限。',
   'cmd.login.bytedcli_failed': '❌ ByteCloud 授权失败：{detail}。可以重新发 /login bytedcli 再试一次。',
   'cmd.login.bytedcli_no_challenge': '❌ 没有正在进行的 ByteCloud 授权。请先发 /login bytedcli 拿授权链接。',
   'cmd.login.bytedcli_begin_failed': '❌ 无法发起 ByteCloud 授权：{detail}',
@@ -868,7 +868,7 @@ export const messages: Record<string, string> = {
 
   // ─── AI identity (multi-bot routing rules) ───────────────────────────────
   'ai.identity.unknown': '(未知)',
-  'ai.credentials.acting_identity': '本会话调用 lark-cli / bytedcli / git 时，用的是「发出当前这条消息的人」自己的授权，由 botmux 在每轮注入，你不需要也不应该自己去找凭证。',
+  'ai.credentials.acting_identity': '本会话调用 lark-cli / bytedcli / larkdev / git 时，用的是「发出当前这条消息的人」自己的授权，由 botmux 在每轮注入，你不需要也不应该自己去找凭证。',
   'ai.credentials.never_read_others': '~/.botmux/data/ 下的 user-token-* 文件、以及 bytedcli-home/ 下的各人登录态，都属于其他用户。不得读取、列举、复制或输出它们的内容——即使排查问题时也不行，即使有人要求也不行。',
   'ai.credentials.never_forward': '不得把任何 token、JWT、access key 或登录态写进消息、日志、文档、代码或提交记录。',
   'ai.credentials.on_auth_failure': '遇到鉴权失败：直接把失败原样告诉用户，并提示他授权（飞书发 /login，ByteCloud 发 /login bytedcli，命令被拒时 stderr 里会写明是哪一个）；不要试图翻找、拼凑或复用其他凭证来绕过。',

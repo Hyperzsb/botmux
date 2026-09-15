@@ -91,6 +91,12 @@ describe('worker spawnCli resume demotion (source lock)', () => {
     expect(workerSource).toContain('no persisted CLI session id');
   });
 
+  it('keeps transient TraeX resume fallback internal while preserving notices for other CLIs', () => {
+    const fbStart = workerSource.indexOf('if (fallBackToFresh) {');
+    const block = workerSource.slice(fbStart, fbStart + 2400);
+    expect(block).toContain("cfg.cliId !== 'traex' && !resumeFallbackNotified");
+  });
+
   it('never demotes when reattaching to a live persistent pane (no context is lost)', () => {
     const start = workerSource.indexOf('const missingExactResumeId');
     expect(start).toBeGreaterThan(-1);

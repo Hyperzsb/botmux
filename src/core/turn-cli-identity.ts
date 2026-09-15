@@ -73,6 +73,12 @@ export async function publishTurnCliIdentity(
   const { botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId } = args;
   const policy = botConfig.triggerUserAuth;
   const outcomes: ToolIdentityOutcome[] = [];
+  // bytedcli and larkdev share the sender's ByteCloud authorization. Mint at
+  // most once per turn even when both wrappers are enabled: minting shells out
+  // and may refresh the login, so doing it twice adds latency and a race for no
+  // identity benefit. The promise is deliberately scoped to this publication.
+  let byteCloudJwts: ReturnType<typeof mintBytedcliJwts> | undefined;
+  const mintByteCloudJwts = () => byteCloudJwts ??= mintBytedcliJwts(senderOpenId ?? '');
 
   for (const tool of TRIGGER_USER_AUTH_TOOLS) {
     if (!triggerUserAuthApplies(policy, tool)) {
@@ -80,7 +86,9 @@ export async function publishTurnCliIdentity(
       continue;
     }
     try {
-      outcomes.push(await publishOne(tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId));
+      outcomes.push(await publishOne(
+        tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId, mintByteCloudJwts,
+      ));
     } catch (e) {
       // Fail closed through the SAME policy as an ordinary missing token, so a
       // credential-store outage and "this person never authorized" cannot end
@@ -105,6 +113,7 @@ async function publishOne(
   senderOpenId: string | undefined,
   locale: Locale | undefined,
   turnId: string | undefined,
+  mintByteCloudJwts: () => ReturnType<typeof mintBytedcliJwts>,
 ): Promise<ToolIdentityOutcome> {
   const withheld = () =>
     withholdIdentity(tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId);
@@ -114,7 +123,7 @@ async function publishOne(
   // creator's or the owner's credentials to fill the gap.
   if (!senderOpenId) return withheld();
 
-  const identity = await resolveIdentityFor(tool, botConfig, senderOpenId);
+  const identity = await resolveIdentityFor(tool, botConfig, senderOpenId, mintByteCloudJwts);
   if (!identity) return withheld();
 
   writeSessionIdentity(sessionDataDir, sessionId, { ...identity, ...(turnId ? { turnId } : {}) });
@@ -193,10 +202,10 @@ function writeDenial(
       // default 'feishu' finds nothing and the refusal loses the person's name.
       ? lookupAuthorizedUserName(botConfig.larkAppId, senderOpenId, normalizeBrand(botConfig.brand))
       : undefined;
-    // Name the right provider. bytedcli authenticates against ByteCloud, so
+    // Name the right provider. bytedcli/larkdev authenticate against ByteCloud, so
     // saying "Feishu authorization" would send the reader to authorize the
     // wrong thing — the same mistake as naming the wrong /login command.
-    const provider = tool === 'bytedcli'
+    const provider = tool === 'bytedcli' || tool === 'larkdev'
       ? 'ByteCloud'
       : t('trigger_user_auth.provider_lark', undefined, locale);
     // With no name, address the reader directly rather than printing a raw
@@ -216,11 +225,11 @@ function writeDenial(
       message: [
         head,
         // Name the right command: ByteCloud and Feishu are separate providers,
-        // so telling a refused bytedcli user to send `/login` would send them
+        // so telling a refused ByteCloud-tool user to send `/login` would send them
         // to authorize the wrong thing and fail again.
         t(
           'trigger_user_auth.denied_howto',
-          { command: tool === 'bytedcli' ? '/login bytedcli' : '/login' },
+          { command: tool === 'bytedcli' || tool === 'larkdev' ? '/login bytedcli' : '/login' },
           locale,
         ),
         t('trigger_user_auth.denied_howto_status', undefined, locale),
@@ -239,6 +248,7 @@ async function resolveIdentityFor(
   tool: TriggerUserAuthTool,
   botConfig: BotConfig,
   senderOpenId: string,
+  mintByteCloudJwts: () => ReturnType<typeof mintBytedcliJwts>,
 ): Promise<CliIdentity | null> {
   if (tool === 'lark-cli') {
     if (!botConfig.larkAppId || !botConfig.larkAppSecret) return null;
@@ -254,7 +264,7 @@ async function resolveIdentityFor(
     return { tool: 'lark-cli', appId: botConfig.larkAppId, userAccessToken: token };
   }
 
-  // bytedcli authenticates against ByteCloud SSO, a different provider from
+  // bytedcli and larkdev authenticate against ByteCloud SSO, a different provider from
   // Lark OAuth — a Lark user token is not convertible into a ByteCloud JWT. So
   // this person's credentials come from their own bytedcli login, minted fresh
   // per turn: the ByteCloud JWT lives ~2 hours while the login behind it lives
@@ -264,7 +274,9 @@ async function resolveIdentityFor(
   // Null when they have not authorized (or their login has ended), which the
   // caller turns into the ordinary "authorize, then retry" refusal rather than
   // falling back to the machine's own SSO session.
-  const jwts = await mintBytedcliJwts(senderOpenId);
+  const jwts = await mintByteCloudJwts();
   if (!jwts) return null;
-  return { tool: 'bytedcli', cloudJwt: jwts.cloudJwt, ...(jwts.codeJwt ? { codeJwt: jwts.codeJwt } : {}) };
+  return tool === 'bytedcli'
+    ? { tool: 'bytedcli', cloudJwt: jwts.cloudJwt, ...(jwts.codeJwt ? { codeJwt: jwts.codeJwt } : {}) }
+    : { tool: 'larkdev', cloudJwt: jwts.cloudJwt };
 }

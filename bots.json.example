@@ -8,6 +8,11 @@
       "oc_xxx_team": { "claude-code": { "model": "opus", "reasoningEffort": "high" } }
     },
     "disableCliBypass": true,
+    "triggerUserAuth": {
+      "enabled": true,
+      "tools": ["lark-cli", "bytedcli", "larkdev"],
+      "fallback": "none"
+    },
     "allowedUsers": ["alice@company.com"],
     "allowedChatGroups": ["oc_xxx_team"],
     "workingDir": "~/projects",

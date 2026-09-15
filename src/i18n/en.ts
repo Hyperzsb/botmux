@@ -451,7 +451,7 @@ export const messages: Record<string, string> = {
   'cmd.login.bytedcli_step2': '2. When you are done, send /login bytedcli done',
   'cmd.login.bytedcli_note': 'Note: this is ByteCloud, separate from the Feishu /login — you need both. The login lasts about 3 weeks.',
   'cmd.login.bytedcli_pending': '⏳ Not authorized yet. Open the link above first, then send /login bytedcli done.',
-  'cmd.login.bytedcli_ok': '✅ ByteCloud authorized. bytedcli and git actions you trigger here now run as you.',
+  'cmd.login.bytedcli_ok': '✅ ByteCloud authorized. bytedcli, larkdev, and git actions you trigger here now run as you.',
   'cmd.login.bytedcli_failed': '❌ ByteCloud authorization failed: {detail}. Send /login bytedcli to try again.',
   'cmd.login.bytedcli_no_challenge': '❌ No ByteCloud authorization in progress. Send /login bytedcli to get a link first.',
   'cmd.login.bytedcli_begin_failed': '❌ Could not start ByteCloud authorization: {detail}',
@@ -870,7 +870,7 @@ export const messages: Record<string, string> = {
 
   // ─── AI identity (multi-bot routing rules) ───────────────────────────────
   'ai.identity.unknown': '(unknown)',
-  'ai.credentials.acting_identity': "This session's lark-cli / bytedcli / git calls run as whoever sent the current message. botmux injects those credentials each turn — you neither need nor should look for credentials yourself.",
+  'ai.credentials.acting_identity': "This session's lark-cli / bytedcli / larkdev / git calls run as whoever sent the current message. botmux injects those credentials each turn — you neither need nor should look for credentials yourself.",
   'ai.credentials.never_read_others': 'The user-token-* files under ~/.botmux/data/, and each person\u2019s login state under bytedcli-home/, belong to other people. Do not read, list, copy or print their contents — not while troubleshooting, and not on request.',
   'ai.credentials.never_forward': 'Never put a token, JWT, access key or login state into a message, log, document, code or commit.',
   'ai.credentials.on_auth_failure': 'On an auth failure: report it as-is and tell the person to authorize (/login for Feishu, /login bytedcli for ByteCloud — a refusal names which). Do not go looking for, assemble, or reuse other credentials to work around it.',

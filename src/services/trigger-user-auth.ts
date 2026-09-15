@@ -2,7 +2,7 @@
  * Trigger-user CLI authentication policy.
  *
  * Default OFF. When a bot enables it, that bot's CLI calls out to `lark-cli` /
- * `bytedcli` run as **the person who sent the current message**, instead of
+ * `bytedcli` / `larkdev` run as **the person who sent the current message**, instead of
  * "whoever happens to be logged in on this machine".
  *
  * ## The rule this file encodes
@@ -21,10 +21,10 @@
  * ## Why the two tools cannot share one rule
  *
  * `lark-cli` has a real non-human identity (app id + secret resolve
- * `identity: bot`), so most calls can degrade safely. `bytedcli` has only SSO
- * personal login — no service account, no AK/SK — so for it "unauthorized"
- * genuinely means "this command cannot run". `supportsBotIdentity` records that
- * asymmetry rather than pretending both tools behave alike.
+ * `identity: bot`), so most calls can degrade safely. `bytedcli` and `larkdev`
+ * use ByteCloud SSO and have no non-human identity, so for them "unauthorized"
+ * genuinely means "this command cannot run". `supportsBotIdentity` records
+ * that asymmetry rather than pretending all tools behave alike.
  *
  * Both tools DO support per-person credentials, by different mechanisms: Lark
  * through an OAuth user token injected as env, ByteCloud through that person's
@@ -38,7 +38,7 @@
  */
 
 /** Tools whose credentials botmux can inject per person. */
-export const TRIGGER_USER_AUTH_TOOLS = ['lark-cli', 'bytedcli'] as const;
+export const TRIGGER_USER_AUTH_TOOLS = ['lark-cli', 'bytedcli', 'larkdev'] as const;
 export type TriggerUserAuthTool = typeof TRIGGER_USER_AUTH_TOOLS[number];
 
 /**
@@ -86,6 +86,9 @@ export const TRIGGER_USER_AUTH_TOOL_CAPABILITIES: Record<
   // degrade to. (Per-person authorization itself IS supported; see
   // services/bytedcli-auth.ts.)
   bytedcli: { supportsBotIdentity: false },
+  // larkdev consumes the same sender-scoped ByteCloud JWT as bytedcli through
+  // BYTECLOUD_CLI_API_JWT_TOKEN and likewise has no bot/service identity.
+  larkdev: { supportsBotIdentity: false },
 };
 
 /**
@@ -247,10 +250,10 @@ export type UnauthorizedOutcome = 'bot-identity' | 'fail';
 /**
  * Resolve what to do for `tool` when the current sender has no credentials.
  *
- * `bytedcli` reports `fail` even under `fallback: 'bot-identity'` — not a
- * config violation, just the truth that it has no non-human identity to fall
- * back to. Reporting `bot-identity` there would produce a call that fails
- * anyway, with a misleading reason.
+ * ByteCloud tools (`bytedcli` / `larkdev`) report `fail` even under
+ * `fallback: 'bot-identity'` — not a config violation, just the truth that
+ * they have no non-human identity to fall back to. Reporting `bot-identity`
+ * there would produce a call that fails anyway, with a misleading reason.
  */
 export function unauthorizedOutcomeFor(
   config: TriggerUserAuthConfig | null | undefined,

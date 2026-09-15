@@ -3254,6 +3254,14 @@ describe('handleCommand', () => {
         );
         expect(text).toContain('bytedcli: 以你自己的身份调用');
       });
+
+      it('reports larkdev through the shared ByteCloud authorization', async () => {
+        vi.mocked(hasBytedcliHome).mockReturnValue(true);
+        const text = await statusText(
+          statusWith({ enabled: true, tools: ['larkdev'] }, false),
+        );
+        expect(text).toContain('larkdev: 以你自己的身份调用');
+      });
     });
   });
 

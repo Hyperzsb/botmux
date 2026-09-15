@@ -1266,7 +1266,7 @@ function loginPromptLines(
  * Whose credentials this session's CLI calls use right now — per tool.
  *
  * Per tool because the answer genuinely differs between them. `/login` grants
- * Lark only; bytedcli authenticates against ByteCloud SSO, so the same person
+ * Lark only; bytedcli/larkdev authenticate against ByteCloud SSO, so the same person
  * can be authorized for one and refused by the other. Printing the tools on one
  * line above a single verdict said "you are authorized" about a tool the token
  * has no bearing on — the reader then discovers otherwise only when a command
@@ -3307,8 +3307,11 @@ export async function handleCommand(
           // 按人查：报「你自己」授权了没。别人的授权状态与你无关，也不该让你看见。
           const lines = [getTokenStatus(botCfg2.larkAppId, normalizeBrand(botCfg2.brand), loginOpenId)];
           // ByteCloud 是另一个身份提供方，飞书授权了不代表这边也授权了。只在这个
-          // bot 真的会用 bytedcli 时才多说一行，否则是噪音。
-          if (loginOpenId && triggerUserAuthApplies(botCfg2.triggerUserAuth, 'bytedcli')) {
+          // bot 真的会用 bytedcli/larkdev 时才多说一行，否则是噪音。
+          if (loginOpenId && (
+            triggerUserAuthApplies(botCfg2.triggerUserAuth, 'bytedcli')
+            || triggerUserAuthApplies(botCfg2.triggerUserAuth, 'larkdev')
+          )) {
             lines.push(t(
               hasBytedcliHome(loginOpenId)
                 ? 'cmd.login.bytedcli_status_yes'

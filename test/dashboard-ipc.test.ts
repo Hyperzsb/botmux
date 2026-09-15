@@ -2645,7 +2645,7 @@ describe('PUT + GET /api/bot-trigger-user-auth — 开关刷新回显', () => {
       });
       expect(allTools.status).toBe(200);
       expect((await (await fetch(`${base}/api/bot-default-oncall`)).json()).triggerUserAuth)
-        .toMatchObject({ enabled: true, tools: ['lark-cli', 'bytedcli'], fallback: 'bot-identity' });
+        .toMatchObject({ enabled: true, tools: ['lark-cli', 'bytedcli', 'larkdev'], fallback: 'bot-identity' });
 
       // null clears → key dropped from disk, GET back to null (off).
       const off = await fetch(`${base}/api/bot-trigger-user-auth`, {

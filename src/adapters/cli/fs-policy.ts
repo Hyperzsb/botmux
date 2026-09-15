@@ -852,6 +852,7 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
     push([
       `${ctx.sessionDataDir}/cli-identity/${ctx.sessionId}.lark-cli.env`,
       `${ctx.sessionDataDir}/cli-identity/${ctx.sessionId}.bytedcli.env`,
+      `${ctx.sessionDataDir}/cli-identity/${ctx.sessionId}.larkdev.env`,
       `${ctx.sessionDataDir}/cli-identity/${ctx.sessionId}.bin`,
       // The turn the CLI is currently executing. The wrapper compares it against
       // the turn stamped on the identity and refuses on a mismatch, so without

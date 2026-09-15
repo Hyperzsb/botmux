@@ -120,6 +120,26 @@ export const IDENTITY_ENV_KEYS: Record<TriggerUserAuthTool, readonly string[]> =
   // ByteCloud JWT and the Codebase JWT derived from it. The latter is what git
   // pushes authenticate with, so attribution of a commit follows from it.
   bytedcli: ['BYTEDCLI_USER_CLOUD_JWT', 'BYTEDCLI_USER_CODE_JWT'],
+  // larkdev's ByteCloud Auth SDK explicitly supports a non-interactive JWT.
+  // Reuse the sender's bytedcli-backed login rather than creating a second
+  // per-person credential store for the same identity provider.
+  larkdev: ['BYTECLOUD_CLI_API_JWT_TOKEN'],
+};
+
+/** Identity values to clear before loading the current turn. Most tools clear
+ * exactly what they later export; larkdev additionally clears site-specific
+ * variables because its SDK gives them precedence over the injected global JWT. */
+const IDENTITY_ENV_CLEAR_KEYS: Record<TriggerUserAuthTool, readonly string[]> = {
+  ...IDENTITY_ENV_KEYS,
+  larkdev: [
+    ...IDENTITY_ENV_KEYS.larkdev,
+    'BYTECLOUD_CLI_API_JWT_TOKEN_CN',
+    'BYTECLOUD_CLI_API_JWT_TOKEN_BOE',
+    'BYTECLOUD_CLI_API_JWT_TOKEN_I18N_TT',
+    'BYTECLOUD_CLI_API_JWT_TOKEN_I18N_BD',
+    'BYTECLOUD_CLI_API_JWT_TOKEN_EU_TTP',
+    'BYTECLOUD_CLI_API_JWT_TOKEN_US_TTP',
+  ],
 };
 
 /** Common to every variant: the turn these credentials were published FOR.
@@ -140,6 +160,11 @@ export interface BytedCliIdentity extends TurnBound {
   cloudJwt: string;
   /** Optional: only present once a Codebase JWT has been minted for this person. */
   codeJwt?: string;
+}
+
+export interface LarkDevIdentity extends TurnBound {
+  tool: 'larkdev';
+  cloudJwt: string;
 }
 
 /**
@@ -174,7 +199,7 @@ export interface DeniedIdentity extends TurnBound {
   message: string;
 }
 
-export type CliIdentity = LarkCliIdentity | BytedCliIdentity | BotIdentity | DeniedIdentity;
+export type CliIdentity = LarkCliIdentity | BytedCliIdentity | LarkDevIdentity | BotIdentity | DeniedIdentity;
 
 /** Exit code for a command refused for want of authorization. Distinct from the
  *  tool's own failures so callers can tell "not allowed" from "did not work".
@@ -222,9 +247,11 @@ export function renderIdentityEnv(identity: CliIdentity): string {
       ['LARKSUITE_CLI_APP_ID', identity.appId],
       ['LARKSUITE_CLI_USER_ACCESS_TOKEN', identity.userAccessToken],
     );
-  } else {
+  } else if (identity.tool === 'bytedcli') {
     pairs.push([MODE_VAR, 'user'], ['BYTEDCLI_USER_CLOUD_JWT', identity.cloudJwt]);
     if (identity.codeJwt) pairs.push(['BYTEDCLI_USER_CODE_JWT', identity.codeJwt]);
+  } else {
+    pairs.push([MODE_VAR, 'user'], ['BYTECLOUD_CLI_API_JWT_TOKEN', identity.cloudJwt]);
   }
   if (identity.turnId) pairs.push([TURN_VAR, identity.turnId]);
   const header = '# botmux trigger-user identity — rewritten each turn, do not edit\n';
@@ -321,6 +348,7 @@ export function clearAllSessionIdentities(sessionDataDir: string, sessionId: str
  */
 export function renderIdentityWrapper(tool: TriggerUserAuthTool, realBinaryPath: string): string {
   const exportKeys = IDENTITY_ENV_KEYS[tool].join(' ');
+  const clearKeys = IDENTITY_ENV_CLEAR_KEYS[tool].join(' ');
   return [
     '#!/bin/sh',
     '# botmux trigger-user identity wrapper — generated, do not edit.',
@@ -330,6 +358,10 @@ export function renderIdentityWrapper(tool: TriggerUserAuthTool, realBinaryPath:
     '#',
     '# No usable identity => the command does not run. Exec\'ing the tool bare',
     '# would hand it the machine account\'s login, not the bot\'s.',
+    // Clear every identity-bearing value before sourcing the per-turn file. In
+    // particular, larkdev's site-specific JWT variables outrank its global JWT;
+    // an inherited _CN/_I18N_* value must never override the current sender.
+    `unset ${clearKeys}`,
     `${MODE_VAR}=`,
     `${DENY_MSG_VAR}=`,
     'if [ -n "$SESSION_DATA_DIR" ] && [ -n "$BOTMUX_SESSION_ID" ]; then',

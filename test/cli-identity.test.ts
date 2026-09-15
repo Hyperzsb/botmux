@@ -54,6 +54,12 @@ describe('renderIdentityEnv', () => {
     expect(body).not.toContain('BYTEDCLI_USER_CODE_JWT');
   });
 
+  it('emits the ByteCloud JWT larkdev consumes without exposing Codebase credentials', () => {
+    const body = renderIdentityEnv({ tool: 'larkdev', cloudJwt: 'cloud.jwt' });
+    expect(body).toContain("BYTECLOUD_CLI_API_JWT_TOKEN='cloud.jwt'");
+    expect(body).not.toContain('BYTEDCLI_USER_CODE_JWT');
+  });
+
   it('refuses a value carrying a line break rather than silently truncating it', () => {
     expect(() => renderIdentityEnv({ tool: 'bytedcli', cloudJwt: 'a\nb' }))
       .toThrow(/line break/);
@@ -141,9 +147,11 @@ describe('clearSessionIdentity', () => {
   it('clears every tool on teardown', () => {
     writeSessionIdentity(dir, SESSION, { tool: 'lark-cli', appId: 'a', userAccessToken: 'tok' });
     writeSessionIdentity(dir, SESSION, { tool: 'bytedcli', cloudJwt: 'jwt' });
+    writeSessionIdentity(dir, SESSION, { tool: 'larkdev', cloudJwt: 'jwt' });
     clearAllSessionIdentities(dir, SESSION);
     expect(existsSync(sessionIdentityPath(dir, SESSION, 'lark-cli'))).toBe(false);
     expect(existsSync(sessionIdentityPath(dir, SESSION, 'bytedcli'))).toBe(false);
+    expect(existsSync(sessionIdentityPath(dir, SESSION, 'larkdev'))).toBe(false);
   });
 });
 
@@ -349,6 +357,24 @@ describe('renderIdentityWrapper', () => {
     expect(out).toBe('cli_app|u-tok|im +send');
   });
 
+  it('gives larkdev the current sender JWT and clears higher-priority inherited site JWTs', () => {
+    const real = join(dir, 'real-larkdev.sh');
+    writeFileSync(real, '#!/bin/sh\nprintf "%s|%s|%s" "$BYTECLOUD_CLI_API_JWT_TOKEN" "${BYTECLOUD_CLI_API_JWT_TOKEN_CN-unset}" "${BYTECLOUD_CLI_API_JWT_TOKEN_I18N_TT-unset}"\n');
+    chmodSync(real, 0o755);
+    const wrapperPath = join(dir, 'larkdev');
+    writeFileSync(wrapperPath, renderIdentityWrapper('larkdev', real));
+    writeSessionIdentity(dir, SESSION, { tool: 'larkdev', cloudJwt: 'sender-jwt' });
+
+    const out = runWrapper(wrapperPath, {
+      SESSION_DATA_DIR: dir,
+      BOTMUX_SESSION_ID: SESSION,
+      BYTECLOUD_CLI_API_JWT_TOKEN: 'machine-global',
+      BYTECLOUD_CLI_API_JWT_TOKEN_CN: 'machine-cn',
+      BYTECLOUD_CLI_API_JWT_TOKEN_I18N_TT: 'machine-i18n',
+    });
+    expect(out).toBe('sender-jwt|unset|unset');
+  });
+
   // The regression this whole wrapper exists to prevent. Running the tool with
   // no identity env does NOT make it act as the bot: lark-cli then resolves the
   // operator's on-disk login and acts as *that person* — the machine account.
@@ -549,6 +575,13 @@ describe('installIdentityWrapper', () => {
     const binDir = join(dir, 'bin');
     expect(installIdentityWrapper(binDir, 'bytedcli', null)).toBeNull();
     expect(identityWrapperInstalled(binDir, 'bytedcli')).toBe(false);
+  });
+
+  it('installs the larkdev wrapper through the shared tool mechanism', () => {
+    const binDir = join(dir, 'bin');
+    const path = installIdentityWrapper(binDir, 'larkdev', '/usr/local/bin/larkdev');
+    expect(path).toBe(join(binDir, 'larkdev'));
+    expect(identityWrapperInstalled(binDir, 'larkdev')).toBe(true);
   });
 });
 

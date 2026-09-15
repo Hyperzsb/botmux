@@ -51,6 +51,8 @@ describe('parseTriggerUserAuthConfig', () => {
       .toEqual(['lark-cli']);
     expect(parseTriggerUserAuthConfig({ enabled: true, tools: ['bytedcli', 'bytedcli'] })?.tools)
       .toEqual(['bytedcli']);
+    expect(parseTriggerUserAuthConfig({ enabled: true, tools: ['larkdev', 'larkdev'] })?.tools)
+      .toEqual(['larkdev']);
   });
 
   it('defaults the fallback to the bot\'s own identity', () => {
@@ -130,6 +132,11 @@ describe('unauthorizedOutcomeFor', () => {
   it('fails for bytedcli even under fallback: bot-identity', () => {
     const config = parseTriggerUserAuthConfig({ enabled: true, fallback: 'bot-identity' });
     expect(unauthorizedOutcomeFor(config, 'bytedcli')).toBe('fail');
+  });
+
+  it('fails for larkdev even under fallback: bot-identity', () => {
+    const config = parseTriggerUserAuthConfig({ enabled: true, fallback: 'bot-identity' });
+    expect(unauthorizedOutcomeFor(config, 'larkdev')).toBe('fail');
   });
 
   it('fails for every governed tool under fallback: none', () => {

@@ -175,6 +175,12 @@ describe('bot defaults focused layout', () => {
     expect(i18n).toContain("with or without the sandbox");
   });
 
+  it('offers larkdev in the trigger-user authentication tool list', () => {
+    expect(page).toContain("(['lark-cli', 'bytedcli', 'larkdev'] as const)");
+    expect(i18n).toContain('lark-cli / bytedcli / larkdev');
+    expect(i18n).toContain('bytedcli / larkdev 走 ByteCloud SSO');
+  });
+
   it('auto-saves duration and quota without action buttons', () => {
     expect(page).toContain('dataInput="grantDefaultDurationMs"');
     expect(page).toContain('data-input="quotaLimit"');

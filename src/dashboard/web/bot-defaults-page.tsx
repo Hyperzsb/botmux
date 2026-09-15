@@ -3488,7 +3488,7 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
   const { bot, patchBot } = props;
   const policy = bot.triggerUserAuth ?? null;
   const enabled = policy?.enabled === true;
-  const tools = policy?.tools ?? ['lark-cli', 'bytedcli'];
+  const tools = policy?.tools ?? ['lark-cli', 'bytedcli', 'larkdev'];
   const fallback = policy?.fallback ?? 'bot-identity';
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<StatusMessage>(null);
@@ -3536,7 +3536,7 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
     }
   }
 
-  function toggleTool(tool: 'lark-cli' | 'bytedcli', on: boolean): void {
+  function toggleTool(tool: 'lark-cli' | 'bytedcli' | 'larkdev', on: boolean): void {
     const next = on ? [...new Set([...tools, tool])] : tools.filter(t => t !== tool);
     void save({ enabled: true, tools: next, fallback });
   }
@@ -3558,7 +3558,7 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
         <>
           <div className="bd-row">
             <span>{tr('botDefaults.triggerUserAuthTools')}</span>
-            {(['lark-cli', 'bytedcli'] as const).map(tool => (
+            {(['lark-cli', 'bytedcli', 'larkdev'] as const).map(tool => (
               <label key={tool} className="bd-inline-check">
                 <input
                   type="checkbox"
@@ -3589,7 +3589,7 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
               </select>
             </label>
           </div>
-          {tools.includes('bytedcli') ? (
+          {tools.includes('bytedcli') || tools.includes('larkdev') ? (
             <p className="bd-section-note">{tr('botDefaults.triggerUserAuthBytedcliNote')}</p>
           ) : null}
           {typeof info?.authorizedCount === 'number' ? (
