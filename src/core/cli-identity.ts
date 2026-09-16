@@ -119,7 +119,16 @@ export const IDENTITY_ENV_KEYS: Record<TriggerUserAuthTool, readonly string[]> =
   'lark-cli': ['LARKSUITE_CLI_APP_ID', 'LARKSUITE_CLI_APP_SECRET', 'LARKSUITE_CLI_USER_ACCESS_TOKEN'],
   // ByteCloud JWT and the Codebase JWT derived from it. The latter is what git
   // pushes authenticate with, so attribution of a commit follows from it.
-  bytedcli: ['BYTEDCLI_USER_CLOUD_JWT', 'BYTEDCLI_USER_CODE_JWT'],
+  bytedcli: [
+    'BYTEDCLI_USER_CLOUD_JWT',
+    'BYTEDCLI_USER_CODE_JWT',
+    'BOTMUX_BYTEDCLI_CLOUD_JWT_CN',
+    'BOTMUX_BYTEDCLI_CLOUD_JWT_BOE',
+    'BOTMUX_BYTEDCLI_CLOUD_JWT_I18N_BD',
+    'BOTMUX_BYTEDCLI_CLOUD_JWT_I18N_TT',
+    'BOTMUX_BYTEDCLI_CLOUD_JWT_US_TTP',
+    'BOTMUX_BYTEDCLI_CLOUD_JWT_EU_TTP',
+  ],
   // larkdev's ByteCloud Auth SDK explicitly supports a non-interactive JWT.
   // Reuse the sender's bytedcli-backed login rather than creating a second
   // per-person credential store for the same identity provider.
@@ -158,6 +167,8 @@ export interface LarkCliIdentity extends TurnBound {
 export interface BytedCliIdentity extends TurnBound {
   tool: 'bytedcli';
   cloudJwt: string;
+  /** Target-site JWTs minted from the same person's private login state. */
+  cloudJwts?: Partial<Record<'cn' | 'boe' | 'i18n-bd' | 'i18n-tt' | 'us-ttp' | 'eu-ttp', string>>;
   /** Optional: only present once a Codebase JWT has been minted for this person. */
   codeJwt?: string;
 }
@@ -249,6 +260,19 @@ export function renderIdentityEnv(identity: CliIdentity): string {
     );
   } else if (identity.tool === 'bytedcli') {
     pairs.push([MODE_VAR, 'user'], ['BYTEDCLI_USER_CLOUD_JWT', identity.cloudJwt]);
+    const siteJwts = { cn: identity.cloudJwt, ...identity.cloudJwts };
+    const siteEnvKeys = {
+      cn: 'BOTMUX_BYTEDCLI_CLOUD_JWT_CN',
+      boe: 'BOTMUX_BYTEDCLI_CLOUD_JWT_BOE',
+      'i18n-bd': 'BOTMUX_BYTEDCLI_CLOUD_JWT_I18N_BD',
+      'i18n-tt': 'BOTMUX_BYTEDCLI_CLOUD_JWT_I18N_TT',
+      'us-ttp': 'BOTMUX_BYTEDCLI_CLOUD_JWT_US_TTP',
+      'eu-ttp': 'BOTMUX_BYTEDCLI_CLOUD_JWT_EU_TTP',
+    } as const;
+    for (const [site, key] of Object.entries(siteEnvKeys)) {
+      const jwt = siteJwts[site as keyof typeof siteJwts];
+      if (jwt) pairs.push([key, jwt]);
+    }
     if (identity.codeJwt) pairs.push(['BYTEDCLI_USER_CODE_JWT', identity.codeJwt]);
   } else {
     pairs.push([MODE_VAR, 'user'], ['BYTECLOUD_CLI_API_JWT_TOKEN', identity.cloudJwt]);
@@ -395,7 +419,45 @@ export function renderIdentityWrapper(tool: TriggerUserAuthTool, realBinaryPath:
     '',
     `case "$${MODE_VAR}" in`,
     '  user|bot)',
-    `    export ${exportKeys}`,
+    ...(tool === 'bytedcli' ? [
+      // A ByteCloud token is scoped to a cloud host.  Choose the token from the
+      // command's explicit --site (or BYTEDCLI_CLOUD_SITE/default CN) before
+      // exec, otherwise a valid CN login produces a misleading 401 on i18n-bd.
+      '    __botmux_site=${BYTEDCLI_CLOUD_SITE:-cn}',
+      '    __botmux_next_is_site=',
+      '    for __botmux_arg in "$@"; do',
+      '      if [ -n "$__botmux_next_is_site" ]; then',
+      '        __botmux_site=$__botmux_arg',
+      '        __botmux_next_is_site=',
+      '        continue',
+      '      fi',
+      '      case "$__botmux_arg" in',
+      '        --site) __botmux_next_is_site=1 ;;',
+      '        --site=*) __botmux_site=${__botmux_arg#--site=} ;;',
+      '      esac',
+      '    done',
+      '    case "$__botmux_site" in',
+      '      cn|prod|online) __botmux_cloud_jwt=$BOTMUX_BYTEDCLI_CLOUD_JWT_CN ;;',
+      '      boe|sandbox) __botmux_cloud_jwt=$BOTMUX_BYTEDCLI_CLOUD_JWT_BOE ;;',
+      '      i18n|i18n-bd) __botmux_cloud_jwt=$BOTMUX_BYTEDCLI_CLOUD_JWT_I18N_BD ;;',
+      '      i18n-tt) __botmux_cloud_jwt=$BOTMUX_BYTEDCLI_CLOUD_JWT_I18N_TT ;;',
+      '      us-ttp|us-ttp-bdee|us-ttp-usts) __botmux_cloud_jwt=$BOTMUX_BYTEDCLI_CLOUD_JWT_US_TTP ;;',
+      '      eu-ttp|eu-ttp-limited|eu-ttp-full) __botmux_cloud_jwt=$BOTMUX_BYTEDCLI_CLOUD_JWT_EU_TTP ;;',
+      '      *) __botmux_cloud_jwt= ;;',
+      '    esac',
+      '    if [ -z "$__botmux_cloud_jwt" ]; then',
+      `      printf '%s\n' "botmux: 当前用户没有可用于 ByteCloud site $__botmux_site 的凭证；请发送 /login bytedcli 后重试。" >&2`,
+      `      exit ${IDENTITY_DENIED_EXIT_CODE}`,
+      '    fi',
+      '    BYTEDCLI_USER_CLOUD_JWT=$__botmux_cloud_jwt',
+      '    export BYTEDCLI_USER_CLOUD_JWT BYTEDCLI_USER_CODE_JWT',
+      '    unset __botmux_site __botmux_next_is_site __botmux_arg __botmux_cloud_jwt',
+      '    unset BOTMUX_BYTEDCLI_CLOUD_JWT_CN BOTMUX_BYTEDCLI_CLOUD_JWT_BOE',
+      '    unset BOTMUX_BYTEDCLI_CLOUD_JWT_I18N_BD BOTMUX_BYTEDCLI_CLOUD_JWT_I18N_TT',
+      '    unset BOTMUX_BYTEDCLI_CLOUD_JWT_US_TTP BOTMUX_BYTEDCLI_CLOUD_JWT_EU_TTP',
+    ] : [
+      `    export ${exportKeys}`,
+    ]),
     '    ;;',
     '  turn-mismatch)',
     `    printf '%s\\n' 'botmux: 这条命令属于上一轮对话，而凭证已经切换到新消息的发起人；为避免用错人的权限，命令未执行。' >&2`,

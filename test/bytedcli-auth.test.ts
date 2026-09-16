@@ -21,14 +21,19 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { EventEmitter } from 'node:events';
 
-/** Every `bytedcli` invocation this test file caused: argv plus the HOME it ran under. */
-const calls: Array<{ args: string[]; home: string | undefined }> = [];
+/** Every `bytedcli` invocation this test file caused: argv plus its isolated environment. */
+const calls: Array<{ args: string[]; home: string | undefined; noProxy: string | undefined }> = [];
+const closeIpv4Proxy = vi.fn(async () => {});
+const startIpv4Proxy = vi.fn(async () => ({
+  url: 'http://127.0.0.1:43123',
+  close: closeIpv4Proxy,
+}));
 /** Queued replies, one per invocation, in order. */
 let replies: Array<{ code: number; stdout?: string; stderr?: string }> = [];
 
 vi.mock('node:child_process', () => ({
   spawn: vi.fn((_cmd: string, args: string[], opts: { env?: Record<string, string> }) => {
-    calls.push({ args, home: opts?.env?.HOME });
+    calls.push({ args, home: opts?.env?.HOME, noProxy: opts?.env?.NO_PROXY });
     const reply = replies.shift() ?? { code: 0, stdout: '' };
     const child = new EventEmitter() as EventEmitter & {
       stdout: EventEmitter; stderr: EventEmitter; kill: () => void;
@@ -44,6 +49,9 @@ vi.mock('node:child_process', () => ({
     });
     return child;
   }),
+}));
+vi.mock('../src/services/bytedcli-ipv4-proxy.js', () => ({
+  startBytedcliIpv4Proxy: startIpv4Proxy,
 }));
 
 let home: string;
@@ -64,12 +72,26 @@ beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), 'botmux-bytedcli-'));
   calls.length = 0;
   replies = [];
+  closeIpv4Proxy.mockClear();
+  startIpv4Proxy.mockClear();
 });
 afterEach(() => { rmSync(home, { recursive: true, force: true }); });
 
 /** bytedcli's `--json` envelope. */
 function envelope(data: unknown, status = 'success') {
   return `${JSON.stringify({ status, data, error: null })}\n`;
+}
+
+function jwtReplies(cloudJwt: string, codeJwt?: string) {
+  return [
+    { code: 0, stdout: `${cloudJwt}\n` },
+    { code: 0, stdout: `boe.${cloudJwt}\n` },
+    { code: 0, stdout: `i18n-bd.${cloudJwt}\n` },
+    { code: 0, stdout: `i18n-tt.${cloudJwt}\n` },
+    { code: 0, stdout: `us-ttp.${cloudJwt}\n` },
+    { code: 0, stdout: `eu-ttp.${cloudJwt}\n` },
+    codeJwt ? { code: 0, stdout: `${codeJwt}\n` } : { code: 1, stderr: 'codebase down' },
+  ];
 }
 
 describe('bytedcliHomeFor — the isolation boundary', () => {
@@ -115,6 +137,18 @@ describe('login — device code, in two steps', () => {
     expect(calls[0].home).not.toBe(home);
   });
 
+  it('routes the static ByteCloud runtime through the IPv4 proxy on Linux', async () => {
+    const mod = await fresh();
+    replies = [{ code: 0, stdout: envelope({ verification_uri_complete: 'https://x/y', complete_token: 't' }) }];
+    await mod.beginBytedcliLogin(ALICE);
+    expect(calls[0].args).toEqual(process.platform === 'linux'
+      ? ['--no-auto-upgrade', '--http-proxy', 'http://127.0.0.1:43123', '--http-timeout-ms', '3000', 'auth', 'login', '--begin', '--json']
+      : ['--no-auto-upgrade', 'auth', 'login', '--begin', '--json']);
+    expect(startIpv4Proxy).toHaveBeenCalledTimes(process.platform === 'linux' ? 1 : 0);
+    expect(calls[0].noProxy).toBe(process.platform === 'linux' ? '127.0.0.1,localhost' : process.env.NO_PROXY);
+    expect(closeIpv4Proxy).toHaveBeenCalledTimes(process.platform === 'linux' ? 1 : 0);
+  });
+
   it('reports failure rather than a half-built challenge', async () => {
     const mod = await fresh();
     replies = [{ code: 1, stderr: 'network unreachable' }];
@@ -122,10 +156,66 @@ describe('login — device code, in two steps', () => {
     expect(mod.pendingBytedcliChallenge(ALICE)).toBeNull();
   });
 
+  it('retries a transient ByteCloud runtime network failure', async () => {
+    const mod = await fresh();
+    replies = [
+      {
+        code: 1,
+        stdout: JSON.stringify({
+          status: 'error',
+          error: { code: 'BYTECLOUD_AUTH_RUNTIME_ERROR', message: 'TLS handshake timeout' },
+        }),
+      },
+      { code: 0, stdout: envelope({ verification_uri_complete: 'https://x/y', complete_token: 'tok-2' }) },
+    ];
+    expect(await mod.beginBytedcliLogin(ALICE)).toEqual({ authUrl: 'https://x/y', completeToken: 'tok-2' });
+    expect(calls).toHaveLength(2);
+    expect(startIpv4Proxy).toHaveBeenCalledTimes(process.platform === 'linux' ? 1 : 0);
+    expect(closeIpv4Proxy).toHaveBeenCalledTimes(process.platform === 'linux' ? 1 : 0);
+  });
+
+  it('does not retry an authentication rejection', async () => {
+    const mod = await fresh();
+    replies = [{ code: 1, stdout: JSON.stringify({ status: 'error', error: { code: 'AUTH_DENIED' } }) }];
+    expect(await mod.beginBytedcliLogin(ALICE)).toBeNull();
+    expect(calls).toHaveLength(1);
+  });
+
   it('treats "not clicked yet" as pending, not as an error', async () => {
     const mod = await fresh();
     replies = [{ code: 0, stdout: envelope({ status: 'pending' }) }];
     expect(await mod.completeBytedcliLogin(ALICE, 'tok-1')).toEqual({ state: 'pending' });
+  });
+
+  it('gives login completion its long-poll budget instead of the ordinary 3s timeout', async () => {
+    const mod = await fresh();
+    replies = [{ code: 0, stdout: envelope({ status: 'ok' }) }];
+
+    expect(await mod.completeBytedcliLogin(ALICE, 'tok-1')).toEqual({ state: 'authorized' });
+    if (process.platform === 'linux') {
+      expect(calls[0].args).toContain('30000');
+      expect(calls[0].args).not.toContain('3000');
+    }
+  });
+
+  it('does not multiply one login-completion timeout into five long polls', async () => {
+    const mod = await fresh();
+    replies = [{
+      code: 1,
+      stdout: JSON.stringify({
+        status: 'error',
+        error: {
+          code: 'BYTECLOUD_AUTH_LOGIN_TIMEOUT',
+          message: 'Request auth.login.complete timed out after 30000ms',
+        },
+      }),
+    }];
+
+    expect(await mod.completeBytedcliLogin(ALICE, 'tok-1')).toEqual({
+      state: 'failed',
+      detail: 'Request auth.login.complete timed out after 30000ms',
+    });
+    expect(calls).toHaveLength(1);
   });
 
   it('clears the challenge once the login lands', async () => {
@@ -157,13 +247,44 @@ describe('mintBytedcliJwts — fresh per turn, never borrowed', () => {
   it('mints both JWTs for an authorized person', async () => {
     const mod = await fresh();
     markLoggedIn(mod, ALICE);
-    replies = [{ code: 0, stdout: 'cloud.jwt.value\n' }, { code: 0, stdout: 'code.jwt.value\n' }];
+    replies = jwtReplies('cloud.jwt.value', 'code.jwt.value');
 
     expect(await mod.mintBytedcliJwts(ALICE)).toEqual({
       cloudJwt: 'cloud.jwt.value',
+      cloudJwts: {
+        cn: 'cloud.jwt.value',
+        boe: 'boe.cloud.jwt.value',
+        'i18n-bd': 'i18n-bd.cloud.jwt.value',
+        'i18n-tt': 'i18n-tt.cloud.jwt.value',
+        'us-ttp': 'us-ttp.cloud.jwt.value',
+        'eu-ttp': 'eu-ttp.cloud.jwt.value',
+      },
       codeJwt: 'code.jwt.value',
     });
     expect(calls.every(c => c.home === mod.bytedcliHomeFor(ALICE))).toBe(true);
+    expect(calls.slice(0, 6).map(c => c.args.slice(-4))).toEqual([
+      ['--site', 'cn', 'auth', 'get-bytecloud-jwt-token'],
+      ['--site', 'boe', 'auth', 'get-bytecloud-jwt-token'],
+      ['--site', 'i18n-bd', 'auth', 'get-bytecloud-jwt-token'],
+      ['--site', 'i18n-tt', 'auth', 'get-bytecloud-jwt-token'],
+      ['--site', 'us-ttp', 'auth', 'get-bytecloud-jwt-token'],
+      ['--site', 'eu-ttp', 'auth', 'get-bytecloud-jwt-token'],
+    ]);
+    expect(calls[6].args.slice(-2)).toEqual(['auth', 'get-codebase-jwt-token']);
+  });
+
+  it('gives ByteCloud JWT minting the long auth-runtime budget', async () => {
+    const mod = await fresh();
+    markLoggedIn(mod, ALICE);
+    replies = jwtReplies('cloud.jwt.value');
+
+    expect(await mod.mintBytedcliJwts(ALICE)).not.toBeNull();
+    if (process.platform === 'linux') {
+      for (const call of calls.slice(0, 6)) {
+        expect(call.args).toContain('30000');
+        expect(call.args).not.toContain('3000');
+      }
+    }
   });
 
   // The whole point: no login means no credentials, NOT the machine's own SSO
@@ -187,8 +308,18 @@ describe('mintBytedcliJwts — fresh per turn, never borrowed', () => {
   it('still authorizes when only the Codebase JWT is unavailable', async () => {
     const mod = await fresh();
     markLoggedIn(mod, ALICE);
-    replies = [{ code: 0, stdout: 'cloud.jwt.value\n' }, { code: 1, stderr: 'codebase down' }];
-    expect(await mod.mintBytedcliJwts(ALICE)).toEqual({ cloudJwt: 'cloud.jwt.value' });
+    replies = jwtReplies('cloud.jwt.value');
+    expect(await mod.mintBytedcliJwts(ALICE)).toEqual({
+      cloudJwt: 'cloud.jwt.value',
+      cloudJwts: {
+        cn: 'cloud.jwt.value',
+        boe: 'boe.cloud.jwt.value',
+        'i18n-bd': 'i18n-bd.cloud.jwt.value',
+        'i18n-tt': 'i18n-tt.cloud.jwt.value',
+        'us-ttp': 'us-ttp.cloud.jwt.value',
+        'eu-ttp': 'eu-ttp.cloud.jwt.value',
+      },
+    });
   });
 
   // Minted per turn on purpose: the ByteCloud JWT lives ~2h while the login
@@ -197,10 +328,7 @@ describe('mintBytedcliJwts — fresh per turn, never borrowed', () => {
   it('asks bytedcli again on every turn rather than caching', async () => {
     const mod = await fresh();
     markLoggedIn(mod, ALICE);
-    replies = [
-      { code: 0, stdout: 'jwt-1\n' }, { code: 0, stdout: 'code-1\n' },
-      { code: 0, stdout: 'jwt-2\n' }, { code: 0, stdout: 'code-2\n' },
-    ];
+    replies = [...jwtReplies('jwt-1', 'code-1'), ...jwtReplies('jwt-2', 'code-2')];
     expect((await mod.mintBytedcliJwts(ALICE))?.cloudJwt).toBe('jwt-1');
     expect((await mod.mintBytedcliJwts(ALICE))?.cloudJwt).toBe('jwt-2');
   });

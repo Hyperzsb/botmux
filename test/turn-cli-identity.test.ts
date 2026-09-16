@@ -174,13 +174,18 @@ describe('publishTurnCliIdentity — withholding removes, never inherits', () =>
   });
 
   it('publishes this person\'s own ByteCloud JWTs once they have authorized', async () => {
-    bytedcliJwts.set(ALICE, { cloudJwt: 'cloud-alice', codeJwt: 'code-alice' });
+    bytedcliJwts.set(ALICE, {
+      cloudJwt: 'cloud-alice',
+      cloudJwts: { cn: 'cloud-alice', 'i18n-bd': 'cloud-alice-i18n' },
+      codeJwt: 'code-alice',
+    });
     const config = botConfig({ enabled: true, tools: ['bytedcli'] });
     const outcomes = await publish(config, ALICE);
 
     expect(outcomes.find(o => o.tool === 'bytedcli')?.state).toBe('user');
     const body = readFileSync(sessionIdentityPath(dir, SESSION, 'bytedcli'), 'utf8');
     expect(body).toContain("BYTEDCLI_USER_CLOUD_JWT='cloud-alice'");
+    expect(body).toContain("BOTMUX_BYTEDCLI_CLOUD_JWT_I18N_BD='cloud-alice-i18n'");
     // git attribution rides this one.
     expect(body).toContain("BYTEDCLI_USER_CODE_JWT='code-alice'");
   });

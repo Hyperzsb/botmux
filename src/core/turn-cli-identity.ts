@@ -277,6 +277,11 @@ async function resolveIdentityFor(
   const jwts = await mintByteCloudJwts();
   if (!jwts) return null;
   return tool === 'bytedcli'
-    ? { tool: 'bytedcli', cloudJwt: jwts.cloudJwt, ...(jwts.codeJwt ? { codeJwt: jwts.codeJwt } : {}) }
+    ? {
+        tool: 'bytedcli',
+        cloudJwt: jwts.cloudJwt,
+        cloudJwts: jwts.cloudJwts,
+        ...(jwts.codeJwt ? { codeJwt: jwts.codeJwt } : {}),
+      }
     : { tool: 'larkdev', cloudJwt: jwts.cloudJwt };
 }

@@ -35,15 +35,25 @@ import { join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { logger } from '../utils/logger.js';
 import { isUsableOpenId } from '../utils/user-token.js';
+import { startBytedcliIpv4Proxy } from './bytedcli-ipv4-proxy.js';
 
 /** Root under which each authorized person gets their own bytedcli HOME. */
 const BYTEDCLI_HOME_ROOT = join(homedir(), '.botmux', 'data', 'bytedcli-home');
 
-/** How long to wait on a `bytedcli` invocation. The device-code calls talk to
- *  ByteCloud, so they are network-bound; the JWT reads are usually local but
- *  may refresh. Generous enough not to fail a slow network, short enough that a
- *  wedged CLI cannot hold a turn open. */
-const BYTEDCLI_TIMEOUT_MS = 30_000;
+/** Bound ordinary requests tightly so a black-holed ByteCloud TLS connection
+ *  can be retried without holding the chat command open for minutes. Login
+ *  completion is deliberately different: auth.login.complete is a long poll
+ *  and routinely needs more than three seconds after browser approval. */
+const BYTEDCLI_HTTP_TIMEOUT_MS = 3_000;
+const BYTEDCLI_ATTEMPT_TIMEOUT_MS = 8_000;
+const BYTEDCLI_MAX_ATTEMPTS = 5;
+const BYTEDCLI_COMPLETE_HTTP_TIMEOUT_MS = 30_000;
+const BYTEDCLI_COMPLETE_ATTEMPT_TIMEOUT_MS = 40_000;
+// Token minting also crosses the ByteCloud auth runtime. A freshly completed
+// login was measured taking more than 12 seconds to mint its first JWT, so the
+// ordinary 3-second request budget falsely turns valid logins into refusals.
+const BYTEDCLI_TOKEN_HTTP_TIMEOUT_MS = 30_000;
+const BYTEDCLI_TOKEN_ATTEMPT_TIMEOUT_MS = 40_000;
 
 /** ByteCloud gives a device-code challenge about an hour; expire ours a little
  *  sooner so we never hand back a token that is about to be refused. */
@@ -89,34 +99,94 @@ export interface BytedcliResult {
  * inherited, because bytedcli needs the usual PATH/proxy/site settings to reach
  * ByteCloud at all.
  */
-async function runAsUser(openId: string, args: string[]): Promise<BytedcliResult> {
+interface BytedcliRunOptions {
+  httpTimeoutMs?: number;
+  attemptTimeoutMs?: number;
+  maxAttempts?: number;
+}
+
+async function runAsUser(
+  openId: string,
+  args: string[],
+  options: BytedcliRunOptions = {},
+): Promise<BytedcliResult> {
   const home = bytedcliHomeFor(openId);
   mkdirSync(home, { recursive: true, mode: 0o700 });
-  return await new Promise<BytedcliResult>(resolve => {
-    const child = spawn('bytedcli', args, {
-      env: { ...process.env, HOME: home },
-      stdio: ['ignore', 'pipe', 'pipe'],
+  const httpTimeoutMs = options.httpTimeoutMs ?? BYTEDCLI_HTTP_TIMEOUT_MS;
+  const attemptTimeoutMs = options.attemptTimeoutMs ?? BYTEDCLI_ATTEMPT_TIMEOUT_MS;
+  const maxAttempts = options.maxAttempts ?? BYTEDCLI_MAX_ATTEMPTS;
+  const childEnv: NodeJS.ProcessEnv = { ...process.env, HOME: home };
+  let proxy: Awaited<ReturnType<typeof startBytedcliIpv4Proxy>> | undefined;
+  let commandArgs = ['--no-auto-upgrade', ...args];
+  if (process.platform === 'linux') {
+    // The bundled ByteCloud Auth runtime is a statically-linked Go binary, so
+    // GODEBUG=netdns=cgo is ignored. On dual-stack hosts an unreachable AAAA
+    // address can consequently consume the whole TLS deadline. A short-lived
+    // loopback CONNECT proxy resolves the gateway with Node's IPv4 resolver.
+    proxy = await startBytedcliIpv4Proxy();
+    commandArgs = [
+      '--no-auto-upgrade',
+      '--http-proxy', proxy.url,
+      '--http-timeout-ms', String(httpTimeoutMs),
+      ...args,
+    ];
+    // A host-level NO_PROXY entry for *.bytedance.net would bypass the explicit
+    // proxy. These values are private to this one child process.
+    childEnv.NO_PROXY = '127.0.0.1,localhost';
+    childEnv.no_proxy = '127.0.0.1,localhost';
+  }
+  try {
+    const runAttempt = () => new Promise<BytedcliResult>(resolve => {
+      const child = spawn('bytedcli', commandArgs, {
+        env: childEnv,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let stdout = '';
+      let stderr = '';
+      let settled = false;
+      const finish = (ok: boolean) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve({ ok, stdout, stderr });
+      };
+      const timer = setTimeout(() => {
+        child.kill('SIGKILL');
+        stderr += '\n[bytedcli-auth] timed out';
+        finish(false);
+      }, attemptTimeoutMs);
+      child.stdout.on('data', d => { stdout += String(d); });
+      child.stderr.on('data', d => { stderr += String(d); });
+      // A missing binary lands here, not on a non-zero exit.
+      child.on('error', err => { stderr += `\n${err.message}`; finish(false); });
+      child.on('close', code => finish(code === 0));
     });
-    let stdout = '';
-    let stderr = '';
-    let settled = false;
-    const finish = (ok: boolean) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolve({ ok, stdout, stderr });
-    };
-    const timer = setTimeout(() => {
-      child.kill('SIGKILL');
-      stderr += '\n[bytedcli-auth] timed out';
-      finish(false);
-    }, BYTEDCLI_TIMEOUT_MS);
-    child.stdout.on('data', d => { stdout += String(d); });
-    child.stderr.on('data', d => { stderr += String(d); });
-    // A missing binary lands here, not on a non-zero exit.
-    child.on('error', err => { stderr += `\n${err.message}`; finish(false); });
-    child.on('close', code => finish(code === 0));
-  });
+
+    let lastResult: BytedcliResult = { ok: false, stdout: '', stderr: '' };
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      lastResult = await runAttempt();
+      if (lastResult.ok || !isRetryableNetworkFailure(lastResult) || attempt === maxAttempts) {
+        return lastResult;
+      }
+      logger.warn(`[bytedcli-auth] transient network failure; retrying (${attempt}/${maxAttempts})`);
+      await new Promise(resolve => setTimeout(resolve, attempt * 100));
+    }
+    return lastResult;
+  } finally {
+    await proxy?.close();
+  }
+}
+
+function isRetryableNetworkFailure(result: BytedcliResult): boolean {
+  const output = `${result.stderr}\n${result.stdout}`.toLowerCase();
+  return output.includes('bytecloud_auth_runtime_error')
+    || output.includes('bytecloud_auth_login_timeout')
+    || output.includes('tls handshake timeout')
+    || output.includes('timeout awaiting response headers')
+    || output.includes('connection reset')
+    || output.includes('econnreset')
+    || output.includes('no route to host')
+    || output.includes('network is unreachable');
 }
 
 /** Parse bytedcli's `--json` envelope, which wraps everything in {status,data}. */
@@ -191,6 +261,8 @@ export interface BytedcliLoginChallenge {
  * shape that works when the person authorizing is on the other side of a chat.
  */
 export async function beginBytedcliLogin(openId: string): Promise<BytedcliLoginChallenge | null> {
+  // A failed fresh begin must not leave `done` pointing at an older challenge.
+  clearChallenge(openId);
   const { ok, stdout, stderr } = await runAsUser(openId, ['auth', 'login', '--begin', '--json']);
   const env = parseEnvelope(stdout);
   const data = env?.data as Record<string, unknown> | undefined;
@@ -199,7 +271,8 @@ export async function beginBytedcliLogin(openId: string): Promise<BytedcliLoginC
     : undefined;
   const completeToken = typeof data?.complete_token === 'string' ? data.complete_token : undefined;
   if (!ok || !authUrl || !completeToken) {
-    logger.warn(`[bytedcli-auth] could not start a login: ${stderr.trim() || stdout.trim() || 'no output'}`);
+    const detail = (env?.error as Record<string, unknown> | undefined)?.message;
+    logger.warn(`[bytedcli-auth] could not start a login: ${typeof detail === 'string' ? detail : stderr.trim() || stdout.trim() || 'no output'}`);
     return null;
   }
   saveChallenge(openId, completeToken);
@@ -221,6 +294,16 @@ export async function completeBytedcliLogin(
   const { ok, stdout, stderr } = await runAsUser(
     openId,
     ['auth', 'login', '--complete', completeToken, '--json'],
+    {
+      // ByteCloud Auth implements completion as a long-poll RPC. Keep the
+      // ordinary 3s budget for begin/JWT calls, but restore the SDK's 30s
+      // request budget here and leave process-shutdown headroom. One attempt is
+      // intentional: repeating five 30s polls would make one chat command hang
+      // for minutes, while the saved challenge remains available for `done`.
+      httpTimeoutMs: BYTEDCLI_COMPLETE_HTTP_TIMEOUT_MS,
+      attemptTimeoutMs: BYTEDCLI_COMPLETE_ATTEMPT_TIMEOUT_MS,
+      maxAttempts: 1,
+    },
   );
   const env = parseEnvelope(stdout);
   const data = env?.data as Record<string, unknown> | undefined;
@@ -234,10 +317,27 @@ export async function completeBytedcliLogin(
 }
 
 export interface BytedcliJwts {
+  /** Default CN credential, kept for consumers such as larkdev and git fallback. */
   cloudJwt: string;
+  /**
+   * ByteCloud JWTs are target-site scoped.  In particular, a CN JWT is not
+   * accepted by i18n-bd even though both sites use the same ByteDance SSO
+   * login.  The bytedcli wrapper selects one of these for each invocation.
+   */
+  cloudJwts: Partial<Record<BytedcliCredentialSite, string>>;
   /** Git pushes authenticate with this one, so commit attribution follows it. */
   codeJwt?: string;
 }
+
+export const BYTEDCLI_CREDENTIAL_SITES = [
+  'cn',
+  'boe',
+  'i18n-bd',
+  'i18n-tt',
+  'us-ttp',
+  'eu-ttp',
+] as const;
+export type BytedcliCredentialSite = typeof BYTEDCLI_CREDENTIAL_SITES[number];
 
 /**
  * Mint this person's JWTs for the current turn.
@@ -252,11 +352,41 @@ export interface BytedcliJwts {
  */
 export async function mintBytedcliJwts(openId: string): Promise<BytedcliJwts | null> {
   if (!hasBytedcliHome(openId)) return null;
-  const cloud = await runAsUser(openId, ['auth', 'get-bytecloud-jwt-token']);
-  const cloudJwt = cloud.stdout.trim();
-  if (!cloud.ok || !cloudJwt) {
-    logger.debug(`[bytedcli-auth] no ByteCloud JWT for ${openId}: ${cloud.stderr.trim() || 'empty output'}`);
+  // A ByteCloud JWT is scoped to the target cloud host, not merely to the SSO
+  // identity that minted it.  `cn` and `i18n-bd`, for example, share the
+  // ByteDance login but reject one another's JWT at the API boundary. Mint all
+  // supported sites now, while the daemon still owns the private per-person
+  // HOME. Calls are concurrent because any one may spend seconds in the auth
+  // runtime. One long attempt is enough; the next turn naturally retries.
+  const tokenRunOptions: BytedcliRunOptions = {
+    httpTimeoutMs: BYTEDCLI_TOKEN_HTTP_TIMEOUT_MS,
+    attemptTimeoutMs: BYTEDCLI_TOKEN_ATTEMPT_TIMEOUT_MS,
+    maxAttempts: 1,
+  };
+  const siteResults = await Promise.all(BYTEDCLI_CREDENTIAL_SITES.map(async site => ({
+    site,
+    result: await runAsUser(
+      openId,
+      ['--site', site, 'auth', 'get-bytecloud-jwt-token'],
+      tokenRunOptions,
+    ),
+  })));
+  const cn = siteResults.find(({ site }) => site === 'cn')?.result;
+  const cloudJwt = cn?.stdout.trim() ?? '';
+  if (!cn?.ok || !cloudJwt) {
+    logger.debug(`[bytedcli-auth] no ByteCloud JWT for ${openId}: ${cn?.stderr.trim() || 'empty output'}`);
     return null;
+  }
+
+  // CN remains required for backwards compatibility; the other sites are best
+  // effort so an outage in one remote region does not deny every bytedcli call.
+  const cloudJwts: Partial<Record<BytedcliCredentialSite, string>> = {};
+  for (const { site, result } of siteResults) {
+    const jwt = result.stdout.trim();
+    if (result.ok && jwt) cloudJwts[site] = jwt;
+    else logger.debug(
+      `[bytedcli-auth] no ${site} ByteCloud JWT for ${openId}: ${result.stderr.trim() || 'empty output'}`,
+    );
   }
   // The Codebase JWT is optional: without it lark/bytedcli calls still work and
   // only git attribution degrades, so a failure here must not deny the turn.
@@ -265,5 +395,5 @@ export async function mintBytedcliJwts(openId: string): Promise<BytedcliJwts | n
   if (!codeJwt) {
     logger.debug(`[bytedcli-auth] no Codebase JWT for ${openId}; git attribution will fall back`);
   }
-  return { cloudJwt, ...(codeJwt ? { codeJwt } : {}) };
+  return { cloudJwt, cloudJwts, ...(codeJwt ? { codeJwt } : {}) };
 }

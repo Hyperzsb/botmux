@@ -54,6 +54,16 @@ describe('renderIdentityEnv', () => {
     expect(body).not.toContain('BYTEDCLI_USER_CODE_JWT');
   });
 
+  it('keeps target-site ByteCloud JWTs in the current session identity', () => {
+    const body = renderIdentityEnv({
+      tool: 'bytedcli',
+      cloudJwt: 'cn.jwt',
+      cloudJwts: { cn: 'cn.jwt', 'i18n-bd': 'i18n.jwt' },
+    });
+    expect(body).toContain("BOTMUX_BYTEDCLI_CLOUD_JWT_CN='cn.jwt'");
+    expect(body).toContain("BOTMUX_BYTEDCLI_CLOUD_JWT_I18N_BD='i18n.jwt'");
+  });
+
   it('emits the ByteCloud JWT larkdev consumes without exposing Codebase credentials', () => {
     const body = renderIdentityEnv({ tool: 'larkdev', cloudJwt: 'cloud.jwt' });
     expect(body).toContain("BYTECLOUD_CLI_API_JWT_TOKEN='cloud.jwt'");
@@ -355,6 +365,42 @@ describe('renderIdentityWrapper', () => {
 
     const out = runWrapper(wrapperPath, { SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION }, ['im', '+send']);
     expect(out).toBe('cli_app|u-tok|im +send');
+  });
+
+  it('selects the ByteCloud JWT matching --site and hides the other site JWTs', () => {
+    const real = join(dir, 'real-bytedcli.sh');
+    writeFileSync(real, '#!/bin/sh\nprintf "%s|%s|%s" "$BYTEDCLI_USER_CLOUD_JWT" "${BOTMUX_BYTEDCLI_CLOUD_JWT_CN-unset}" "$*"\n');
+    chmodSync(real, 0o755);
+    const wrapperPath = join(dir, 'bytedcli');
+    writeFileSync(wrapperPath, renderIdentityWrapper('bytedcli', real));
+    writeSessionIdentity(dir, SESSION, {
+      tool: 'bytedcli',
+      cloudJwt: 'cn.jwt',
+      cloudJwts: { cn: 'cn.jwt', 'i18n-bd': 'i18n.jwt' },
+    });
+
+    const out = runWrapper(
+      wrapperPath,
+      { SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION },
+      ['--site', 'i18n-bd', 'log', 'get-logid-log'],
+    );
+    expect(out).toBe('i18n.jwt|unset|--site i18n-bd log get-logid-log');
+  });
+
+  it('uses BYTEDCLI_CLOUD_SITE aliases and refuses an unminted site', () => {
+    const real = join(dir, 'real-bytedcli.sh');
+    writeFileSync(real, '#!/bin/sh\nprintf "%s" "$BYTEDCLI_USER_CLOUD_JWT"\n');
+    chmodSync(real, 0o755);
+    const wrapperPath = join(dir, 'bytedcli');
+    writeFileSync(wrapperPath, renderIdentityWrapper('bytedcli', real));
+    writeSessionIdentity(dir, SESSION, {
+      tool: 'bytedcli', cloudJwt: 'cn.jwt', cloudJwts: { cn: 'cn.jwt', boe: 'boe.jwt' },
+    });
+    const env = { SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION, BYTEDCLI_CLOUD_SITE: 'sandbox' };
+    expect(runWrapper(wrapperPath, env)).toBe('boe.jwt');
+    const denied = runDenied(wrapperPath, { ...env, BYTEDCLI_CLOUD_SITE: 'i18n-bd' });
+    expect(denied.status).toBe(IDENTITY_DENIED_EXIT_CODE);
+    expect(denied.stderr).toContain('i18n-bd');
   });
 
   it('gives larkdev the current sender JWT and clears higher-priority inherited site JWTs', () => {
