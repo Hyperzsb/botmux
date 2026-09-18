@@ -84,6 +84,7 @@ describe('bot defaults focused layout', () => {
 
     // 会话常驻上限(含机器过载告警) + 启动命令 + /summary 总结范围 live under 会话.
     expect(sessions).toContain('<SessionCapSection');
+    expect(sessions).toContain('<AutoIdleSessionCleanupSection');
     expect(sessions).toContain('<StartupCommandsSection');
     expect(sessions).toContain('<SummaryTriggerSection');
     // 默认角色 moved to 常用.
@@ -98,6 +99,7 @@ describe('bot defaults focused layout', () => {
     expect(advanced).toContain('<SessionOwnerReminderSection');
     // and the moved sections no longer sit in their old homes
     expect(advanced).not.toContain('<SessionCapSection');
+    expect(advanced).not.toContain('<AutoIdleSessionCleanupSection');
     expect(common).not.toContain('<BackendTypeSection');
     // 启动命令 was pulled out of the 启动环境 composite (Shell + env stay there).
     const runtimeEnv = page.slice(page.indexOf('function RuntimeEnvironmentSection'), page.indexOf('function RuntimeEnvironmentSection') + 400);

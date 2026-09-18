@@ -3943,11 +3943,16 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     agentSelectionKey = selectionKeyForBot(cliId, wrapperCli ?? undefined);
   } catch { /* no registered bot */ }
   let maxLiveWorkers: number | null = null;
+  let autoCleanupIdleHours: number | null = null;
   let sessionOwnerReminder = DEFAULT_SESSION_OWNER_REMINDER;
   try {
     const botConfig = getBot(cachedLarkAppId).config;
     const m = botConfig.maxLiveWorkers;
     if (typeof m === 'number' && Number.isInteger(m) && m > 0) maxLiveWorkers = m;
+    const cleanupHours = botConfig.autoCleanupIdleHours;
+    if (typeof cleanupHours === 'number' && Number.isInteger(cleanupHours) && cleanupHours > 0) {
+      autoCleanupIdleHours = cleanupHours;
+    }
     sessionOwnerReminder = botConfig.sessionOwnerReminder ?? DEFAULT_SESSION_OWNER_REMINDER;
   } catch { /* default unlimited */ }
   let logicalSessionCount = 0;
@@ -4074,6 +4079,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     // value when this bot has no explicit override (prompt/global/off).
     skillInjectionDefault: globalBuiltinSkillInjectionDefault(),
     maxLiveWorkers,
+    autoCleanupIdleHours,
     sessionOwnerReminder,
     logicalSessionCount,
     residentSessionCount,
@@ -5174,6 +5180,36 @@ ipcRoute('PUT', '/api/bot-max-live-workers', async (req, res) => {
   const r = await applyConfigField(cachedLarkAppId, spec, value);
   if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
   jsonRes(res, 200, { ok: true, maxLiveWorkers: value });
+});
+
+// Per-bot idle session lifetime. A positive integer enables automatic close
+// after that many hours without activity; null disables it. The daemon scan
+// reads the hot-updated registry value on every pass and again before closing.
+ipcRoute('PUT', '/api/bot-auto-cleanup-idle-hours', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let raw: unknown;
+  try { raw = await readJsonBody(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    return jsonRes(res, 400, { ok: false, error: 'no_valid_fields' });
+  }
+  const body = raw as { autoCleanupIdleHours?: unknown };
+  const spec = findConfigField('autoCleanupIdleHours');
+  if (!spec) return jsonRes(res, 500, { ok: false, error: 'spec_missing' });
+
+  let value: number | null;
+  if (body.autoCleanupIdleHours === null || body.autoCleanupIdleHours === undefined) {
+    value = null;
+  } else {
+    const coerced = coerceConfigValue(spec, body.autoCleanupIdleHours);
+    if (!coerced.ok || typeof coerced.value !== 'number') {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_number' });
+    }
+    value = coerced.value;
+  }
+  const result = await applyConfigField(cachedLarkAppId, spec, value);
+  if (!result.ok) return jsonRes(res, 400, { ok: false, error: result.reason });
+  return jsonRes(res, 200, { ok: true, autoCleanupIdleHours: value });
 });
 
 ipcRoute('PUT', '/api/bot-session-owner-reminder', async (req, res) => {

@@ -202,6 +202,7 @@ import {
   getDaemonStreamingCardUsageSnapshot,
   postTurnStartingCard,
   isSessionTransferring,
+  isSessionLifecycleInFlight,
   snapshotCodexAppFinalSettlements,
   codexAppFinalSettlementCount,
   type WorkerSessionReplyOptions,
@@ -297,6 +298,10 @@ import { HerdrBackend } from './adapters/backend/herdr-backend.js';
 import { ZellijBackend } from './adapters/backend/zellij-backend.js';
 import { ZmxBackend } from './adapters/backend/zmx-backend.js';
 import { sweepIdleWorkersAfterTurnDrain, DEFAULT_MAX_LIVE_WORKERS } from './core/idle-worker-sweeper.js';
+import {
+  AUTO_IDLE_SESSION_CLEANUP_SCAN_INTERVAL_MS,
+  cleanupAutoIdleSessionsAfterTurnDrain,
+} from './core/auto-idle-session-cleanup.js';
 import {
   DEFAULT_SESSION_OWNER_REMINDER,
   SessionOwnerReminderController,
@@ -22676,6 +22681,41 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   }, 60_000);
   idleWorkerSweepTimer.unref?.();
 
+  let autoIdleSessionCleanupInFlight = false;
+  const scanAutoIdleSessionCleanup = async (): Promise<void> => {
+    if (autoIdleSessionCleanupInFlight) return;
+    autoIdleSessionCleanupInFlight = true;
+    try {
+      const cleanup = await cleanupAutoIdleSessionsAfterTurnDrain(
+        cfg.larkAppId,
+        activeSessions,
+        () => getBot(cfg.larkAppId).config.autoCleanupIdleHours,
+        closeSessionForBackgroundCleanup,
+        { isTransferring: isSessionTransferring, isLifecycleInFlight: isSessionLifecycleInFlight },
+      );
+      if (cleanup.closed > 0 || cleanup.failed > 0 || cleanup.residual > 0) {
+        logger.info(
+          `[auto-idle-session-cleanup] matched=${cleanup.matched} closed=${cleanup.closed} `
+          + `failed=${cleanup.failed} residual=${cleanup.residual} skipped=${cleanup.skipped} `
+          + `hours=${cleanup.olderThanHours ?? 'disabled'}`,
+        );
+      }
+    } catch (error) {
+      logger.warn(
+        `[auto-idle-session-cleanup] scan failed: `
+        + `${error instanceof Error ? error.message : String(error)}`,
+      );
+    } finally {
+      autoIdleSessionCleanupInFlight = false;
+    }
+  };
+  const autoIdleSessionCleanupTimer = setInterval(
+    () => { void scanAutoIdleSessionCleanup(); },
+    AUTO_IDLE_SESSION_CLEANUP_SCAN_INTERVAL_MS,
+  );
+  autoIdleSessionCleanupTimer.unref?.();
+  void scanAutoIdleSessionCleanup();
+
   const sessionOwnerReminder = new SessionOwnerReminderController({
     load: () => loadSessionOwnerReminderRecords(config.session.dataDir, cfg.larkAppId),
     save: records => saveSessionOwnerReminderRecords(config.session.dataDir, cfg.larkAppId, records),
@@ -23071,6 +23111,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     for (const key of [...vcMeetingPendingInvites.keys()]) deleteVcMeetingPendingInvite(key);
     clearInterval(descriptorHeartbeat);
     clearInterval(idleWorkerSweepTimer);
+    clearInterval(autoIdleSessionCleanupTimer);
     clearInterval(sessionOwnerReminderTimer);
     if (memoryDiagnostics) clearInterval(memoryDiagnostics);
     removeDaemonDescriptor(cfg.larkAppId);

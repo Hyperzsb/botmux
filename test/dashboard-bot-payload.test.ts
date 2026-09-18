@@ -16,7 +16,7 @@ describe('dashboard bot payload helpers', () => {
     const editableFields = [
       'agentSelectionKey', 'autoGrantRequestCards', 'autoStartOnGroupJoin',
       'autoStartOnGroupJoinPrompt', 'autoStartOnGroupJoinSeed', 'autoStartOnGroupJoinSeedDefault',
-      'autoStartOnNewTopic', 'backendType',
+      'autoStartOnNewTopic', 'autoCleanupIdleHours', 'backendType',
       'botToBotSameDir', 'brandLabel', 'canTalkDaemonCommands', 'cliRuntime', 'codexAppCleanInput', 'codexAuthSync',
       'customPassthroughCommands', 'defaultOncall', 'defaultWorkingDir',
       'defaultWorkingDirAutoWorktree', 'disableStreamingCard', 'docSubscribeDefaultMode',

@@ -1556,6 +1556,13 @@ export interface BotConfig {
    * sessions are never suspended. See core/idle-worker-sweeper.ts.
    */
   maxLiveWorkers?: number;
+  /**
+   * Automatically close this bot's logical sessions after this many hours
+   * without activity. Missing means disabled. Only safe idle/dormant sessions
+   * are eligible; active turns and sessions holding deferred input are skipped.
+   * Read live by the daemon's periodic cleanup scan.
+   */
+  autoCleanupIdleHours?: number;
   /** Periodically @ the persisted Session owner while selected actionable
    * runtime states remain unchanged. Missing means disabled. */
   sessionOwnerReminder?: SessionOwnerReminderConfig;
@@ -3255,6 +3262,11 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       maxLiveWorkers: typeof entry.maxLiveWorkers === 'number'
         && Number.isInteger(entry.maxLiveWorkers) && entry.maxLiveWorkers > 0
         ? entry.maxLiveWorkers
+        : undefined,
+      // Positive integer only; absent/invalid = automatic cleanup disabled.
+      autoCleanupIdleHours: typeof entry.autoCleanupIdleHours === 'number'
+        && Number.isInteger(entry.autoCleanupIdleHours) && entry.autoCleanupIdleHours > 0
+        ? entry.autoCleanupIdleHours
         : undefined,
       sessionOwnerReminder: normalizeSessionOwnerReminderConfig(entry.sessionOwnerReminder),
       // Only explicit true persisted (undefined = off), same as restrictGrantCommands.

@@ -6684,6 +6684,24 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // PUT /api/bots/:appId/auto-cleanup-idle-hours — proxy the per-Bot idle
+    // lifetime setting to its daemon. null disables automatic cleanup.
+    let mBotAutoCleanup: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotAutoCleanup = url.pathname.match(/^\/api\/bots\/([^/]+)\/auto-cleanup-idle-hours$/))) {
+      const appId = decodeURIComponent(mBotAutoCleanup[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-auto-cleanup-idle-hours`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
     // Native Feishu/Lark conversation labels (feed groups). These APIs are
     // user-token-only, so the frontend pins subsequent create/assign calls to
     // the same app whose OAuth token produced this list.

@@ -1033,6 +1033,7 @@ function BotDefaultsCard(props: {
               <CrossBotSection bot={bot} putCardPref={putCardPref} />
             </section>
             <section className="bd-tile"><SessionCapSection bot={bot} patchBot={patchBot} /></section>
+            <section className="bd-tile"><AutoIdleSessionCleanupSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile"><StartupCommandsSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile"><SummaryTriggerSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} /></section>
           </BdTabGrid>
@@ -5366,6 +5367,90 @@ function SessionCapSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
         <button type="button" className="primary" data-action="save-session-cap" disabled={busy} onClick={saveInput}>{tr('botDefaults.maxLiveWorkersSave')}</button>
         <button type="button" data-action="off-session-cap" disabled={busy} onClick={() => { setInput(''); void save(null); }}>{tr('botDefaults.maxLiveWorkersOff')}</button>
         <StatusSpan status={status} attr={{ 'data-session-cap-status': '' }} />
+      </div>
+    </section>
+  );
+}
+
+function AutoIdleSessionCleanupSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+  const tr = useT();
+  const initial = typeof props.bot.autoCleanupIdleHours === 'number'
+    ? props.bot.autoCleanupIdleHours
+    : null;
+  const [hours, setHours] = useState<number | null>(initial);
+  const [input, setInput] = useState(initial == null ? '' : String(initial));
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    const next = typeof props.bot.autoCleanupIdleHours === 'number'
+      ? props.bot.autoCleanupIdleHours
+      : null;
+    setHours(next);
+    setInput(next == null ? '' : String(next));
+  }, [props.bot.autoCleanupIdleHours]);
+
+  async function save(value: number | null): Promise<void> {
+    setStatus(null);
+    setBusy(true);
+    try {
+      const res = await sendJson(
+        'PUT',
+        `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/auto-cleanup-idle-hours`,
+        { autoCleanupIdleHours: value },
+      );
+      if (res.ok && res.body.ok) {
+        const next = typeof res.body.autoCleanupIdleHours === 'number'
+          ? res.body.autoCleanupIdleHours
+          : null;
+        setHours(next);
+        setInput(next == null ? '' : String(next));
+        props.patchBot(props.bot.larkAppId, { autoCleanupIdleHours: next });
+        setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
+      } else {
+        setStatus({ text: `✗ ${responseErrorText(res)}` });
+      }
+    } catch (error: any) {
+      setStatus({ text: `✗ ${caughtErrorText(error)}` });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function saveInput(): void {
+    const parsed = positiveIntegerOrNull(input);
+    if (parsed === 'invalid') {
+      setStatus({ text: `✗ ${tr('botDefaults.autoCleanupIdleHoursInvalid')}` });
+      return;
+    }
+    void save(parsed);
+  }
+
+  return (
+    <section className="bd-section">
+      <h3 className="bd-section-title">{tr('botDefaults.autoCleanupIdleTitle')}</h3>
+      <div className="bd-row">
+        <label>
+          <FieldTitle help={tr('botDefaults.autoCleanupIdleHelp')}>{tr('botDefaults.autoCleanupIdleHours')}</FieldTitle>
+          <input
+            type="number"
+            min={1}
+            step={1}
+            data-input="autoCleanupIdleHours"
+            placeholder={tr('botDefaults.autoCleanupIdlePlaceholder')}
+            value={input}
+            disabled={busy}
+            onChange={event => setInput(event.currentTarget.value)}
+          />
+        </label>
+        <small data-auto-cleanup-idle-state>{hours == null
+          ? tr('botDefaults.autoCleanupIdleStateOff')
+          : tr('botDefaults.autoCleanupIdleStateOn', { hours })}</small>
+      </div>
+      <div className="actions">
+        <button type="button" className="primary" data-action="save-auto-cleanup-idle" disabled={busy} onClick={saveInput}>{tr('botDefaults.autoCleanupIdleSave')}</button>
+        <button type="button" data-action="off-auto-cleanup-idle" disabled={busy} onClick={() => { setInput(''); void save(null); }}>{tr('botDefaults.autoCleanupIdleOff')}</button>
+        <StatusSpan status={status} attr={{ 'data-auto-cleanup-idle-status': '' }} />
       </div>
     </section>
   );

@@ -215,6 +215,20 @@ describe('parseBotConfigsFromText — brand', () => {
     }
   });
 
+  it('keeps only a positive-integer autoCleanupIdleHours value', () => {
+    const [valid] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'a', larkAppSecret: 's', autoCleanupIdleHours: 48 },
+    ]));
+    expect(valid.autoCleanupIdleHours).toBe(48);
+
+    for (const bad of [0, -2, 1.5, '48', null] as const) {
+      const [invalid] = mod.parseBotConfigsFromText(JSON.stringify([
+        { larkAppId: 'a', larkAppSecret: 's', autoCleanupIdleHours: bad },
+      ]));
+      expect(invalid.autoCleanupIdleHours).toBeUndefined();
+    }
+  });
+
   it('keeps only a valid sessionOwnerReminder configuration', () => {
     const reminder = {
       enabled: true,

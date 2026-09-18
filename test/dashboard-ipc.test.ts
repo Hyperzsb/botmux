@@ -793,6 +793,65 @@ describe('POST /api/session-origin/attest', () => {
   }, 5_000);
 });
 
+describe('PUT /api/bot-auto-cleanup-idle-hours', () => {
+  it('is default-off, hot-updates a positive duration, rejects invalid values, and clears with null', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-auto-idle-cleanup-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-auto-idle-cleanup-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'codex',
+      }], null, 2));
+      loadBotConfigs().forEach((config: any) => registerBot(config));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+
+      const initial = await (await fetch(`${base}/api/bot-default-oncall`)).json();
+      expect(initial.autoCleanupIdleHours).toBeNull();
+
+      const enabled = await fetch(`${base}/api/bot-auto-cleanup-idle-hours`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ autoCleanupIdleHours: 48 }),
+      });
+      expect(enabled.status).toBe(200);
+      expect(await enabled.json()).toEqual({ ok: true, autoCleanupIdleHours: 48 });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].autoCleanupIdleHours).toBe(48);
+      expect(getBot(appId).config.autoCleanupIdleHours).toBe(48);
+      expect(await (await fetch(`${base}/api/bot-default-oncall`)).json())
+        .toMatchObject({ autoCleanupIdleHours: 48 });
+
+      const invalid = await fetch(`${base}/api/bot-auto-cleanup-idle-hours`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ autoCleanupIdleHours: 0 }),
+      });
+      expect(invalid.status).toBe(400);
+      expect(await invalid.json()).toMatchObject({ ok: false, error: 'invalid_number' });
+      expect(getBot(appId).config.autoCleanupIdleHours).toBe(48);
+
+      const disabled = await fetch(`${base}/api/bot-auto-cleanup-idle-hours`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ autoCleanupIdleHours: null }),
+      });
+      expect(disabled.status).toBe(200);
+      expect(await disabled.json()).toEqual({ ok: true, autoCleanupIdleHours: null });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].autoCleanupIdleHours).toBeUndefined();
+      expect(getBot(appId).config.autoCleanupIdleHours).toBeUndefined();
+    } finally {
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('PUT /api/bot-card-prefs — Codex App clean history', () => {
   it('is default-off and persists explicit on/off changes immediately', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-codex-clean-'));

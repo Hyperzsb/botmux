@@ -110,6 +110,7 @@ export type BotDefaultsRow = {
   feedback?: FeedbackPolicyLayer | null;
   docSubscribeDefaultMode?: string;
   maxLiveWorkers?: number | null;
+  autoCleanupIdleHours?: number | null;
   logicalSessionCount?: number;
   residentSessionCount?: number;
   dormantSessionCount?: number;

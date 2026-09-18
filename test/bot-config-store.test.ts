@@ -527,6 +527,20 @@ describe('bot-config store', () => {
     expect(registry.getBot('app_default').config.maxLiveWorkers).toBeUndefined();
   });
 
+  it('autoCleanupIdleHours round-trips, hot-updates, and clears on null', async () => {
+    const { registry, store } = await loaded();
+    const spec = store.findConfigField('autoCleanupIdleHours')!;
+    expect(spec).toMatchObject({ kind: 'number', effect: 'immediate', clearable: true });
+
+    expect((await store.applyConfigField('app_default', spec, 72)).ok).toBe(true);
+    expect(readConfig().autoCleanupIdleHours).toBe(72);
+    expect(registry.getBot('app_default').config.autoCleanupIdleHours).toBe(72);
+
+    expect((await store.applyConfigField('app_default', spec, null)).ok).toBe(true);
+    expect(readConfig().autoCleanupIdleHours).toBeUndefined();
+    expect(registry.getBot('app_default').config.autoCleanupIdleHours).toBeUndefined();
+  });
+
   it('session owner reminder config round-trips and hot-updates the registered Bot', async () => {
     const { registry } = await loaded();
     const reminderStore = await import('../src/services/session-owner-reminder-config-store.js');

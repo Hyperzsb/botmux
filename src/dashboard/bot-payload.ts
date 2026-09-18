@@ -142,6 +142,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     skillInjectionDefault: (j?.skillInjectionDefault === 'global' || j?.skillInjectionDefault === 'off') ? j.skillInjectionDefault : 'prompt',
     skillInjectionSupport: (j?.skillInjectionSupport === 'dynamic' || j?.skillInjectionSupport === 'global') ? j.skillInjectionSupport : 'none',
     maxLiveWorkers: typeof j?.maxLiveWorkers === 'number' ? j.maxLiveWorkers : null,
+    autoCleanupIdleHours: typeof j?.autoCleanupIdleHours === 'number' ? j.autoCleanupIdleHours : null,
     logicalSessionCount: typeof j?.logicalSessionCount === 'number' ? j.logicalSessionCount : 0,
     residentSessionCount: typeof j?.residentSessionCount === 'number' ? j.residentSessionCount : 0,
     dormantSessionCount: typeof j?.dormantSessionCount === 'number' ? j.dormantSessionCount : 0,
