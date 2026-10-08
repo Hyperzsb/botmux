@@ -14214,14 +14214,7 @@ async function spawnCli(
   // set their own canonical HOME + enforce a real Seatbelt/bwrap boundary, and the
   // agent CLI data is redirected into BOT_HOME there. This override is a per-user
   // convenience boundary for plain sessions only — not a security boundary.
-  // TRAEX is a host-managed installation: its installer/updater owns
-  // ~/.local/bin and ~/.local/share/traex. Running it with a mirrored
-  // tool-home would write through shared .local symlinks and leave host links
-  // whose targets point back into that session. Keep the per-user HOME mirror
-  // for auxiliary CLIs, but always run TRAEX itself from the canonical host
-  // HOME; its own ~/.trae data is intentionally shared by the adapter.
-  const perUserToolAuthOn = cliAdapter.id !== 'traex'
-    && !sandboxRequested
+  const perUserToolAuthOn = !sandboxRequested
     && !credentialBoundaryActive
     && !cfg.adoptMode
     && perUserToolAuthEnabled({ perBot: cfg.perUserToolAuth, env: process.env });

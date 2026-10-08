@@ -250,6 +250,10 @@ export function resolveHostTraexExecutable(): string {
   return candidates[0]!;
 }
 
+function isBotmuxTraexProxy(path: string): boolean {
+  return path.replaceAll('\\', '/').endsWith('/.botmux/bin/traex_proxy.sh');
+}
+
 export function classifyTraexStartupProbeForTest(input: {
   status: number | null;
   stdout: string;
@@ -284,7 +288,14 @@ export function classifyTraexStartupProbeForTest(input: {
 }
 
 export function createTraexAdapter(pathOverride?: string): CliAdapter {
-  const rawBin = pathOverride?.trim() || resolveHostTraexExecutable();
+  const explicitBin = pathOverride?.trim();
+  // Older local bot configs point at the host-side proxy wrapper. That wrapper
+  // may predate the per-user HOME contract and force HOME back to the host.
+  // Keep arbitrary custom overrides working, but bypass this known Botmux
+  // wrapper so the runtime child can receive its per-user tool-home HOME.
+  const rawBin = explicitBin && !isBotmuxTraexProxy(explicitBin)
+    ? explicitBin
+    : resolveHostTraexExecutable();
   let cachedBin: string | undefined;
   return {
     id: 'traex',
