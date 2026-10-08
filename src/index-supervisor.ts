@@ -13,8 +13,11 @@ import { homedir } from 'node:os';
 import { existsSync, readFileSync } from 'node:fs';
 import { installStdioEpipeGuard } from './utils/stdio-epipe-guard.js';
 import { scrubClaudeSessionMarkerEnv, scrubSessionCliHomeEnv, scrubWorkflowWorkerEnv } from './utils/child-env.js';
+import { normalizeBotmuxHostHome } from './utils/host-home.js';
 
 installStdioEpipeGuard();
+
+normalizeBotmuxHostHome(process.env);
 
 const configDir = join(homedir(), '.botmux');
 const globalEnv = join(configDir, '.env');

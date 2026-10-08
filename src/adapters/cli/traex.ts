@@ -1,5 +1,7 @@
-import { existsSync, statSync } from 'node:fs';
+import { existsSync, realpathSync, statSync } from 'node:fs';
 import { execFile } from 'node:child_process';
+import { homedir, userInfo } from 'node:os';
+import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
@@ -208,8 +210,81 @@ const TRAEX_STATIC_BUSY_PATTERN = new RegExp(
  *  model-catalog-json.js 共享；旧名 re-export 保持既有引用（含测试）可用。 */
 export { parseDebugModelsJson as parseTraexModelsJson };
 
+const TRAEX_STARTUP_PROBE_MAX_BUFFER = 16 * 1024 * 1024;
+
+function isToolHomePath(path: string): boolean {
+  return path.replaceAll('\\', '/').includes('/.botmux/tool-homes/');
+}
+
+/**
+ * Resolve TRAEX from the canonical host HOME, never from a session HOME.
+ *
+ * TRAEX owns its installation under ~/.local/bin and ~/.local/share/traex.
+ * Those paths are shared by per-user tool-home mirrors, so resolving through
+ * the current session PATH can select a mirror lexical path and make an
+ * installer write host files with a tool-home target. The host account home
+ * remains authoritative even when this adapter is constructed inside a
+ * managed session.
+ */
+export function resolveHostTraexExecutable(): string {
+  const envHome = process.env.HOME?.trim() ?? '';
+  const sessionHome = process.env.BOTMUX_TOOL_HOME?.trim() || envHome;
+  let hostHome = homedir();
+  if (isToolHomePath(sessionHome)) {
+    try { hostHome = userInfo().homedir; } catch { /* keep the best available home */ }
+  }
+  try { hostHome = realpathSync(hostHome); } catch { /* retain lexical host home */ }
+
+  const candidates = [
+    join(hostHome, '.local', 'bin', 'traex'),
+    join(hostHome, '.local', 'share', 'traex', 'current', 'traex'),
+  ];
+  for (const candidate of candidates) {
+    try {
+      const canonical = realpathSync(candidate);
+      if (!isToolHomePath(canonical)) return canonical;
+    } catch { /* keep looking for the host-owned installation */ }
+  }
+  // Preserve the normal missing-binary error path, but keep the fallback
+  // anchored at host HOME rather than falling back to a session PATH lookup.
+  return candidates[0]!;
+}
+
+export function classifyTraexStartupProbeForTest(input: {
+  status: number | null;
+  stdout: string;
+  stderr: string;
+  errorCode?: string;
+}): import('../../utils/startup-probe.js').StartupProbeClassification {
+  if (input.status === 0) {
+    try {
+      const parsed = JSON.parse(input.stdout) as unknown;
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        return { state: 'ready', reason: `models=${parsed.length}` };
+      }
+      return { state: 'retryable', reason: 'empty_model_catalog' };
+    } catch {
+      return { state: 'retryable', reason: 'invalid_model_catalog' };
+    }
+  }
+
+  const text = `${input.stderr}\n${input.stdout}`.toLowerCase();
+  if (
+    input.status === 401
+    || input.status === 403
+    || /unauthori[sz]ed|forbidden|missing .*credential|no .*credential|entitlement|permission denied/.test(text)
+  ) {
+    return { state: 'fatal', reason: 'auth_or_entitlement_rejected' };
+  }
+  if (input.errorCode === 'ENOENT') return { state: 'fatal', reason: 'traex_binary_missing' };
+  if (input.errorCode === 'ETIMEDOUT' || /timeout|timed out|tls|network|connection|fetch/.test(text)) {
+    return { state: 'retryable', reason: 'network_or_timeout' };
+  }
+  return { state: 'retryable', reason: 'probe_exit' };
+}
+
 export function createTraexAdapter(pathOverride?: string): CliAdapter {
-  const rawBin = pathOverride ?? 'traex';
+  const rawBin = pathOverride?.trim() || resolveHostTraexExecutable();
   let cachedBin: string | undefined;
   return {
     id: 'traex',
@@ -226,6 +301,14 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
     authPaths: ['~/.trae/cli'],
     sandboxReadonlyPaths: () => [...TRAE_MIGRATION_DONE_MARKERS],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
+    startupProbe: {
+      args: ['models', '--json'],
+      timeoutMs: 45_000,
+      maxBuffer: TRAEX_STARTUP_PROBE_MAX_BUFFER,
+      maxAttempts: 3,
+      backoffMs: [2_000, 5_000],
+      classify: classifyTraexStartupProbeForTest,
+    },
 
     buildArgs({ sessionId, resume, resumeSessionId, workingDir, model, reasoningEffort, disableCliBypass, bypassHookTrust, remoteWsUrl, remoteThreadId }) {
       // Hybrid RPC input mode (codex-family): attach the TUI to the botmux-owned

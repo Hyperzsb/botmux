@@ -411,6 +411,12 @@ export interface CliAdapter {
    *  Examples: CoCo `⏵⏵` status bar, Codex `›` prompt indicator. */
   readonly readyPattern?: RegExp;
 
+  /** Optional startup health probe. The worker may use this capability for a
+   *  fresh service-account session before admitting the first user message.
+   *  The probe is deliberately adapter-owned so Botmux does not duplicate a
+   *  CLI's credential exchange protocol. */
+  readonly startupProbe?: import('../../utils/startup-probe.js').StartupProbeSpec;
+
   /** When true, the adapter injects a `SessionStart` hook that calls
    *  `botmux session-ready` once the CLI's input box is genuinely rendered —
    *  Claude-family via its effective settings.json, Grok via its global

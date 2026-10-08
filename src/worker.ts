@@ -112,6 +112,9 @@ import {
 } from './utils/pending-input-queue.js';
 import { remoteWorkerShutdownInputBlocker } from './core/remote-worker-shutdown-readiness.js';
 import { ReadyGate, shouldArmReadyGate } from './utils/ready-gate.js';
+import { StartupHealthGate } from './utils/startup-health-gate.js';
+import { runStartupProbe } from './utils/startup-probe.js';
+import { normalizeBotmuxHostHome } from './utils/host-home.js';
 import { shouldRunStartupCommandsOnSpawn, shouldDeferInitialPromptForStartup } from './core/startup-commands.js';
 import { sanitizePerBotEnv } from './core/per-bot-env.js';
 import { normalizeExistingAppServerEndpoint } from './core/existing-app-server.js';
@@ -508,6 +511,7 @@ import {
 
 // Never inherit a session-level CLI home from the daemon's launch environment.
 // Each worker re-pins the current bot's home after this scrub.
+normalizeBotmuxHostHome(process.env);
 scrubSessionCliHomeEnv(process.env);
 // Claude session-identity markers ride the same restart-from-a-session vector
 // and this process's env seeds childEnv AND the tmux client env — a marker
@@ -2109,6 +2113,15 @@ function cliName(): string {
     ?? CLI_DISPLAY_NAMES[lastInitConfig?.cliId ?? '']
     ?? 'CLI';
 }
+
+function hasTraeServiceAuth(env: Record<string, string>): boolean {
+  return Boolean(
+    env.TRAECLI_BYTECLOUD_BEARER
+    || env.TRAECLI_BYTECLOUD_JWT
+    || (env.TRAECLI_BYTECLOUD_ACCESS_KEY_ID && env.TRAECLI_BYTECLOUD_SECRET_ACCESS_KEY),
+  );
+}
+
 let isPromptReady = false;
 /** Mutex for async flushPending — prevents concurrent flush loops. */
 let isFlushing = false;
@@ -2160,6 +2173,10 @@ let bareShellCheckInProgress = false;
  *  fresh post-hook prompt evidence because sibling hooks may still be running.
  *  Recreated + armed per spawn; disarmed on signal or fallback timeout. */
 let readyGate = new ReadyGate();
+/** TRAE service-account startup health. This is separate from readyGate: the
+ * latter only protects against interactive startup selectors. */
+let startupHealthGate = new StartupHealthGate();
+let startupHealthProbeGeneration = 0;
 /** Fallback timer: if the SessionStart signal never arrives (hook injection
  *  failed / old CLI / launcher didn't pass --settings / adopt) release the gate
  *  and fall back to readyPattern + quiescence. */
@@ -10304,6 +10321,13 @@ function markPromptReady(): void {
     log('Idle detected but holding for SessionStart ready signal (startup selector guard)');
     return;
   }
+  if (startupHealthGate.isEnabled) {
+    startupHealthGate.markUiReady();
+    if (startupHealthGate.shouldHold()) {
+      log(`Prompt detected but holding for TRAE startup health state=${startupHealthGate.state}`);
+      return;
+    }
+  }
   if (awaitingPostSessionStartPromptEvidence) {
     if (!postSessionStartPromptEvidenceInFlight) {
       log('Ignoring non-PTY ready source while waiting for post-SessionStart prompt evidence');
@@ -10962,6 +10986,10 @@ async function flushPending(): Promise<void> {
   // the signal (or fallback timeout) lands. No-op for non-armed gates / other CLIs.
   if (readyGate.shouldHold()) {
     log(`Holding ${pendingMessages.length} pending message(s) until SessionStart ready signal`);
+    return;
+  }
+  if (startupHealthGate.shouldHold()) {
+    log(`Holding ${pendingMessages.length} pending message(s) until TRAE startup health state=${startupHealthGate.state}`);
     return;
   }
   // Post-signal quiescence settle in progress — hold so the first write lands
@@ -14186,7 +14214,14 @@ async function spawnCli(
   // set their own canonical HOME + enforce a real Seatbelt/bwrap boundary, and the
   // agent CLI data is redirected into BOT_HOME there. This override is a per-user
   // convenience boundary for plain sessions only — not a security boundary.
-  const perUserToolAuthOn = !sandboxRequested
+  // TRAEX is a host-managed installation: its installer/updater owns
+  // ~/.local/bin and ~/.local/share/traex. Running it with a mirrored
+  // tool-home would write through shared .local symlinks and leave host links
+  // whose targets point back into that session. Keep the per-user HOME mirror
+  // for auxiliary CLIs, but always run TRAEX itself from the canonical host
+  // HOME; its own ~/.trae data is intentionally shared by the adapter.
+  const perUserToolAuthOn = cliAdapter.id !== 'traex'
+    && !sandboxRequested
     && !credentialBoundaryActive
     && !cfg.adoptMode
     && perUserToolAuthEnabled({ perBot: cfg.perUserToolAuth, env: process.env });
@@ -14228,6 +14263,52 @@ async function spawnCli(
       }
     }
   }
+
+  // TRAE's TUI can render its composer while the account processor is still
+  // refreshing the CloudIDE token. For service-account sessions, validate the
+  // actual CLI/model path before allowing any queued user input to flush. Keep
+  // this on fresh, unsandboxed spawns for the first rollout: reattached panes
+  // already own a live CLI generation and sandboxed children need a later
+  // probe implementation that runs inside their exact boundary. Run it after
+  // HOME mirroring so the probe and the real CLI observe the same state root.
+  startupHealthGate.reset(false);
+  const startupProbeEnabled = cliAdapter.id === 'traex'
+    && !sandboxRequested
+    && !credentialBoundaryActive
+    && !cfg.adoptMode
+    && !willReattachPersistent
+    && !!cliAdapter.startupProbe
+    && hasTraeServiceAuth(perBotInjectEnv);
+  if (startupProbeEnabled && cliAdapter.startupProbe) {
+    startupHealthGate.reset(true);
+    const probeGeneration = ++startupHealthProbeGeneration;
+    const probeEnv = { ...childEnv, ...perBotInjectEnv };
+    const probe = await runStartupProbe({
+      bin: cliAdapter.resolvedBin,
+      cwd: cfg.workingDir,
+      env: probeEnv,
+      spec: cliAdapter.startupProbe,
+      log,
+    });
+    if (probeGeneration !== startupHealthProbeGeneration || spawnGeneration !== cliSpawnGeneration) {
+      throw new CliSpawnSupersededError();
+    }
+    if (probe.state === 'ready') {
+      startupHealthGate.markAuthReady();
+      log(`[startup-probe] TRAE auth ready attempts=${probe.attempts} elapsed_ms=${probe.elapsedMs}`);
+    } else {
+      startupHealthGate.markAuthFailure(probe.state === 'fatal' ? 'fatal' : 'exhausted');
+      log(`[startup-probe] TRAE auth blocked state=${probe.state} reason=${probe.reason} attempts=${probe.attempts} elapsed_ms=${probe.elapsedMs}`);
+      send({
+        type: 'user_notify',
+        turnId: currentBotmuxTurnId,
+        message: probe.state === 'fatal'
+          ? '⚠️ TRAE 服务账号认证被拒绝，首条消息已暂存；请检查服务账号凭据或模型权限。'
+          : '⚠️ TRAE 服务账号认证依赖暂不可用，首条消息已暂存；BotMux 已停止自动投递，稍后可重试。',
+      });
+    }
+  }
+
   const hermesUsesBotmuxSessionProfile = basename(cfg.cliPathOverride ?? '') === 'hermes-botmux-session';
   hermesBridgeDbPath = cfg.cliId === 'hermes'
     ? resolveHermesStateDbPath(
@@ -16217,6 +16298,8 @@ function killCli(opts: {
   spawnArgvTurnStartBusyScanTail = '';
   structuredRejectedReadyEvidenceGeneration = undefined;
   ptyOutputGeneration.reset();
+  startupHealthProbeGeneration += 1;
+  startupHealthGate.reset(false);
   // Cancel any pending ready-gate fallback / settle timers; spawnCli re-arms on respawn.
   if (readySignalTimer) { clearTimeout(readySignalTimer); readySignalTimer = null; }
   if (readyFlushSettleTimer) { clearTimeout(readyFlushSettleTimer); readyFlushSettleTimer = null; }

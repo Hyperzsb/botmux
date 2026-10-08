@@ -21,7 +21,7 @@
  * tmux command would fail. Functional probe + soft fallback fixes both.
  */
 import { execFileSync, spawnSync } from 'node:child_process';
-import { unlinkSync } from 'node:fs';
+import { realpathSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { detectPlatform, type PackageManager, type PlatformInfo } from './detect-platform.js';
 import {
@@ -141,11 +141,26 @@ const TMUX_PATH_EXTRAS = [
   '/sbin',
 ];
 
+function isLoopingPathEntry(pathEntry: string): boolean {
+  // A managed session can leave a self-referential ~/.local/bin symlink in
+  // the inherited PATH. Node's PATH lookup reports ELOOP for the first such
+  // entry instead of continuing to /usr/bin, which makes a healthy tmux look
+  // unavailable to the daemon. Only discard entries that are provably a
+  // symlink loop; missing or otherwise unusual user PATH entries retain their
+  // previous behavior and are harmless to exec search.
+  try {
+    realpathSync(pathEntry);
+    return false;
+  } catch (err: any) {
+    return err?.code === 'ELOOP';
+  }
+}
+
 function withTmuxSearchPath(pathValue: string | undefined): string {
   const seen = new Set<string>();
   const merged: string[] = [];
   for (const part of [...(pathValue?.split(':') ?? []), ...TMUX_PATH_EXTRAS]) {
-    if (!part || seen.has(part)) continue;
+    if (!part || seen.has(part) || isLoopingPathEntry(part)) continue;
     seen.add(part);
     merged.push(part);
   }

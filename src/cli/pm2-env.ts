@@ -6,6 +6,7 @@ import {
   scrubWorkflowWorkerEnv,
   stripDashboardH5Env,
 } from '../utils/child-env.js';
+import { normalizeBotmuxHostHome } from '../utils/host-home.js';
 
 /**
  * Scrub the env handed to a pm2 invocation, in place.
@@ -66,6 +67,7 @@ export function scrubPm2CallerEnv(env: NodeJS.ProcessEnv): void {
 /** Build the env for a pm2 invocation with an isolated PM2_HOME. */
 export function pm2CallerEnv(base: NodeJS.ProcessEnv, home: string): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...base, PM2_HOME: home };
+  normalizeBotmuxHostHome(env);
   scrubPm2CallerEnv(env);
   return env;
 }
