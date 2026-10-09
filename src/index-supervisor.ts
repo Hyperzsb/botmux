@@ -12,7 +12,7 @@ import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { existsSync, readFileSync } from 'node:fs';
 import { installStdioEpipeGuard } from './utils/stdio-epipe-guard.js';
-import { scrubClaudeSessionMarkerEnv, scrubSessionCliHomeEnv, scrubWorkflowWorkerEnv } from './utils/child-env.js';
+import { scrubClaudeSessionMarkerEnv, scrubSessionCliHomeEnv, scrubTraeCliRuntimeMarkerEnv, scrubWorkflowWorkerEnv } from './utils/child-env.js';
 import { normalizeBotmuxHostHome } from './utils/host-home.js';
 
 installStdioEpipeGuard();
@@ -29,6 +29,7 @@ for (const k of ['BOTMUX_SESSION_ID', 'BOTMUX_LARK_APP_ID', 'BOTMUX_CHAT_ID', 'B
 }
 scrubSessionCliHomeEnv(process.env);
 scrubClaudeSessionMarkerEnv(process.env);
+scrubTraeCliRuntimeMarkerEnv(process.env);
 scrubWorkflowWorkerEnv(process.env);
 
 async function main(): Promise<void> {

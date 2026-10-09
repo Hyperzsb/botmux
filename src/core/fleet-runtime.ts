@@ -16,6 +16,7 @@ import { resolveEntrySpawn } from './self-spawn.js';
 import { readFleetState } from './fleet-state-store.js';
 import { resolveBotmuxDataDir } from './data-dir.js';
 import { normalizeBotmuxHostHome } from '../utils/host-home.js';
+import { scrubTraeCliRuntimeMarkerEnv } from '../utils/child-env.js';
 import { enqueueFleetCommand } from './fleet-command-queue.js';
 import type { FleetProcState, FleetState } from './fleet-supervisor-policy.js';
 import { FLEET_GRACEFUL_EXIT_CODE } from './fleet-supervisor-policy.js';
@@ -60,6 +61,7 @@ export function fleetDaemonNodeArgs(): string[] {
 export function resolveFleetDaemonEnv(): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env };
   normalizeBotmuxHostHome(env);
+  scrubTraeCliRuntimeMarkerEnv(env);
   // Legacy: the daemon reads ~/.botmux/.env for global settings. We surface the
   // file's presence to the caller by NOT parsing here — index-daemon's own
   // dotenvConfig loads it. Keeping env pass-through avoids double-parsing.
@@ -197,6 +199,7 @@ export function startFleetViaSupervisor(): StartFleetResult {
   const nodeArgs = args.length > 0 && args[0].startsWith('__') ? [] : ['--enable-source-maps'];
   const supervisorEnv = { ...process.env };
   normalizeBotmuxHostHome(supervisorEnv);
+  scrubTraeCliRuntimeMarkerEnv(supervisorEnv);
   const child = spawn(command, [...nodeArgs, ...args], {
     cwd: CONFIG_DIR,
     detached: true,

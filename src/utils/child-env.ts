@@ -192,6 +192,28 @@ export function scrubInvokerTerminalEnv(env: NodeJS.ProcessEnv): void {
 }
 
 /**
+ * Runtime markers exported by an outer TRAE/TraeX TUI. They identify that
+ * TUI's own inbox/thread and are never valid for a Botmux-managed child. If a
+ * botmux daemon is started from inside TRAE, retaining them makes every
+ * worker/pty inherit the outer conversation; tmux also persists them in its
+ * server-global environment for later panes.
+ *
+ * Keep this list deliberately narrow: per-bot service-account credentials such
+ * as TRAECLI_BYTECLOUD_BEARER are real configuration and must still be
+ * injected by Botmux after this scrub.
+ */
+export const TRAECLI_RUNTIME_MARKER_ENV_KEYS = [
+  'TRAECLI_SESSION_INBOX',
+  'TRAECLI_THREAD_ID',
+  'TRAECLI_CI',
+] as const;
+
+/** Delete outer TraeX session identity from a Botmux-owned process boundary. */
+export function scrubTraeCliRuntimeMarkerEnv(env: NodeJS.ProcessEnv): void {
+  for (const key of TRAECLI_RUNTIME_MARKER_ENV_KEYS) delete env[key];
+}
+
+/**
  * Env vars that must never reach a spawned CLI child. The bot's IM-app creds
  * (a child CLI's own Lark OAuth reads `process.env.LARK_APP_ID` as the app to
  * authorize and gets hijacked by the botmux IM app → no docs scopes → 403
@@ -220,6 +242,7 @@ export const REDACTED_CHILD_ENV_KEYS = [
   // override.
   ...DASHBOARD_H5_ENV_KEYS,
   ...CLAUDE_SESSION_MARKER_ENV_KEYS,
+  ...TRAECLI_RUNTIME_MARKER_ENV_KEYS,
   // Parent-tmux client vars: when the daemon itself was started inside a tmux
   // session, process.env carries TMUX (server socket path) + TMUX_PANE. Leaking
   // these into a spawned CLI makes tmux-aware tools (codex integrates with tmux)
@@ -536,6 +559,7 @@ export const PROXY_ENV_KEYS = [
 const TMUX_CLIENT_STRIP_KEYS: ReadonlySet<string> = new Set([
   ...BOTMUX_INJECTED_ENV_KEYS,
   ...REDACTED_CHILD_ENV_KEYS,
+  ...TRAECLI_RUNTIME_MARKER_ENV_KEYS,
   // Strip proxy vars from the tmux CLIENT env so botmux doesn't seed the
   // shared server's global env with daemon-side proxy (which may contain
   // embedded credentials) and leak it to the user's own interactive panes.
@@ -548,6 +572,7 @@ const TMUX_CLIENT_STRIP_KEYS: ReadonlySet<string> = new Set([
 
 const TMUX_SERVER_GLOBAL_SCRUB_KEYS: ReadonlySet<string> = new Set([
   ...BOTMUX_INJECTED_ENV_KEYS,
+  ...TRAECLI_RUNTIME_MARKER_ENV_KEYS,
   'LARK_APP_ID',
   'LARK_APP_SECRET',
   // Claude session markers are stale by definition in a server's GLOBAL env
@@ -650,6 +675,7 @@ export function redactChildEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
 export function scrubExternalMemberEnv(env: NodeJS.ProcessEnv): void {
   scrubSessionCliHomeEnv(env);
   scrubClaudeSessionMarkerEnv(env);
+  scrubTraeCliRuntimeMarkerEnv(env);
   scrubWorkflowWorkerEnv(env);
   stripDashboardH5Env(env);
   scrubInvokerTerminalEnv(env);

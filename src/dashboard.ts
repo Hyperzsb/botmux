@@ -337,7 +337,7 @@ import {
   dashboardAutostartErrorStatus,
   parseAutostartWrite,
 } from './dashboard/autostart-api.js';
-import { scrubWorkflowWorkerEnv } from './utils/child-env.js';
+import { scrubTraeCliRuntimeMarkerEnv, scrubWorkflowWorkerEnv } from './utils/child-env.js';
 
 // The dashboard is an independent long-lived PM2 app and can be resurrected
 // from a stale dump.pm2 without passing through cli.ts pm2Env(). Its start/stop
@@ -345,6 +345,7 @@ import { scrubWorkflowWorkerEnv } from './utils/child-env.js';
 // marker would make those CLI commands fail at the workflow safety gate before
 // they can reach their own cleanup boundary.
 scrubWorkflowWorkerEnv(process.env);
+scrubTraeCliRuntimeMarkerEnv(process.env);
 
 const SECRET_PATH = dashboardSecretPath();
 const TOKEN_PATH = join(homedir(), '.botmux', '.dashboard-token');

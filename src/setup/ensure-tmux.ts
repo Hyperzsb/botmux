@@ -25,6 +25,7 @@ import { realpathSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { detectPlatform, type PackageManager, type PlatformInfo } from './detect-platform.js';
 import {
+  TRAECLI_RUNTIME_MARKER_ENV_KEYS,
   isBotmuxManagedTmuxEnvKey,
   isBotmuxManagedTmuxServerGlobalEnvKey,
 } from '../utils/child-env.js';

@@ -3,6 +3,7 @@ import {
   scrubInvokerTerminalEnv,
   scrubSessionCliHomeEnv,
   scrubSessionTurnMarkerEnv,
+  scrubTraeCliRuntimeMarkerEnv,
   scrubWorkflowWorkerEnv,
   stripDashboardH5Env,
 } from '../utils/child-env.js';
@@ -57,6 +58,7 @@ export function scrubPm2CallerEnv(env: NodeJS.ProcessEnv): void {
   // must not become fleet-wide daemon env — the daemon stays session-agnostic
   // (see SESSION_TURN_MARKER_ENV_KEYS for the per-key rationale).
   scrubSessionTurnMarkerEnv(env);
+  scrubTraeCliRuntimeMarkerEnv(env);
   // Re-pin TERM to the constant every botmux PTY already forces. Deleting it
   // outright would make pm2 CLIENT output (e.g. `botmux status` on a real
   // TTY) fail supports-color detection and render colorless; pinning keeps

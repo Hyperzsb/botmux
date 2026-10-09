@@ -14,11 +14,13 @@ import {
   scrubInvokerTerminalEnv,
   scrubSessionCliHomeEnv,
   scrubSessionTurnMarkerEnv,
+  scrubTraeCliRuntimeMarkerEnv,
   scrubWorkflowWorkerEnv,
   SESSION_CLI_HOME_ENV_KEYS,
   SESSION_TURN_MARKER_ENV_KEYS,
   stripDashboardH5Env,
   WORKFLOW_WORKER_ENV_KEYS,
+  TRAECLI_RUNTIME_MARKER_ENV_KEYS,
 } from '../src/utils/child-env.js';
 import { pm2CallerEnv } from '../src/cli/pm2-env.js';
 import { PM2_GRACEFUL_EXIT_CODE_ENV } from '../src/pm2-graceful-exit.js';
@@ -72,6 +74,21 @@ describe('redactChildEnv()', () => {
     expect(base.LARK_APP_ID).toBe('a');
     expect(base.LARK_APP_SECRET).toBe('s');
     expect(base.CLAUDECODE).toBe('1');
+  });
+
+  it('removes outer TRAE runtime markers but preserves service-account credentials', () => {
+    const out = redactChildEnv({
+      ...Object.fromEntries(TRAECLI_RUNTIME_MARKER_ENV_KEYS.map((key) => [key, 'stale'])),
+      TRAECLI_BYTECLOUD_AUTH_BASE_URL: 'https://cloud.example',
+      TRAECLI_BYTECLOUD_BEARER: 'service-account-token',
+      KEEP: 'v',
+    });
+    for (const key of TRAECLI_RUNTIME_MARKER_ENV_KEYS) {
+      expect(key in out, key).toBe(false);
+    }
+    expect(out.TRAECLI_BYTECLOUD_AUTH_BASE_URL).toBe('https://cloud.example');
+    expect(out.TRAECLI_BYTECLOUD_BEARER).toBe('service-account-token');
+    expect(out.KEEP).toBe('v');
   });
 
   it('removes every Claude session marker from child env', () => {
@@ -502,6 +519,22 @@ describe('scrubSessionTurnMarkerEnv()', () => {
     for (const key of Object.keys(env)) {
       expect.fail(`expected every key deleted, found ${key}`);
     }
+  });
+});
+
+describe('scrubTraeCliRuntimeMarkerEnv()', () => {
+  it('removes only outer TraeX session markers', () => {
+    const env: NodeJS.ProcessEnv = {
+      ...Object.fromEntries(TRAECLI_RUNTIME_MARKER_ENV_KEYS.map((key) => [key, 'stale'])),
+      TRAECLI_BYTECLOUD_BEARER: 'service-account-token',
+      KEEP: 'v',
+    };
+    scrubTraeCliRuntimeMarkerEnv(env);
+    for (const key of TRAECLI_RUNTIME_MARKER_ENV_KEYS) {
+      expect(key in env, key).toBe(false);
+    }
+    expect(env.TRAECLI_BYTECLOUD_BEARER).toBe('service-account-token');
+    expect(env.KEEP).toBe('v');
   });
 });
 

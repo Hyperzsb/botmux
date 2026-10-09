@@ -89,6 +89,10 @@ describe('tmuxEnv()', () => {
       CLAUDE_CODE_ENTRYPOINT: 'cli',
       CLAUDE_CODE_EXECPATH: '/stale/claude.exe',
       CLAUDE_PID: '41028',
+      TRAECLI_SESSION_INBOX: '/home/u/.trae/cli/sessions/outer.artifacts/inbox.d',
+      TRAECLI_THREAD_ID: '01outer-thread',
+      TRAECLI_CI: '1',
+      TRAECLI_BYTECLOUD_BEARER: 'service-account-token',
       // Legit passthrough — the tmux client still needs these.
       PATH: '/usr/bin',
       HOME: '/root',
@@ -106,9 +110,11 @@ describe('tmuxEnv()', () => {
       'LARK_APP_ID', 'LARK_APP_SECRET', 'CLAUDECODE',
       'CLAUDE_CODE_CHILD_SESSION', 'CLAUDE_CODE_SESSION_ID',
       'CLAUDE_CODE_ENTRYPOINT', 'CLAUDE_CODE_EXECPATH', 'CLAUDE_PID',
+      'TRAECLI_SESSION_INBOX', 'TRAECLI_THREAD_ID', 'TRAECLI_CI',
     ]) {
       expect(stripped[leaked]).toBeUndefined();
     }
+    expect(stripped.TRAECLI_BYTECLOUD_BEARER).toBe('service-account-token');
     // Non-botmux env the tmux client legitimately needs survives.
     expect(stripped.HOME).toBe('/root');
     expect(stripped.LANG).toBe('en_US.UTF-8');
@@ -127,6 +133,17 @@ describe('tmuxEnv()', () => {
     for (const key of [...BOTMUX_INJECTED_ENV_KEYS, ...REDACTED_CHILD_ENV_KEYS]) {
       expect(isBotmuxManagedTmuxEnvKey(key), key).toBe(true);
     }
+  });
+
+  it('classifies outer TRAE runtime markers as tmux-managed', () => {
+    for (const key of ['TRAECLI_SESSION_INBOX', 'TRAECLI_THREAD_ID', 'TRAECLI_CI']) {
+      expect(isBotmuxManagedTmuxEnvKey(key), key).toBe(true);
+      expect(isBotmuxManagedTmuxServerGlobalEnvKey(key), key).toBe(true);
+    }
+    // Per-bot service credentials are injected after the tmux wrapper scrub and
+    // must not be treated as stale outer-session markers.
+    expect(isBotmuxManagedTmuxEnvKey('TRAECLI_BYTECLOUD_BEARER')).toBe(false);
+    expect(isBotmuxManagedTmuxServerGlobalEnvKey('TRAECLI_BYTECLOUD_BEARER')).toBe(false);
   });
 
   it('does not classify GitHub tokens as botmux-owned tmux server-global keys', () => {

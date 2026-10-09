@@ -370,7 +370,7 @@ import { parseWorkerRequestUrl } from './utils/worker-http.js';
 import { structuredRateLimitState, isStructuredRateLimitAuthoritative, type CliUsageLimitState } from './utils/cli-usage-limit.js';
 import { bridgeTurnOutcome, createUsageLimitTracker } from './utils/usage-limit-tracker.js';
 import { uploadImageBuffer } from './utils/lark-upload.js';
-import { applySessionOwnerEnv, redactChildEnv, scrubClaudeSessionMarkerEnv, scrubSessionCliHomeEnv } from './utils/child-env.js';
+import { applySessionOwnerEnv, redactChildEnv, scrubClaudeSessionMarkerEnv, scrubSessionCliHomeEnv, scrubTraeCliRuntimeMarkerEnv } from './utils/child-env.js';
 import {
   decideSubmitConfirmationAction,
   settleDeferredSubmitConfirmation,
@@ -513,6 +513,7 @@ import {
 // Each worker re-pins the current bot's home after this scrub.
 normalizeBotmuxHostHome(process.env);
 scrubSessionCliHomeEnv(process.env);
+scrubTraeCliRuntimeMarkerEnv(process.env);
 // Claude session-identity markers ride the same restart-from-a-session vector
 // and this process's env seeds childEnv AND the tmux client env — a marker
 // that survives to the first `tmux new-session` gets copied into the shared

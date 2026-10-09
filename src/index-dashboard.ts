@@ -14,7 +14,7 @@ import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { existsSync } from 'node:fs';
 import { installStdioEpipeGuard } from './utils/stdio-epipe-guard.js';
-import { scrubClaudeSessionMarkerEnv, scrubSessionCliHomeEnv, scrubWorkflowWorkerEnv } from './utils/child-env.js';
+import { scrubClaudeSessionMarkerEnv, scrubSessionCliHomeEnv, scrubTraeCliRuntimeMarkerEnv, scrubWorkflowWorkerEnv } from './utils/child-env.js';
 import { loadDashboardEnvFile } from './utils/dashboard-env.js';
 
 // Same pipe topology as the daemon: under pm2 the dashboard's stdout/stderr are
@@ -65,6 +65,7 @@ scrubSessionCliHomeEnv(process.env);
 // Claude session-identity markers: inherited into a CLI forked from here (debug
 // terminal) they mark it a nested child session → transcript saving OFF.
 scrubClaudeSessionMarkerEnv(process.env);
+scrubTraeCliRuntimeMarkerEnv(process.env);
 // Workflow/goal worker identity: the dashboard is a workflow HOST surface,
 // never a worker. dashboard.ts repeats this scrub at its own module top — kept
 // there because a stale ecosystem/dump from an older install can still start

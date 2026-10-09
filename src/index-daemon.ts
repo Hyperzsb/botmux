@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { existsSync } from 'node:fs';
 import { installStdioEpipeGuard } from './utils/stdio-epipe-guard.js';
-import { scrubClaudeSessionMarkerEnv, scrubInvokerTerminalEnv, scrubSessionCliHomeEnv, scrubSessionTurnMarkerEnv, scrubWorkflowWorkerEnv, stripDashboardH5Env } from './utils/child-env.js';
+import { scrubClaudeSessionMarkerEnv, scrubInvokerTerminalEnv, scrubSessionCliHomeEnv, scrubSessionTurnMarkerEnv, scrubTraeCliRuntimeMarkerEnv, scrubWorkflowWorkerEnv, stripDashboardH5Env } from './utils/child-env.js';
 import { normalizeBotmuxHostHome } from './utils/host-home.js';
 
 // Under pm2 the daemon's stdout/stderr are pipes to the God daemon. A broken
@@ -55,6 +55,9 @@ scrubSessionCliHomeEnv(process.env);
 // as a nested child session (transcript saving OFF → --resume continuity
 // silently lost). See CLAUDE_SESSION_MARKER_ENV_KEYS.
 scrubClaudeSessionMarkerEnv(process.env);
+// A daemon is never an outer TRAE TUI session. Remove stale inbox/thread/CI
+// markers before workers or the shared tmux server can inherit them.
+scrubTraeCliRuntimeMarkerEnv(process.env);
 // A stale PM2 dump can bypass cli.ts pm2Env(). Daemons are workflow hosts,
 // never workflow workers; remove node-scoped identity before importing daemon
 // code or forking ordinary chat workers. The ephemeral pool re-adds the exact
