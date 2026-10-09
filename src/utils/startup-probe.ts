@@ -10,14 +10,25 @@ export type StartupProbeClassification = {
 };
 
 export type StartupProbeInput = {
+  /** Process exit code. Node's execFile reports this as numeric error.code for
+   *  ordinary non-zero exits; some wrappers expose error.status instead. */
   status: number | null;
   stdout: string;
   stderr: string;
   errorCode?: string;
+  killed?: boolean;
+  signal?: string;
+};
+
+export type StartupProbeContext = {
+  /** Effective model selected for the CLI generation being admitted. */
+  model?: string;
+  /** Effective reasoning effort selected for that model. */
+  reasoningEffort?: string;
 };
 
 export type StartupProbeSpec = {
-  args: readonly string[];
+  args: readonly string[] | ((context: StartupProbeContext) => readonly string[]);
   timeoutMs: number;
   maxBuffer: number;
   maxAttempts: number;
@@ -26,10 +37,30 @@ export type StartupProbeSpec = {
 };
 
 export type StartupProbeResult = Omit<StartupProbeClassification, 'state'> & {
-  state: StartupProbeClassification['state'] | 'exhausted';
+  state: StartupProbeClassification['state'] | 'exhausted' | 'cancelled';
   attempts: number;
   elapsedMs: number;
 };
+
+async function abortableDelay(ms: number, signal?: AbortSignal): Promise<boolean> {
+  if (signal?.aborted) return false;
+  if (!signal) {
+    await delay(ms);
+    return true;
+  }
+  return new Promise<boolean>((resolve) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      resolve(false);
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve(true);
+    }, ms);
+    timer.unref?.();
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
 
 /**
  * Execute a short-lived CLI-owned health probe.  The probe receives the exact
@@ -41,21 +72,31 @@ export async function runStartupProbe(input: {
   cwd: string;
   env: NodeJS.ProcessEnv;
   spec: StartupProbeSpec;
+  context?: StartupProbeContext;
+  signal?: AbortSignal;
   log?: (message: string) => void;
 }): Promise<StartupProbeResult> {
   const startedAt = Date.now();
   let last: StartupProbeClassification = { state: 'retryable', reason: 'probe_not_run' };
 
   for (let attempt = 1; attempt <= input.spec.maxAttempts; attempt += 1) {
+    if (input.signal?.aborted) {
+      return { state: 'cancelled', reason: 'probe_cancelled', attempts: attempt - 1, elapsedMs: Date.now() - startedAt };
+    }
     let result: StartupProbeClassification;
     try {
-      const output = await execFileAsync(input.bin, [...input.spec.args], {
+      const args = typeof input.spec.args === 'function'
+        ? input.spec.args(input.context ?? {})
+        : input.spec.args;
+      const output = await execFileAsync(input.bin, [...args], {
         cwd: input.cwd,
         env: input.env,
         encoding: 'utf8',
         timeout: input.spec.timeoutMs,
         maxBuffer: input.spec.maxBuffer,
         windowsHide: true,
+        killSignal: 'SIGKILL',
+        signal: input.signal,
       });
       result = input.spec.classify({
         status: 0,
@@ -63,11 +104,21 @@ export async function runStartupProbe(input: {
         stderr: output.stderr,
       });
     } catch (error: any) {
+      if (input.signal?.aborted || error?.name === 'AbortError' || error?.code === 'ABORT_ERR') {
+        return { state: 'cancelled', reason: 'probe_cancelled', attempts: attempt, elapsedMs: Date.now() - startedAt };
+      }
+      const rawCode = error?.code;
       result = input.spec.classify({
-        status: typeof error?.status === 'number' ? error.status : null,
+        status: typeof error?.status === 'number'
+          ? error.status
+          : typeof rawCode === 'number'
+            ? rawCode
+            : null,
         stdout: typeof error?.stdout === 'string' ? error.stdout : '',
         stderr: typeof error?.stderr === 'string' ? error.stderr : '',
-        errorCode: typeof error?.code === 'string' ? error.code : undefined,
+        errorCode: typeof rawCode === 'string' ? rawCode : undefined,
+        killed: error?.killed === true,
+        signal: typeof error?.signal === 'string' ? error.signal : undefined,
       });
     }
 
@@ -82,7 +133,9 @@ export async function runStartupProbe(input: {
       };
     }
     const backoff = input.spec.backoffMs[Math.min(attempt - 1, input.spec.backoffMs.length - 1)] ?? 0;
-    if (backoff > 0) await delay(backoff);
+    if (backoff > 0 && !(await abortableDelay(backoff, input.signal))) {
+      return { state: 'cancelled', reason: 'probe_cancelled', attempts: attempt, elapsedMs: Date.now() - startedAt };
+    }
   }
 
   return {

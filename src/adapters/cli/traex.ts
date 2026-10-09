@@ -211,6 +211,11 @@ const TRAEX_STATIC_BUSY_PATTERN = new RegExp(
 export { parseDebugModelsJson as parseTraexModelsJson };
 
 const TRAEX_STARTUP_PROBE_MAX_BUFFER = 16 * 1024 * 1024;
+const TRAEX_STARTUP_PROBE_OK = 'BOTMUX_AUTH_OK';
+const TRAEX_STARTUP_PROBE_DISALLOWED_TOOLS = [
+  'Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep', 'WebSearch', 'WebFetch',
+  'exec', 'apply_patch',
+] as const;
 
 function isToolHomePath(path: string): boolean {
   return path.replaceAll('\\', '/').includes('/.botmux/tool-homes/');
@@ -259,32 +264,84 @@ export function classifyTraexStartupProbeForTest(input: {
   stdout: string;
   stderr: string;
   errorCode?: string;
+  killed?: boolean;
+  signal?: string;
 }): import('../../utils/startup-probe.js').StartupProbeClassification {
-  if (input.status === 0) {
-    try {
-      const parsed = JSON.parse(input.stdout) as unknown;
-      if (Array.isArray(parsed) && parsed.length > 0) {
-        return { state: 'ready', reason: `models=${parsed.length}` };
-      }
-      return { state: 'retryable', reason: 'empty_model_catalog' };
-    } catch {
-      return { state: 'retryable', reason: 'invalid_model_catalog' };
+  const text = `${input.stderr}\n${input.stdout}`.toLowerCase();
+  const classifyFailure = (): import('../../utils/startup-probe.js').StartupProbeClassification => {
+    // Definite credential/entitlement rejection takes precedence over generic
+    // CloudIDE wording: `failed to exchange ...: 403 Forbidden` is permanent
+    // for this credential snapshot and should not burn three retries.
+    if (
+      input.status === 401
+      || input.status === 403
+      || /\b(?:401|403)\b|unauthori[sz]ed|forbidden|missing .*credential|no .*credential|entitlement|permission denied/.test(text)
+    ) {
+      return { state: 'fatal', reason: 'auth_or_entitlement_rejected' };
     }
+    if (
+      /please use \/login|sign in first|authentication did not become active|failed to exchange cloudide token/.test(text)
+    ) {
+      return { state: 'retryable', reason: 'service_auth_not_active' };
+    }
+    if (input.errorCode === 'ENOENT') return { state: 'fatal', reason: 'traex_binary_missing' };
+    if (
+      input.killed
+      || input.signal
+      || input.errorCode === 'ETIMEDOUT'
+      || /timeout|timed out|tls|network|connection|fetch/.test(text)
+    ) {
+      return { state: 'retryable', reason: 'network_or_timeout' };
+    }
+    return { state: 'retryable', reason: 'probe_exit' };
+  };
+
+  if (input.status === 0) {
+    let turnStarted = false;
+    let sawExpectedAgentMessage = false;
+    let sawMalformedLine = false;
+    let sawDisallowedAction = false;
+    let sawFailedTurn = false;
+    for (const line of input.stdout.split(/\r?\n/)) {
+      if (!line.trim()) continue;
+      try {
+        const event = JSON.parse(line) as {
+          type?: unknown;
+          item?: { type?: unknown; text?: unknown };
+        };
+        if (event.type === 'turn.started') turnStarted = true;
+        if (event.type === 'error' || event.type === 'turn.failed') sawFailedTurn = true;
+        const itemType = typeof event.item?.type === 'string' ? event.item.type : '';
+        if (itemType && itemType !== 'agent_message' && itemType !== 'reasoning') {
+          sawDisallowedAction = true;
+        }
+        if (
+          turnStarted
+          && event.type === 'item.completed'
+          && event.item?.type === 'agent_message'
+          && typeof event.item.text === 'string'
+          && event.item.text.trim() === TRAEX_STARTUP_PROBE_OK
+        ) {
+          sawExpectedAgentMessage = true;
+        }
+        if (event.type === 'turn.completed') {
+          if (sawFailedTurn) return classifyFailure();
+          if (turnStarted && sawExpectedAgentMessage && !sawMalformedLine && !sawDisallowedAction && !sawFailedTurn) {
+            return { state: 'ready', reason: 'model_turn_completed' };
+          }
+          return { state: 'retryable', reason: 'incomplete_model_turn' };
+        }
+      } catch {
+        sawMalformedLine = true;
+      }
+    }
+    if (sawFailedTurn) return classifyFailure();
+    if (sawDisallowedAction) return { state: 'retryable', reason: 'probe_tool_activity' };
+    if (sawMalformedLine) return { state: 'retryable', reason: 'invalid_probe_jsonl' };
+    return { state: 'retryable', reason: 'incomplete_model_turn' };
   }
 
-  const text = `${input.stderr}\n${input.stdout}`.toLowerCase();
-  if (
-    input.status === 401
-    || input.status === 403
-    || /unauthori[sz]ed|forbidden|missing .*credential|no .*credential|entitlement|permission denied/.test(text)
-  ) {
-    return { state: 'fatal', reason: 'auth_or_entitlement_rejected' };
-  }
-  if (input.errorCode === 'ENOENT') return { state: 'fatal', reason: 'traex_binary_missing' };
-  if (input.errorCode === 'ETIMEDOUT' || /timeout|timed out|tls|network|connection|fetch/.test(text)) {
-    return { state: 'retryable', reason: 'network_or_timeout' };
-  }
-  return { state: 'retryable', reason: 'probe_exit' };
+  return classifyFailure();
 }
 
 export function createTraexAdapter(pathOverride?: string): CliAdapter {
@@ -313,7 +370,25 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
     sandboxReadonlyPaths: () => [...TRAE_MIGRATION_DONE_MARKERS],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
     startupProbe: {
-      args: ['models', '--json'],
+      args: ({ model, reasoningEffort }) => [
+        'exec',
+        '--ephemeral',
+        '--skip-git-repo-check',
+        '--ignore-user-config',
+        '--ignore-rules',
+        '--json',
+        ...(model?.trim() ? ['--model', model.trim()] : []),
+        ...(reasoningEffort?.trim()
+          ? ['-c', `model_reasoning_effort=${JSON.stringify(reasoningEffort.trim())}`]
+          : []),
+        '--sandbox',
+        'read-only',
+        ...TRAEX_STARTUP_PROBE_DISALLOWED_TOOLS.flatMap((tool) => ['--disallowed-tool', tool]),
+        `Reply exactly ${TRAEX_STARTUP_PROBE_OK}. Do not call tools.`,
+      ],
+      // One CloudIDE/model exchange commonly needs tens of seconds. The worker
+      // starts the TUI first and keeps input fail-closed while this bounded
+      // retry sequence runs in the background.
       timeoutMs: 45_000,
       maxBuffer: TRAEX_STARTUP_PROBE_MAX_BUFFER,
       maxAttempts: 3,

@@ -12,10 +12,11 @@ import type { DaemonToWorker } from './types.js';
 
 type InitCfg = Extract<DaemonToWorker, { type: 'init' }>;
 
-/** CLIs that expose the codex-family `app-server --listen` + `--remote resume`
- *  protocol the RPC engine drives. codex + traex are verified identical; coco
- *  diverges (--resume flag) and needs its own verification before inclusion. */
-export const RPC_CAPABLE_CLIS = new Set(['codex', 'traex']);
+/** CLIs allowed to execute model turns through the host-side app-server.
+ *  TraeX is deliberately excluded: its PTY child must own the per-user
+ *  ToolHome and service-account readiness gate; a host-env app-server would
+ *  bypass both boundaries. */
+export const RPC_CAPABLE_CLIS = new Set(['codex']);
 
 /** Retry cadence for native turn/completed → rollout visibility hydration.
  *  Total window is 11.55s: bounded, but intentionally aligned with the 12s
@@ -274,7 +275,24 @@ export async function orchestrateCodexRpcInit(
   runtime: CodexRpcRuntimeGates = {},
 ): Promise<RpcInitDecision> {
   const NONE: RpcInitDecision = { engaged: false, queuePrompt: false, abortSpawn: false };
-  if (!codexRpcEligible(cfg, runtime)) return NONE;
+  if (!codexRpcEligible(cfg, runtime)) {
+    // Builds before the ToolHome/startup gate could leave a surviving TraeX
+    // `--remote` viewer. TraeX now always uses the PTY path, so remove that
+    // stale viewer before spawnCli can mistake it for a native pane and reattach.
+    if (cfg.cliId === 'traex') {
+      const pane = fx.paneInfo(cfg.sessionId);
+      if (pane?.live && fx.paneIsRemote(pane.name)) {
+        const gone = await fx.killVerify(pane.name);
+        if (gone) {
+          fx.log(`TraeX PTY startup: removed stale RPC pane ${pane.name}`);
+          return NONE;
+        }
+        fx.notify('TRAE 会话恢复失败：无法替换旧 --remote 面板。请重试，或 /close 后重开会话。');
+        return { engaged: false, queuePrompt: false, abortSpawn: true };
+      }
+    }
+    return NONE;
+  }
   const pane = fx.paneInfo(cfg.sessionId);
   if (!pane || !pane.live) {
     // Fresh session, or a resume whose pane didn't survive.
@@ -394,6 +412,10 @@ export function paneRunsRemoteTui(
   const expectedNames = expectedExecutable
     ? new Set([executableName(expectedExecutable)])
     : new Set(['codex', 'traex']);
+  // The legacy Botmux proxy exec-replaces itself with the canonical host
+  // binary, so a live pane reports `traex`, not `traex_proxy.sh`. Treat those
+  // two names as the same known runtime; arbitrary wrappers remain exact-only.
+  if (expectedNames.has('traex_proxy.sh')) expectedNames.add('traex');
   let frontier = [panePid];
   const seen = new Set<number>();
   for (let depth = 0; depth <= 4 && frontier.length; depth++) {

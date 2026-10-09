@@ -21,17 +21,26 @@ describe('codexRpcEligible — the eligible base case', () => {
   it('a fresh codex/tmux bot with a prompt + codexRpcInput is eligible', () => {
     expect(codexRpcEligible(baseCfg())).toBe(true);
   });
-  it('traex is also RPC-capable', () => {
-    expect(codexRpcEligible(baseCfg({ cliId: 'traex' }))).toBe(true);
-    expect(RPC_CAPABLE_CLIS.has('traex')).toBe(true);
+  it('traex always uses the ToolHome-aware gated PTY path', () => {
+    expect(codexRpcEligible(baseCfg({ cliId: 'traex' }))).toBe(false);
+    expect(RPC_CAPABLE_CLIS.has('traex')).toBe(false);
   });
-  it('traex reasoningEffort stays eligible for RPC input', () => {
+  it('traex reasoningEffort does not bypass the PTY gate', () => {
     expect(codexRpcEligible(baseCfg({
       cliId: 'traex',
       model: 'DeepSeek-V4-Pro',
       reasoningEffort: 'medium',
       startupCommands: undefined,
-    }))).toBe(true);
+    }))).toBe(false);
+  });
+  it('service-account traex degrades to gated PTY input', () => {
+    expect(codexRpcEligible(baseCfg({
+      cliId: 'traex',
+      env: {
+        TRAECLI_BYTECLOUD_AUTH_BASE_URL: 'https://cloud.example',
+        TRAECLI_BYTECLOUD_BEARER: 'service-account-token',
+      },
+    }))).toBe(false);
   });
   it('a resume (no prompt but resume + cliSessionId) is eligible', () => {
     expect(codexRpcEligible(baseCfg({ prompt: '', resume: true, cliSessionId: 'thread-1' }))).toBe(true);
@@ -240,6 +249,12 @@ describe('paneRunsRemoteTui — RPC-owned detection via leaf argv (not pane_curr
     }), 'C:\\tools\\vendor-codex.exe')).toBe(true);
   });
 
+  it('recognizes a canonical traex leaf behind the known legacy Botmux proxy', () => {
+    expect(paneRunsRemoteTui('bmx-1', probes({
+      100: { comm: 'traex', argv: ['traex', '--remote', 'ws://x', 'resume', 'tid'] },
+    }), '/home/user/.botmux/bin/traex_proxy.sh')).toBe(true);
+  });
+
   it('matches a configured runtime in a known Node executable slot, but never in arbitrary program argv', () => {
     expect(paneRunsRemoteTui('bmx-1', probes({
       100: {
@@ -327,6 +342,45 @@ describe('orchestrateCodexRpcInit — three-state fresh / resume / kill-failure 
     const d = await orchestrateCodexRpcInit(baseCfg({ codexRpcInput: false }), effects);
     expect(d).toEqual({ engaged: false, queuePrompt: false, abortSpawn: false });
     expect(calls).not.toContain('engage');
+  });
+
+  it('service-account traex removes a surviving legacy remote pane before PTY fallback', async () => {
+    const { effects, calls } = fx({
+      pane: { name: 'bmx-legacy-traex', live: true },
+      isRemote: true,
+      killGone: true,
+    });
+    const d = await orchestrateCodexRpcInit(baseCfg({
+      cliId: 'traex',
+      env: { TRAECLI_BYTECLOUD_BEARER: 'service-account-token' },
+    }), effects);
+    expect(d).toEqual({ engaged: false, queuePrompt: false, abortSpawn: false });
+    expect(calls).toEqual(['paneInfo', 'paneIsRemote', 'killVerify']);
+  });
+
+  it('uses the effective inherited-env service-account verdict for stale pane cleanup', async () => {
+    const { effects, calls } = fx({
+      pane: { name: 'bmx-inherited-traex', live: true },
+      isRemote: true,
+      killGone: true,
+    });
+    const d = await orchestrateCodexRpcInit(baseCfg({ cliId: 'traex' }), effects);
+    expect(d).toEqual({ engaged: false, queuePrompt: false, abortSpawn: false });
+    expect(calls).toEqual(['paneInfo', 'paneIsRemote', 'killVerify']);
+  });
+
+  it('service-account traex aborts when a surviving legacy remote pane cannot be removed', async () => {
+    const { effects, calls } = fx({
+      pane: { name: 'bmx-legacy-traex', live: true },
+      isRemote: true,
+      killGone: false,
+    });
+    const d = await orchestrateCodexRpcInit(baseCfg({
+      cliId: 'traex',
+      env: { TRAECLI_BYTECLOUD_BEARER: 'service-account-token' },
+    }), effects);
+    expect(d).toEqual({ engaged: false, queuePrompt: false, abortSpawn: true });
+    expect(calls).toEqual(['paneInfo', 'paneIsRemote', 'killVerify', 'notify']);
   });
 
   it('FRESH accepted (ack/rollout) → engaged, do NOT queue (turn pre-sent)', async () => {

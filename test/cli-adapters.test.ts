@@ -120,12 +120,13 @@ describe('lazy binary resolution', () => {
     const probe = vi.mocked(spawnSync);
     probe.mockClear();
     const adapter = createCliAdapterSync(id); // bare command name → would probe if eager
-    // Seed eagerly resolves its bin to derive its data root; the others must not
-    // touch the shell until resolvedBin is read.
+    // Seed eagerly resolves its bin to derive its data root. TraeX deliberately
+    // anchors to a canonical host absolute path, so resolveCommand short-circuits
+    // without a shell probe. The others defer their bare-command probe.
     if (id !== 'seed') expect(probe).not.toHaveBeenCalled();
     probe.mockClear();
     void adapter.resolvedBin;
-    if (id !== 'seed') expect(probe).toHaveBeenCalled();
+    if (id !== 'seed' && id !== 'traex') expect(probe).toHaveBeenCalled();
   });
 
   it('memoises: a second resolvedBin read does not probe again', async () => {

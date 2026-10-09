@@ -113,7 +113,7 @@ import {
 import { remoteWorkerShutdownInputBlocker } from './core/remote-worker-shutdown-readiness.js';
 import { ReadyGate, shouldArmReadyGate } from './utils/ready-gate.js';
 import { StartupHealthGate } from './utils/startup-health-gate.js';
-import { runStartupProbe } from './utils/startup-probe.js';
+import { runStartupProbe, type StartupProbeContext, type StartupProbeSpec } from './utils/startup-probe.js';
 import { normalizeBotmuxHostHome } from './utils/host-home.js';
 import { shouldRunStartupCommandsOnSpawn, shouldDeferInitialPromptForStartup } from './core/startup-commands.js';
 import { sanitizePerBotEnv } from './core/per-bot-env.js';
@@ -2115,7 +2115,7 @@ function cliName(): string {
     ?? 'CLI';
 }
 
-function hasTraeServiceAuth(env: Record<string, string>): boolean {
+function hasTraeServiceAuth(env: Record<string, string | undefined>): boolean {
   return Boolean(
     env.TRAECLI_BYTECLOUD_BEARER
     || env.TRAECLI_BYTECLOUD_JWT
@@ -2178,6 +2178,120 @@ let readyGate = new ReadyGate();
  * latter only protects against interactive startup selectors. */
 let startupHealthGate = new StartupHealthGate();
 let startupHealthProbeGeneration = 0;
+type StartupHealthProbePlan = {
+  probeGeneration: number;
+  cliGeneration: number;
+  bin: string;
+  cwd: string;
+  env: NodeJS.ProcessEnv;
+  spec: StartupProbeSpec;
+  context: StartupProbeContext;
+  /** A surviving pane cannot receive a new HOME/service-auth environment.
+   *  Refresh it only when real input arrives, then probe the fresh process. */
+  refreshPersistentPaneBeforeProbe: boolean;
+};
+let startupHealthProbePlan: StartupHealthProbePlan | null = null;
+let startupHealthProbeInFlight: Promise<void> | null = null;
+let startupHealthProbeAbortController: AbortController | null = null;
+
+function cancelStartupHealthProbe(): void {
+  startupHealthProbeAbortController?.abort();
+  startupHealthProbeAbortController = null;
+  startupHealthProbeInFlight = null;
+}
+
+/** Start a new auth-verification generation without rebuilding the CLI.
+ *  A transient exhausted probe may preserve already-observed UI readiness;
+ *  an explicit /login must wait for a fresh post-login prompt instead. */
+function rearmStartupHealthProbe(preserveUiReady: boolean): boolean {
+  const previousPlan = startupHealthProbePlan;
+  if (!previousPlan || !startupHealthGate.isEnabled) return false;
+  const uiReady = preserveUiReady && startupHealthGate.isUiReady;
+  cancelStartupHealthProbe();
+  const probeGeneration = ++startupHealthProbeGeneration;
+  startupHealthProbePlan = { ...previousPlan, probeGeneration };
+  startupHealthGate.reset(true);
+  if (uiReady) startupHealthGate.markUiReady();
+  return true;
+}
+
+async function runPlannedStartupHealthProbe(notifyTarget?: {
+  turnId?: string;
+  dispatchAttempt?: number;
+}): Promise<void> {
+  const plan = startupHealthProbePlan;
+  if (!plan || startupHealthGate.state !== 'pending') return;
+  if (startupHealthProbeInFlight) return startupHealthProbeInFlight;
+
+  if (plan.refreshPersistentPaneBeforeProbe) {
+    const task = (async () => {
+      // An external canary can prove the credential snapshot, but not the
+      // already-running pane that inherited its env at an earlier launch.
+      // Cold-resume that pane first; the replacement spawn performs the eager
+      // canary under the exact current ToolHome/service-account environment.
+      startupHealthProbePlan = { ...plan, refreshPersistentPaneBeforeProbe: false };
+      log('[startup-probe] refreshing persistent TRAE pane before model-turn verification');
+      await restartCliProcess('TRAE service-account input requires current runtime environment', {
+        immediate: true,
+        preservePending: true,
+      });
+    })().finally(() => {
+      if (startupHealthProbeInFlight === task) startupHealthProbeInFlight = null;
+    });
+    startupHealthProbeInFlight = task;
+    return task;
+  }
+
+  const abortController = new AbortController();
+  startupHealthProbeAbortController = abortController;
+  const task = (async () => {
+    const probe = await runStartupProbe({
+      bin: plan.bin,
+      cwd: plan.cwd,
+      env: plan.env,
+      spec: plan.spec,
+      context: plan.context,
+      signal: abortController.signal,
+      log,
+    });
+    if (
+      probe.state === 'cancelled'
+      || abortController.signal.aborted
+      || startupHealthProbeAbortController !== abortController
+      ||
+      plan !== startupHealthProbePlan
+      || plan.probeGeneration !== startupHealthProbeGeneration
+      || plan.cliGeneration !== cliSpawnGeneration
+    ) {
+      return;
+    }
+    if (probe.state === 'ready') {
+      startupHealthGate.markAuthReady();
+      log(`[startup-probe] TRAE auth ready attempts=${probe.attempts} elapsed_ms=${probe.elapsedMs}`);
+      // A warm reattach may have published its composer while the lazy probe
+      // was pending. Re-drive the same prompt-ready path now that both halves
+      // of the startup contract are satisfied.
+      if (startupHealthGate.isUiReady) queueMicrotask(() => markPromptReady());
+      return;
+    }
+
+    startupHealthGate.markAuthFailure(probe.state === 'fatal' ? 'fatal' : 'exhausted');
+    log(`[startup-probe] TRAE auth blocked state=${probe.state} reason=${probe.reason} attempts=${probe.attempts} elapsed_ms=${probe.elapsedMs}`);
+    send({
+      type: 'user_notify',
+      turnId: notifyTarget?.turnId ?? currentBotmuxTurnId,
+      dispatchAttempt: notifyTarget?.dispatchAttempt ?? currentBotmuxDispatchAttempt,
+      message: probe.state === 'fatal'
+        ? '⚠️ TRAE 服务账号认证被拒绝，首条消息已暂存；请检查服务账号凭据或模型权限。'
+        : '⚠️ TRAE 服务账号认证依赖暂不可用，首条消息已暂存；BotMux 已停止自动投递，稍后可重试。',
+    });
+  })().finally(() => {
+    if (startupHealthProbeInFlight === task) startupHealthProbeInFlight = null;
+    if (startupHealthProbeAbortController === abortController) startupHealthProbeAbortController = null;
+  });
+  startupHealthProbeInFlight = task;
+  return task;
+}
 /** Fallback timer: if the SessionStart signal never arrives (hook injection
  *  failed / old CLI / launcher didn't pass --settings / adopt) release the gate
  *  and fall back to readyPattern + quiescence. */
@@ -2769,6 +2883,10 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
   // A pending /rename may have been held by the command-write mutex. It still
   // waits for a genuine prompt because isPromptReady was cleared above.
   void flushPending();
+}
+
+function isTraeLoginRecoveryCommand(content: string): boolean {
+  return /^\s*\/login(?:\s|$)/i.test(content);
 }
 /** Inputs written to the CLI whose turn hasn't completed — re-queued across a
  *  CLI crash so a submit-time death can't silently eat user messages. */
@@ -10325,6 +10443,13 @@ function markPromptReady(): void {
   if (startupHealthGate.isEnabled) {
     startupHealthGate.markUiReady();
     if (startupHealthGate.shouldHold()) {
+      if (startupHealthGate.state === 'pending') {
+        const pending = pendingMessages[0];
+        void runPlannedStartupHealthProbe({
+          turnId: pending?.turnId,
+          dispatchAttempt: pending?.dispatchAttempt,
+        });
+      }
       log(`Prompt detected but holding for TRAE startup health state=${startupHealthGate.state}`);
       return;
     }
@@ -10991,6 +11116,20 @@ async function flushPending(): Promise<void> {
   }
   if (startupHealthGate.shouldHold()) {
     log(`Holding ${pendingMessages.length} pending message(s) until TRAE startup health state=${startupHealthGate.state}`);
+    // Fresh spawns run the probe eagerly before launching the TUI. Persistent
+    // reattach is deliberately lazy so a daemon restart does not fan out one
+    // model canary per dormant pane; its first real queued input starts the
+    // same fail-closed probe here.
+    if (
+      startupHealthGate.state === 'pending'
+      && (startupHealthGate.isUiReady || startupHealthProbePlan?.refreshPersistentPaneBeforeProbe)
+    ) {
+      const pending = pendingMessages[0];
+      void runPlannedStartupHealthProbe({
+        turnId: pending?.turnId,
+        dispatchAttempt: pending?.dispatchAttempt,
+      });
+    }
     return;
   }
   // Post-signal quiescence settle in progress — hold so the first write lands
@@ -14260,47 +14399,59 @@ async function spawnCli(
 
   // TRAE's TUI can render its composer while the account processor is still
   // refreshing the CloudIDE token. For service-account sessions, validate the
-  // actual CLI/model path before allowing any queued user input to flush. Keep
-  // this on fresh, unsandboxed spawns for the first rollout: reattached panes
-  // already own a live CLI generation and sandboxed children need a later
-  // probe implementation that runs inside their exact boundary. Run it after
-  // HOME mirroring so the probe and the real CLI observe the same state root.
+  // actual CLI/model path before allowing any queued user input to flush.
+  // Fresh spawns probe eagerly so the real model turn also warms TRAEX's
+  // service-account token before the TUI starts. Persistent reattach keeps the
+  // gate armed but probes lazily on the first queued input, avoiding a model
+  // request storm when a daemon restores many dormant panes. Run this after
+  // HOME mirroring so the probe and real CLI observe the same per-user ToolHome.
+  // Boundaries we cannot reproduce exactly fail closed instead of silently
+  // disabling the gate and delivering an unauthenticated first message.
+  cancelStartupHealthProbe();
   startupHealthGate.reset(false);
-  const startupProbeEnabled = cliAdapter.id === 'traex'
-    && !sandboxRequested
+  startupHealthProbePlan = null;
+  const probeEnv = { ...childEnv, ...perBotInjectEnv };
+  const traexServiceAccount = cliAdapter.id === 'traex' && hasTraeServiceAuth(probeEnv);
+  const startupProbeBoundarySupported = !sandboxRequested
     && !credentialBoundaryActive
-    && !cfg.adoptMode
-    && !willReattachPersistent
-    && !!cliAdapter.startupProbe
-    && hasTraeServiceAuth(perBotInjectEnv);
-  if (startupProbeEnabled && cliAdapter.startupProbe) {
+    && !cfg.adoptMode;
+  if (traexServiceAccount && cliAdapter.startupProbe && startupProbeBoundarySupported) {
     startupHealthGate.reset(true);
     const probeGeneration = ++startupHealthProbeGeneration;
-    const probeEnv = { ...childEnv, ...perBotInjectEnv };
-    const probe = await runStartupProbe({
+    // Keep an automatic model canary away from repository instructions and
+    // user workspace data. Tool execution is separately constrained by the
+    // adapter's read-only/default permission flags.
+    const probeCwd = join(defaultBotmuxHome, 'runtime', 'traex-startup-probe');
+    mkdirSync(probeCwd, { recursive: true, mode: 0o700 });
+    startupHealthProbePlan = {
+      probeGeneration,
+      cliGeneration: spawnGeneration,
       bin: cliAdapter.resolvedBin,
-      cwd: cfg.workingDir,
+      cwd: probeCwd,
       env: probeEnv,
       spec: cliAdapter.startupProbe,
-      log,
-    });
-    if (probeGeneration !== startupHealthProbeGeneration || spawnGeneration !== cliSpawnGeneration) {
-      throw new CliSpawnSupersededError();
-    }
-    if (probe.state === 'ready') {
-      startupHealthGate.markAuthReady();
-      log(`[startup-probe] TRAE auth ready attempts=${probe.attempts} elapsed_ms=${probe.elapsedMs}`);
+      context: { model: cfg.model, reasoningEffort: cfg.reasoningEffort },
+      refreshPersistentPaneBeforeProbe: willReattachPersistent,
+    };
+    if (willReattachPersistent) {
+      log('[startup-probe] TRAE persistent reattach armed for lazy runtime refresh + model-turn verification');
     } else {
-      startupHealthGate.markAuthFailure(probe.state === 'fatal' ? 'fatal' : 'exhausted');
-      log(`[startup-probe] TRAE auth blocked state=${probe.state} reason=${probe.reason} attempts=${probe.attempts} elapsed_ms=${probe.elapsedMs}`);
-      send({
-        type: 'user_notify',
-        turnId: currentBotmuxTurnId,
-        message: probe.state === 'fatal'
-          ? '⚠️ TRAE 服务账号认证被拒绝，首条消息已暂存；请检查服务账号凭据或模型权限。'
-          : '⚠️ TRAE 服务账号认证依赖暂不可用，首条消息已暂存；BotMux 已停止自动投递，稍后可重试。',
-      });
+      // Let the TUI finish its own login-status activation first. Its prompt
+      // edge starts the independent canary, while StartupHealthGate keeps every
+      // input path fail-closed. This avoids both a synchronous startup stall and
+      // two concurrent CloudIDE token exchanges racing the same auth cache.
+      log('[startup-probe] TRAE fresh startup armed for post-prompt model-turn verification');
     }
+  } else if (traexServiceAccount) {
+    startupHealthGate.reset(true);
+    startupHealthGate.markAuthFailure('fatal');
+    log('[startup-probe] TRAE auth gate blocked: exact sandbox/credential/adopt boundary probing is unavailable');
+    send({
+      type: 'user_notify',
+      turnId: currentBotmuxTurnId,
+      dispatchAttempt: currentBotmuxDispatchAttempt,
+      message: '⚠️ TRAE 服务账号会话启用了当前无法精确复现的隔离/接管边界；为避免未认证投递，首条消息已暂存。请改用普通 ToolHome 会话或调整该会话隔离配置后重试。',
+    });
   }
 
   const hermesUsesBotmuxSessionProfile = basename(cfg.cliPathOverride ?? '') === 'hermes-botmux-session';
@@ -16293,7 +16444,9 @@ function killCli(opts: {
   structuredRejectedReadyEvidenceGeneration = undefined;
   ptyOutputGeneration.reset();
   startupHealthProbeGeneration += 1;
+  cancelStartupHealthProbe();
   startupHealthGate.reset(false);
+  startupHealthProbePlan = null;
   // Cancel any pending ready-gate fallback / settle timers; spawnCli re-arms on respawn.
   if (readySignalTimer) { clearTimeout(readySignalTimer); readySignalTimer = null; }
   if (readyFlushSettleTimer) { clearTimeout(readyFlushSettleTimer); readyFlushSettleTimer = null; }
@@ -18438,13 +18591,13 @@ process.on('message', async (raw: unknown) => {
         // then launched/respawned as `codex --remote resume` (codex.ts buildArgs)
         // against the CURRENT app-server (a fresh port each incarnation).
         const rpcBackendType = msg.backendType ?? config.daemon.backendType;
+        const rpcLifecycleAdapter = createCliAdapterSync(msg.cliId as CliId, msg.cliPathOverride);
         let rpcPluginGenerationPrepared = false;
         const rpcDecision = await orchestrateCodexRpcInit(msg, {
           paneInfo: (sid) => persistentPaneInfo(rpcBackendType, sid),
-          paneIsRemote: (name) => paneRunsRemoteTui(name, {}, msg.cliRuntime?.executable),
+          paneIsRemote: (name) => paneRunsRemoteTui(name, {}, rpcLifecycleAdapter.resolvedBin),
           prepare: async () => {
-            const adapter = createCliAdapterSync(msg.cliId as CliId, msg.cliPathOverride);
-            await prepareCliPluginGenerationAndGateway(msg, adapter);
+            await prepareCliPluginGenerationAndGateway(msg, rpcLifecycleAdapter);
             rpcPluginGenerationPrepared = true;
           },
           engage: () => engageCodexRpc(msg),
@@ -18579,13 +18732,29 @@ process.on('message', async (raw: unknown) => {
         if (initialInputCommitted) acknowledgeTurnInputCommitted(msg.turnId);
         initPromptMaterialized = true;
 
+        // A persistent pane can report its composer while spawnCli() is still
+        // running, before this init prompt is materialized. The startup-health
+        // gate intentionally rejects that early ready edge, so explicitly start
+        // the lazy reattach canary once the real queue head now exists.
+        if (
+          startupHealthGate.state === 'pending'
+          && hasPendingInputForFlush()
+          && (startupHealthGate.isUiReady || startupHealthProbePlan?.refreshPersistentPaneBeforeProbe)
+        ) {
+          const pending = pendingMessages[0];
+          void runPlannedStartupHealthProbe({
+            turnId: pending?.turnId,
+            dispatchAttempt: pending?.dispatchAttempt,
+          });
+        }
+
         // A backend may become prompt-ready before spawnCli() returns. The
         // initial prompt is queued only afterwards, so the earlier
         // markPromptReady() necessarily flushed an empty queue. This is normal
         // for riff (ready immediately) and can also happen when Herdr reports a
         // fast-starting TUI as idle during spawn. Flush again after enqueueing;
         // the ready flag keeps booting/busy backends gated.
-        if (isPromptReady && pendingMessages.length > 0) {
+        if (isPromptReady && hasPendingInputForFlush()) {
           flushPending();
         }
 
@@ -18738,7 +18907,8 @@ process.on('message', async (raw: unknown) => {
         // process.on('message') does not serialize async listeners. Hold the
         // per-worker queue across transcript mark + complete adapter write so
         // two CoCo/Codex paste→wait→Enter/history cycles cannot overlap.
-        if (cliRestartInProgress || rawInputRestartGate || !backend || sessionRenameInFlight()) {
+        if (cliRestartInProgress || rawInputRestartGate || !backend || sessionRenameInFlight()
+          || startupHealthGate.shouldHold()) {
           pendingAdoptMessages.push(item);
           log(`Deferred adopt message until the CLI generation/input gate settles (${content.length} chars)`);
         } else {
@@ -18748,6 +18918,13 @@ process.on('message', async (raw: unknown) => {
           });
         }
       } else {
+        // Exhaustion represents a transient dependency window, not a permanent
+        // authorization verdict. A later user message is an explicit retry:
+        // preserve the already-observed composer edge, start a new canary
+        // generation, and keep both the original and new messages queued until
+        // that real model turn succeeds.
+        const retryExhaustedStartupHealth = startupHealthGate.state === 'exhausted'
+          && rearmStartupHealthProbe(true);
         // Non-adopt: enqueue only. Bridge mark is deferred to flushPending
         // so markTimeMs anchors to the actual PTY-write moment, not IPC
         // arrival. Marking now would race with a still-running previous
@@ -18768,6 +18945,14 @@ process.on('message', async (raw: unknown) => {
         });
         if (inputCommitted) acknowledgeTurnInputCommitted(msg.turnId);
         else if (ordinaryImTurnId) rejectOrdinaryImTurn(ordinaryImTurnId, 'cli_input_unavailable');
+        if (retryExhaustedStartupHealth) {
+          const pending = pendingMessages[0];
+          log('TRAE startup health retry requested by a new user message');
+          void runPlannedStartupHealthProbe({
+            turnId: pending?.turnId ?? msg.turnId,
+            dispatchAttempt: pending?.dispatchAttempt ?? msg.dispatchAttempt,
+          });
+        }
       }
       break;
     }
@@ -18793,12 +18978,35 @@ process.on('message', async (raw: unknown) => {
       // preserves busy delivery, but its Enter/arrow sequence must never drive
       // the menu's current selection.
       refreshHookReviewInputHold(lastAnalyzerSnapshot || renderer?.rawSnapshot() || '');
-      if (cliRestartInProgress || rawInputRestartGate || sessionRenameInFlight()
+      const startupHealthAllowsRawInput = isTraeLoginRecoveryCommand(msg.content);
+      const retryExhaustedStartupHealth = !startupHealthAllowsRawInput
+        && startupHealthGate.state === 'exhausted'
+        && rearmStartupHealthProbe(true);
+      if (retryExhaustedStartupHealth) {
+        log('TRAE startup health retry requested by a new passthrough command');
+      }
+      if (startupHealthAllowsRawInput && startupHealthGate.isEnabled) {
+        // Manual login is the explicit recovery escape hatch. The command may
+        // run while the gate is failed, but no later turn is admitted until a
+        // fresh canary validates the new account state.
+        rearmStartupHealthProbe(false);
+        log('TRAE manual /login requested — re-arming startup health verification');
+      }
+      if (!initPromptMaterialized
+        || cliRestartInProgress || rawInputRestartGate || sessionRenameInFlight()
         || shouldHoldCodexRunnerInput(codexRunnerFreshness)
         || injectionFlushing || shouldDeferUserFlush(pendingInjections)
         || bareShellCheckInProgress || bareShellLaunchBlocked
+        || (startupHealthGate.shouldHold() && !startupHealthAllowsRawInput)
         || hookReviewInputHold) {
         freshnessInputQueue.enqueueRaw(msg);
+        if (
+          startupHealthGate.state === 'pending'
+          && !startupHealthAllowsRawInput
+          && (startupHealthGate.isUiReady || startupHealthProbePlan?.refreshPersistentPaneBeforeProbe)
+        ) {
+          void runPlannedStartupHealthProbe({ turnId: msg.turnId });
+        }
         if (hookReviewInputHold) {
           notifyHookReviewInputHold();
           log(`Deferred passthrough slash command while Hook review is visible: ${msg.content}`);

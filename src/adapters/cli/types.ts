@@ -412,7 +412,8 @@ export interface CliAdapter {
   readonly readyPattern?: RegExp;
 
   /** Optional startup health probe. The worker may use this capability for a
-   *  fresh service-account session before admitting the first user message.
+   *  service-account session before admitting the first user message of a
+   *  fresh or newly reattached worker generation.
    *  The probe is deliberately adapter-owned so Botmux does not duplicate a
    *  CLI's credential exchange protocol. */
   readonly startupProbe?: import('../../utils/startup-probe.js').StartupProbeSpec;

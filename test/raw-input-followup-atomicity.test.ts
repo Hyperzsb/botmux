@@ -38,12 +38,10 @@ function caseRegion(src: string, marker: string, span = 3000): string {
 }
 
 describe('worker raw_input handler', () => {
-  const region = caseRegion(workerSrc, "case 'raw_input':");
+  const region = caseRegion(workerSrc, "case 'raw_input':", 4200);
 
   it('queues through an owned restart until the replacement prompt, while preserving normal busy delivery', () => {
-    const gateIdx = region.indexOf(
-      'if (cliRestartInProgress || rawInputRestartGate || sessionRenameInFlight',
-    );
+    const gateIdx = region.indexOf('if (!initPromptMaterialized');
     const queueIdx = region.indexOf('freshnessInputQueue.enqueueRaw(msg)');
     const deliverIdx = region.indexOf('await deliverRawInput(msg)');
 
@@ -62,11 +60,26 @@ describe('worker raw_input handler', () => {
     // passthrough 会直送、执行在旧 cwd 的 CLI 里。两个围栏必须与 restart/rename
     // 同在入队条件里。
     const gate = region.slice(
-      region.indexOf('if (cliRestartInProgress'),
+      region.indexOf('if (!initPromptMaterialized'),
       region.indexOf('freshnessInputQueue.enqueueRaw(msg)'),
     );
     expect(gate).toContain('injectionFlushing');
     expect(gate).toContain('shouldDeferUserFlush(pendingInjections)');
+  });
+
+  it('holds passthrough commands behind TRAEX startup health except explicit /login recovery', () => {
+    const gate = region.slice(
+      region.indexOf('const startupHealthAllowsRawInput'),
+      region.indexOf('await deliverRawInput(msg)'),
+    );
+    expect(gate).toContain('isTraeLoginRecoveryCommand(msg.content)');
+    expect(workerSrc).toContain('/^\\s*\\/login(?:\\s|$)/i');
+    expect(gate).toContain('rearmStartupHealthProbe(false)');
+    expect(gate).toContain("startupHealthGate.state === 'exhausted'");
+    expect(gate).toContain('rearmStartupHealthProbe(true)');
+    expect(region).toContain('if (!initPromptMaterialized');
+    expect(gate).toContain('startupHealthGate.shouldHold() && !startupHealthAllowsRawInput');
+    expect(gate).toContain('runPlannedStartupHealthProbe({ turnId: msg.turnId })');
   });
 
 });

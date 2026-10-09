@@ -44,4 +44,17 @@ describe('StartupHealthGate', () => {
     expect(gate.isUiReady).toBe(false);
     expect(gate.state).toBe('pending');
   });
+
+  it('can re-arm after a failed generation for explicit login recovery', () => {
+    const gate = new StartupHealthGate();
+    gate.reset(true);
+    gate.markUiReady();
+    gate.markAuthFailure('exhausted');
+    expect(gate.shouldHold()).toBe(true);
+
+    gate.reset(true);
+    expect(gate.state).toBe('pending');
+    expect(gate.isUiReady).toBe(false);
+    expect(gate.shouldHold()).toBe(true);
+  });
 });
