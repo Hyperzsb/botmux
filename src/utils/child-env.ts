@@ -633,12 +633,39 @@ export function isByteCloudCredentialEnvKey(key: string): boolean {
     || key === 'AIME_USER_CODE_JWT'
     || key === 'BYTECLOUD_CLI_JWT_TOKEN'
     || key === 'BYTECLOUD_AUTH_AS'
+    // bytedcli can override BYTECLOUD_AUTH_AS=user with `--as app` and then
+    // consume these application credentials.  They are identity-bearing just
+    // like the SDK AK/SK variables below, not harmless CLI configuration.
+    || key === 'BYTEDCLI_AI_AUTH_APP_KEY'
+    || key === 'BYTEDCLI_AI_AUTH_SUBJECT'
+    || key === 'BYTEDCLI_BYTECLOUD_AUTH_FALLBACK'
+    || key === 'BYTEDCLI_USE_ZTI_JWT'
+    || /^BYTEDCLI_SERVICE_ACCOUNT_[A-Z0-9_]+$/.test(key)
     || /^BYTECLOUD_CLI_API_JWT_TOKEN(?:_[A-Z0-9_]+)?$/.test(key)
     || /^BYTECLOUD_AUTH_ACCESS_KEY_ID(?:_[A-Z0-9_]+)?$/.test(key)
     || /^BYTECLOUD_AUTH_SECRET_ACCESS_KEY(?:_[A-Z0-9_]+)?$/.test(key)
     // Older SDK call sites use the same AK/SK names without the AUTH segment.
     || /^BYTECLOUD_ACCESS_KEY_ID(?:_[A-Z0-9_]+)?$/.test(key)
     || /^BYTECLOUD_SECRET_ACCESS_KEY(?:_[A-Z0-9_]+)?$/.test(key);
+}
+
+/**
+ * Credentials accepted directly by governed CLIs outside the shared
+ * ByteCloud SDK. bytedcli is a toolbox whose subcommands also accept domain
+ * tokens, cookies, passwords and AK/SK pairs; inheriting any one of them would
+ * let a turn act as the daemon operator even when its ByteCloud JWT is isolated.
+ */
+export function isCredentialLikeEnvKey(key: string): boolean {
+  return isByteCloudCredentialEnvKey(key)
+    || /(?:TOKEN|JWT|COOKIE|PASSWORD|SECRET|ACCESS_KEY|AUTHORIZATION)/.test(key)
+    || key === 'BYTEDCLI_OCEANUS_AUTH';
+}
+
+/** Delete ambient credentials before starting a governed CLI provider. */
+export function scrubCredentialLikeEnv(env: NodeJS.ProcessEnv): void {
+  for (const key of Object.keys(env)) {
+    if (isCredentialLikeEnvKey(key)) delete env[key];
+  }
 }
 
 /** Delete every inherited ByteCloud user/app identity from `env` in place. */

@@ -23,7 +23,7 @@ import { EventEmitter } from 'node:events';
 
 /** Every `bytedcli` invocation this test file caused: argv plus the HOME it ran under. */
 const statuses = new Map<string, { code: number; stdout?: string; stderr?: string }>();
-const statusCalls: Array<{ home: string | undefined; identity?: string }> = [];
+const statusCalls: Array<{ home: string | undefined; identity?: string; site: string }> = [];
 const calls: Array<{ args: string[]; home: string | undefined }> = [];
 const spawnEnvs: Array<Record<string, string | undefined>> = [];
 /** Queued replies, one per invocation, in order. */
@@ -32,10 +32,13 @@ let replies: Array<{ code: number; stdout?: string; stderr?: string }> = [];
 vi.mock('node:child_process', () => ({
   spawn: vi.fn((_cmd: string, args: string[], opts: { env?: Record<string, string> }) => {
     spawnEnvs.push({ ...opts?.env });
-    const status = args[0] === 'auth' && args[1] === 'status';
-    if (status) statusCalls.push({ home: opts?.env?.HOME, identity: opts?.env?.BYTECLOUD_AUTH_AS });
+    const siteIndex = args.indexOf('--site');
+    const site = siteIndex >= 0 ? args[siteIndex + 1] : 'cn';
+    const authIndex = args.indexOf('auth');
+    const status = authIndex >= 0 && args[authIndex + 1] === 'status';
+    if (status) statusCalls.push({ home: opts?.env?.HOME, identity: opts?.env?.BYTECLOUD_AUTH_AS, site });
     else calls.push({ args, home: opts?.env?.HOME });
-    const reply = status ? (statuses.get(opts?.env?.HOME ?? '') ?? { code: 0, stdout: envelope({ authenticated: false }) })
+    const reply = status ? (statuses.get(`${opts?.env?.HOME ?? ''}\0${site}`) ?? { code: 0, stdout: envelope({ authenticated: false }) })
       : replies.shift() ?? { code: 0, stdout: '' };
     const child = new EventEmitter() as EventEmitter & {
       stdout: EventEmitter; stderr: EventEmitter; kill: () => void;
@@ -61,6 +64,8 @@ vi.mock('node:os', async (importOriginal) => {
 
 const ALICE = 'ou_alice';
 const BOB = 'ou_bob';
+const CN = 'cn' as const;
+const SITES = ['cn', 'i18n-tt', 'i18n-bd', 'eu-ttp', 'us-ttp'] as const;
 
 async function fresh() {
   vi.resetModules();
@@ -105,10 +110,25 @@ function writeBytedData(mod: Awaited<ReturnType<typeof fresh>>, openId: string, 
   writeFileSync(full, '{}');
 }
 
-function authorize(mod: { bytedcliHomeFor: (id: string) => string }, openId: string) {
+function setStatus(
+  mod: { bytedcliHomeFor: (id: string) => string },
+  openId: string,
+  site: string,
+  status: { code: number; stdout?: string; stderr?: string },
+) {
+  statuses.set(`${mod.bytedcliHomeFor(openId)}\0${site}`, status);
+}
+
+function authorize(
+  mod: { bytedcliHomeFor: (id: string) => string },
+  openId: string,
+  sites: readonly string[] = SITES,
+) {
   const dir = mod.bytedcliHomeFor(openId);
   mkdirSync(dir, { recursive: true });
-  statuses.set(dir, { code: 0, stdout: envelope({ authenticated: true, bytecloud_auth: { authType: 'user' } }) });
+  for (const site of sites) {
+    setStatus(mod, openId, site, { code: 0, stdout: envelope({ authenticated: true, bytecloud_auth: { authType: 'user' } }) });
+  }
 }
 
 describe('hasBytedcliHome — provider-owned login state', () => {
@@ -118,11 +138,16 @@ describe('hasBytedcliHome — provider-owned login state', () => {
     vi.stubEnv('BYTECLOUD_SECRET_ACCESS_KEY', 'machine-sk');
     vi.stubEnv('AIPAAS_BYTECLAW', '1');
     vi.stubEnv('AIME_USER_CLOUD_JWT', 'machine-aime');
+    vi.stubEnv('BYTEDCLI_SERVICE_ACCOUNT_JWT_US_TTP', 'machine-app-jwt');
+    vi.stubEnv('BYTEDCLI_SERVICE_ACCOUNT_US_TTP_ACCESS_KEY_ID', 'machine-app-ak');
+    vi.stubEnv('BYTEDCLI_AI_AUTH_APP_KEY', 'machine-ai-app');
+    vi.stubEnv('BYTEDCLI_AI_AUTH_SUBJECT', 'someone-else');
+    vi.stubEnv('BYTEDCLI_USE_ZTI_JWT', '1');
     vi.stubEnv('BYTECLOUD_AUTH_AS', 'app');
     const mod = await fresh();
     authorize(mod, ALICE);
 
-    expect(await mod.hasBytedcliHome(ALICE)).toBe(true);
+    expect(await mod.hasBytedcliHome(ALICE, CN)).toBe(true);
     const env = spawnEnvs.at(-1)!;
     expect(env.HOME).toBe(mod.bytedcliHomeFor(ALICE));
     expect(env.BYTECLOUD_AUTH_AS).toBe('user');
@@ -132,19 +157,24 @@ describe('hasBytedcliHome — provider-owned login state', () => {
       'BYTECLOUD_SECRET_ACCESS_KEY',
       'AIPAAS_BYTECLAW',
       'AIME_USER_CLOUD_JWT',
+      'BYTEDCLI_SERVICE_ACCOUNT_JWT_US_TTP',
+      'BYTEDCLI_SERVICE_ACCOUNT_US_TTP_ACCESS_KEY_ID',
+      'BYTEDCLI_AI_AUTH_APP_KEY',
+      'BYTEDCLI_AI_AUTH_SUBJECT',
+      'BYTEDCLI_USE_ZTI_JWT',
     ]) expect(env[key]).toBeUndefined();
   });
 
   it('accepts an SDK login without any legacy token file and forces personal identity', async () => {
     const mod = await fresh(); authorize(mod, ALICE);
-    expect(await mod.hasBytedcliHome(ALICE)).toBe(true);
-    expect(statusCalls).toEqual([{ home: mod.bytedcliHomeFor(ALICE), identity: 'user' }]);
+    expect(await mod.hasBytedcliHome(ALICE, CN)).toBe(true);
+    expect(statusCalls).toEqual([{ home: mod.bytedcliHomeFor(ALICE), identity: 'user', site: CN }]);
     expect(existsSync(join(mod.bytedcliHomeFor(ALICE), '.local/share/bytedcli/token.json'))).toBe(false);
   });
   it('does not treat a bare HOME or an expired legacy token file as authorization', async () => {
     const mod = await fresh();
     writeBytedData(mod, ALICE, 'token.json');
-    expect(await mod.hasBytedcliHome(ALICE)).toBe(false);
+    expect(await mod.hasBytedcliHome(ALICE, CN)).toBe(false);
   });
   it.each([
     { code: 1, stderr: 'provider unavailable' },
@@ -153,15 +183,22 @@ describe('hasBytedcliHome — provider-owned login state', () => {
     { code: 0, stdout: envelope({ authenticated: true, bytecloud_auth: { authType: 'app' } }) },
   ])('refuses failed, malformed or non-personal status: %j', async status => {
     const mod = await fresh(); authorize(mod, ALICE);
-    statuses.set(mod.bytedcliHomeFor(ALICE), status);
-    await expect(mod.hasBytedcliHome(ALICE)).rejects.toThrow('unavailable');
+    setStatus(mod, ALICE, CN, status);
+    await expect(mod.hasBytedcliHome(ALICE, CN)).rejects.toThrow('unavailable');
   });
   it('keeps two people isolated and observes revocation on the next check', async () => {
     const mod = await fresh(); authorize(mod, ALICE);
-    expect(await mod.hasBytedcliHome(ALICE)).toBe(true);
-    expect(await mod.hasBytedcliHome(BOB)).toBe(false);
-    statuses.set(mod.bytedcliHomeFor(ALICE), { code: 0, stdout: envelope({ authenticated: false }) });
-    expect(await mod.hasBytedcliHome(ALICE)).toBe(false);
+    expect(await mod.hasBytedcliHome(ALICE, CN)).toBe(true);
+    expect(await mod.hasBytedcliHome(BOB, CN)).toBe(false);
+    setStatus(mod, ALICE, CN, { code: 0, stdout: envelope({ authenticated: false }) });
+    expect(await mod.hasBytedcliHome(ALICE, CN)).toBe(false);
+  });
+
+  it('checks the requested site instead of treating CN as global authorization', async () => {
+    const mod = await fresh(); authorize(mod, ALICE, ['i18n-bd']);
+    expect(await mod.hasBytedcliHome(ALICE, CN)).toBe(false);
+    expect(await mod.hasBytedcliHome(ALICE, 'i18n-bd')).toBe(true);
+    expect(statusCalls.map(call => call.site)).toEqual(['cn', 'i18n-bd']);
   });
 });
 
@@ -175,10 +212,11 @@ describe('login — device code, in two steps', () => {
         + envelope({ verification_uri_complete: 'https://cloud.example.com/a?state=s', complete_token: 'tok-1' }),
     }];
 
-    const started = await mod.beginBytedcliLogin(ALICE);
-    expect(started).toEqual({ authUrl: 'https://cloud.example.com/a?state=s', completeToken: 'tok-1' });
+    const started = await mod.beginBytedcliLogin(ALICE, 'i18n-bd');
+    expect(started).toEqual({ site: 'i18n-bd', authUrl: 'https://cloud.example.com/a?state=s', completeToken: 'tok-1' });
     // Persisted, so the person can come back with `done` in a later message.
-    expect(mod.pendingBytedcliChallenge(ALICE)).toBe('tok-1');
+    expect(mod.pendingBytedcliChallenge(ALICE, 'i18n-bd')).toBe('tok-1');
+    expect(calls[0].args.slice(0, 2)).toEqual(['--site', 'i18n-bd']);
   });
 
   it('reuses an unfinished login instead of creating another link', async () => {
@@ -188,8 +226,8 @@ describe('login — device code, in two steps', () => {
       stdout: envelope({ verification_uri_complete: 'https://cloud.example.com/a?state=s', complete_token: 'tok-1' }),
     }];
 
-    const first = await mod.beginBytedcliLogin(ALICE);
-    const second = await mod.beginBytedcliLogin(ALICE);
+    const first = await mod.beginBytedcliLogin(ALICE, CN);
+    const second = await mod.beginBytedcliLogin(ALICE, CN);
 
     expect(second).toEqual(first);
     expect(calls).toHaveLength(1);
@@ -200,7 +238,7 @@ describe('login — device code, in two steps', () => {
   it('runs under the requesting person\'s HOME', async () => {
     const mod = await fresh();
     replies = [{ code: 0, stdout: envelope({ verification_uri_complete: 'https://x/y', complete_token: 't' }) }];
-    await mod.beginBytedcliLogin(ALICE);
+    await mod.beginBytedcliLogin(ALICE, CN);
     expect(calls[0].home).toBe(mod.bytedcliHomeFor(ALICE));
     expect(calls[0].home).not.toBe(home);
   });
@@ -208,14 +246,14 @@ describe('login — device code, in two steps', () => {
   it('reports failure rather than a half-built challenge', async () => {
     const mod = await fresh();
     replies = [{ code: 1, stderr: 'network unreachable' }];
-    expect(await mod.beginBytedcliLogin(ALICE)).toBeNull();
-    expect(mod.pendingBytedcliChallenge(ALICE)).toBeNull();
+    expect(await mod.beginBytedcliLogin(ALICE, CN)).toBeNull();
+    expect(mod.pendingBytedcliChallenge(ALICE, CN)).toBeNull();
   });
 
   it('treats "not clicked yet" as pending, not as an error', async () => {
     const mod = await fresh();
     replies = [{ code: 0, stdout: envelope({ status: 'pending' }) }];
-    expect(await mod.completeBytedcliLogin(ALICE, 'tok-1')).toEqual({ state: 'pending' });
+    expect(await mod.completeBytedcliLogin(ALICE, CN, 'tok-1')).toEqual({ state: 'pending' });
   });
 
   it('clears the challenge once the login lands', async () => {
@@ -225,17 +263,29 @@ describe('login — device code, in two steps', () => {
       { code: 0, stdout: envelope({ verification_uri_complete: 'https://x/y', complete_token: 'tok-1' }) },
       { code: 0, stdout: envelope({ status: 'ok' }) },
     ];
-    await mod.beginBytedcliLogin(ALICE);
-    expect(await mod.completeBytedcliLogin(ALICE, 'tok-1')).toEqual({ state: 'authorized' });
-    expect(mod.pendingBytedcliChallenge(ALICE)).toBeNull();
+    await mod.beginBytedcliLogin(ALICE, CN);
+    expect(await mod.completeBytedcliLogin(ALICE, CN, 'tok-1')).toEqual({ state: 'authorized' });
+    expect(mod.pendingBytedcliChallenge(ALICE, CN)).toBeNull();
   });
 
   // One person's pending login must never be visible as another's.
   it('keeps each person\'s challenge to themselves', async () => {
     const mod = await fresh();
     replies = [{ code: 0, stdout: envelope({ verification_uri_complete: 'https://x/y', complete_token: 'alice-tok' }) }];
-    await mod.beginBytedcliLogin(ALICE);
-    expect(mod.pendingBytedcliChallenge(BOB)).toBeNull();
+    await mod.beginBytedcliLogin(ALICE, CN);
+    expect(mod.pendingBytedcliChallenge(BOB, CN)).toBeNull();
+  });
+
+  it('keeps pending challenges partitioned by site', async () => {
+    const mod = await fresh();
+    replies = [
+      { code: 0, stdout: envelope({ verification_uri_complete: 'https://x/cn', complete_token: 'cn-token' }) },
+      { code: 0, stdout: envelope({ verification_uri_complete: 'https://x/bd', complete_token: 'bd-token' }) },
+    ];
+    await mod.beginBytedcliLogin(ALICE, CN);
+    await mod.beginBytedcliLogin(ALICE, 'i18n-bd');
+    expect(mod.pendingBytedcliChallenge(ALICE, CN)).toBe('cn-token');
+    expect(mod.pendingBytedcliChallenge(ALICE, 'i18n-bd')).toBe('bd-token');
   });
 });
 
@@ -245,7 +295,7 @@ describe('mintBytedcliJwts — fresh per turn, never borrowed', () => {
     authorize(mod, ALICE);
     replies = [{ code: 0, stdout: 'cloud.jwt.value\n' }, { code: 0, stdout: 'code.jwt.value\n' }];
 
-    expect(await mod.mintBytedcliJwts(ALICE)).toEqual({
+    expect(await mod.mintBytedcliJwts(ALICE, CN)).toEqual({
       cloudJwt: 'cloud.jwt.value',
       codeJwt: 'code.jwt.value',
     });
@@ -258,7 +308,7 @@ describe('mintBytedcliJwts — fresh per turn, never borrowed', () => {
       code: 0,
       stdout: envelope({ verification_uri_complete: 'https://cloud.example.com/a?state=s', complete_token: 'tok-1' }),
     }];
-    await mod.beginBytedcliLogin(ALICE);
+    await mod.beginBytedcliLogin(ALICE, CN);
     // A successful --complete makes bytedcli itself write the SSO token; the
     // scripted runner cannot, so lay down what the real CLI would.
     authorize(mod, ALICE);
@@ -268,16 +318,16 @@ describe('mintBytedcliJwts — fresh per turn, never borrowed', () => {
       { code: 0, stdout: 'code.jwt.value\n' },
     ];
 
-    expect(await mod.mintBytedcliJwts(ALICE)).toEqual({
+    expect(await mod.mintBytedcliJwts(ALICE, CN)).toEqual({
       cloudJwt: 'cloud.jwt.value',
       codeJwt: 'code.jwt.value',
     });
     expect(calls.slice(1).map(call => call.args)).toEqual([
-      ['auth', 'login', '--complete', 'tok-1', '--json'],
-      ['auth', 'get-bytecloud-jwt-token'],
-      ['auth', 'get-codebase-jwt-token'],
+      ['--site', 'cn', 'auth', 'login', '--complete', 'tok-1', '--json'],
+      ['--site', 'cn', 'auth', 'get-bytecloud-jwt-token'],
+      ['--site', 'cn', 'auth', 'get-codebase-jwt-token'],
     ]);
-    expect(mod.pendingBytedcliChallenge(ALICE)).toBeNull();
+    expect(mod.pendingBytedcliChallenge(ALICE, CN)).toBeNull();
   });
 
   it('waits for the user to click a pending login before minting JWTs', async () => {
@@ -286,12 +336,12 @@ describe('mintBytedcliJwts — fresh per turn, never borrowed', () => {
       code: 0,
       stdout: envelope({ verification_uri_complete: 'https://cloud.example.com/a?state=s', complete_token: 'tok-1' }),
     }];
-    await mod.beginBytedcliLogin(ALICE);
+    await mod.beginBytedcliLogin(ALICE, CN);
     replies = [{ code: 0, stdout: envelope({ status: 'pending' }) }];
 
-    expect(await mod.mintBytedcliJwts(ALICE)).toBeNull();
+    expect(await mod.mintBytedcliJwts(ALICE, CN)).toBeNull();
     expect(calls.slice(1).map(call => call.args)).toEqual([
-      ['auth', 'login', '--complete', 'tok-1', '--json'],
+      ['--site', 'cn', 'auth', 'login', '--complete', 'tok-1', '--json'],
     ]);
   });
 
@@ -299,7 +349,7 @@ describe('mintBytedcliJwts — fresh per turn, never borrowed', () => {
   // session — which is what plain `bytedcli` would have used.
   it('returns nothing for a person who has never authorized', async () => {
     const mod = await fresh();
-    expect(await mod.mintBytedcliJwts(BOB)).toBeNull();
+    expect(await mod.mintBytedcliJwts(BOB, CN)).toBeNull();
     // And it did not even shell out, so it cannot have read anyone's session.
     expect(calls).toEqual([]);
   });
@@ -307,8 +357,8 @@ describe('mintBytedcliJwts — fresh per turn, never borrowed', () => {
   it('returns nothing once their login has expired', async () => {
     const mod = await fresh();
     authorize(mod, ALICE);
-    statuses.set(mod.bytedcliHomeFor(ALICE), { code: 0, stdout: envelope({ authenticated: false, bytecloud_auth: { status: 'need_login' } }) });
-    expect(await mod.mintBytedcliJwts(ALICE)).toBeNull();
+    setStatus(mod, ALICE, CN, { code: 0, stdout: envelope({ authenticated: false, bytecloud_auth: { status: 'need_login' } }) });
+    expect(await mod.mintBytedcliJwts(ALICE, CN)).toBeNull();
   });
 
   // Only git attribution depends on the Codebase JWT, so losing it must not
@@ -317,7 +367,7 @@ describe('mintBytedcliJwts — fresh per turn, never borrowed', () => {
     const mod = await fresh();
     authorize(mod, ALICE);
     replies = [{ code: 0, stdout: 'cloud.jwt.value\n' }, { code: 1, stderr: 'codebase down' }];
-    expect(await mod.mintBytedcliJwts(ALICE)).toEqual({ cloudJwt: 'cloud.jwt.value' });
+    expect(await mod.mintBytedcliJwts(ALICE, CN)).toEqual({ cloudJwt: 'cloud.jwt.value' });
   });
 
   // Minted per turn on purpose: the ByteCloud JWT lives ~2h while the login
@@ -330,8 +380,8 @@ describe('mintBytedcliJwts — fresh per turn, never borrowed', () => {
       { code: 0, stdout: 'jwt-1\n' }, { code: 0, stdout: 'code-1\n' },
       { code: 0, stdout: 'jwt-2\n' }, { code: 0, stdout: 'code-2\n' },
     ];
-    expect((await mod.mintBytedcliJwts(ALICE))?.cloudJwt).toBe('jwt-1');
-    expect((await mod.mintBytedcliJwts(ALICE))?.cloudJwt).toBe('jwt-2');
+    expect((await mod.mintBytedcliJwts(ALICE, CN))?.cloudJwt).toBe('jwt-1');
+    expect((await mod.mintBytedcliJwts(ALICE, CN))?.cloudJwt).toBe('jwt-2');
   });
 });
 
@@ -341,7 +391,6 @@ describe('mintLarkdevByteCloudJwts — per-plane sender identity', () => {
     authorize(mod, ALICE);
     replies = [
       { code: 0, stdout: 'cn.jwt\n' },
-      { code: 0, stdout: 'code.jwt\n' },
       { code: 0, stdout: 'tt.jwt\n' },
       { code: 0, stdout: 'bd.jwt\n' },
       { code: 0, stdout: 'eu.jwt\n' },
@@ -355,8 +404,7 @@ describe('mintLarkdevByteCloudJwts — per-plane sender identity', () => {
       'us-ttp': 'us.jwt',
     });
     expect(calls.map(call => call.args)).toEqual([
-      ['auth', 'get-bytecloud-jwt-token'],
-      ['auth', 'get-codebase-jwt-token'],
+      ['--site', 'cn', 'auth', 'get-bytecloud-jwt-token'],
       ['--site', 'i18n-tt', 'auth', 'get-bytecloud-jwt-token'],
       ['--site', 'i18n-bd', 'auth', 'get-bytecloud-jwt-token'],
       ['--site', 'eu-ttp', 'auth', 'get-bytecloud-jwt-token'],
@@ -370,7 +418,6 @@ describe('mintLarkdevByteCloudJwts — per-plane sender identity', () => {
     authorize(mod, ALICE);
     replies = [
       { code: 0, stdout: 'cn.jwt\n' },
-      { code: 1, stderr: 'no code jwt' },
       { code: 0, stdout: 'tt.jwt\n' },
       { code: 1, stderr: 'not authorized for bd' },
       { code: 0, stdout: 'eu.jwt\n' },
@@ -380,6 +427,38 @@ describe('mintLarkdevByteCloudJwts — per-plane sender identity', () => {
     expect(jwts?.cn).toBe('cn.jwt');
     expect(jwts?.['i18n-bd']).toBeUndefined();
   });
+
+  it('does not use CN as a gate for an authorized regional site', async () => {
+    const mod = await fresh();
+    authorize(mod, ALICE, ['i18n-bd']);
+    replies = [{ code: 0, stdout: 'bd.jwt\n' }];
+
+    expect(await mod.mintByteCloudUserJwts(ALICE)).toEqual({ 'i18n-bd': 'bd.jwt' });
+    expect(calls.map(call => call.args)).toEqual([
+      ['--site', 'i18n-bd', 'auth', 'get-bytecloud-jwt-token'],
+    ]);
+  });
+
+  it('single-flights all regional mints for the same sender', async () => {
+    const mod = await fresh();
+    authorize(mod, ALICE);
+    replies = [
+      { code: 0, stdout: 'cn.jwt\n' },
+      { code: 0, stdout: 'tt.jwt\n' },
+      { code: 0, stdout: 'bd.jwt\n' },
+      { code: 0, stdout: 'eu.jwt\n' },
+      { code: 0, stdout: 'us.jwt\n' },
+    ];
+
+    const [first, second] = await Promise.all([
+      mod.mintByteCloudUserJwts(ALICE),
+      mod.mintByteCloudUserJwts(ALICE),
+    ]);
+
+    expect(second).toEqual(first);
+    expect(statusCalls).toHaveLength(5);
+    expect(calls).toHaveLength(5);
+  });
 });
 
 describe('mintBytedcliJwts — a pending login is best-effort, never a hard gate (F-B)', () => {
@@ -388,7 +467,7 @@ describe('mintBytedcliJwts — a pending login is best-effort, never a hard gate
       code: 0,
       stdout: envelope({ verification_uri_complete: 'https://cloud.example.com/a', complete_token: 'tok-1' }),
     }];
-    await mod.beginBytedcliLogin(ALICE);
+    await mod.beginBytedcliLogin(ALICE, CN);
   }
 
   // The lockout this fixes: a transient blip auto-begins a challenge on the
@@ -403,14 +482,14 @@ describe('mintBytedcliJwts — a pending login is best-effort, never a hard gate
       { code: 0, stdout: 'cloud.jwt\n' },
       { code: 0, stdout: 'code.jwt\n' },
     ];
-    expect(await mod.mintBytedcliJwts(ALICE)).toEqual({ cloudJwt: 'cloud.jwt', codeJwt: 'code.jwt' });
+    expect(await mod.mintBytedcliJwts(ALICE, CN)).toEqual({ cloudJwt: 'cloud.jwt', codeJwt: 'code.jwt' });
     expect(calls.slice(1).map(c => c.args)).toEqual([
-      ['auth', 'login', '--complete', 'tok-1', '--json'],
-      ['auth', 'get-bytecloud-jwt-token'],
-      ['auth', 'get-codebase-jwt-token'],
+      ['--site', 'cn', 'auth', 'login', '--complete', 'tok-1', '--json'],
+      ['--site', 'cn', 'auth', 'get-bytecloud-jwt-token'],
+      ['--site', 'cn', 'auth', 'get-codebase-jwt-token'],
     ]);
     // Pending leaves the challenge in place so the link stays usable.
-    expect(mod.pendingBytedcliChallenge(ALICE)).toBe('tok-1');
+    expect(mod.pendingBytedcliChallenge(ALICE, CN)).toBe('tok-1');
   });
 
   it('still mints when the completion poll fails terminally, and drops the dead challenge', async () => {
@@ -424,17 +503,17 @@ describe('mintBytedcliJwts — a pending login is best-effort, never a hard gate
     ];
     // Build the failure envelope properly below instead of the concat above.
     replies[0] = { code: 1, stdout: JSON.stringify({ status: 'error', data: null, error: { code: 'BYTECLOUD_AUTH_LOGIN_EXPIRED', message: 'token expired' } }) + '\n' };
-    expect(await mod.mintBytedcliJwts(ALICE)).toEqual({ cloudJwt: 'cloud.jwt', codeJwt: 'code.jwt' });
-    expect(mod.pendingBytedcliChallenge(ALICE)).toBeNull();
+    expect(await mod.mintBytedcliJwts(ALICE, CN)).toEqual({ cloudJwt: 'cloud.jwt', codeJwt: 'code.jwt' });
+    expect(mod.pendingBytedcliChallenge(ALICE, CN)).toBeNull();
   });
 
   it('refuses (no JWT read at all) when nobody ever authorized, challenge or not', async () => {
     const mod = await fresh();
     await beginOnce(mod);
     replies = [{ code: 0, stdout: envelope({ status: 'pending' }) }];
-    expect(await mod.mintBytedcliJwts(ALICE)).toBeNull();
+    expect(await mod.mintBytedcliJwts(ALICE, CN)).toBeNull();
     expect(calls.slice(1).map(c => c.args)).toEqual([
-      ['auth', 'login', '--complete', 'tok-1', '--json'],
+      ['--site', 'cn', 'auth', 'login', '--complete', 'tok-1', '--json'],
     ]);
   });
 
@@ -443,7 +522,7 @@ describe('mintBytedcliJwts — a pending login is best-effort, never a hard gate
     await beginOnce(mod);
     // Earlier turn: no login yet → nothing.
     replies = [{ code: 0, stdout: envelope({ status: 'pending' }) }];
-    expect(await mod.mintBytedcliJwts(ALICE)).toBeNull();
+    expect(await mod.mintBytedcliJwts(ALICE, CN)).toBeNull();
     // Person taps the link; the next turn completes AND mints.
     authorize(mod, ALICE);
     replies = [
@@ -451,7 +530,7 @@ describe('mintBytedcliJwts — a pending login is best-effort, never a hard gate
       { code: 0, stdout: 'cloud.jwt\n' },
       { code: 0, stdout: 'code.jwt\n' },
     ];
-    expect(await mod.mintBytedcliJwts(ALICE)).toEqual({ cloudJwt: 'cloud.jwt', codeJwt: 'code.jwt' });
+    expect(await mod.mintBytedcliJwts(ALICE, CN)).toEqual({ cloudJwt: 'cloud.jwt', codeJwt: 'code.jwt' });
   });
 });
 
@@ -459,11 +538,11 @@ describe('clearBytedcliAuth', () => {
   it('forgets that person entirely, pending login included', async () => {
     const mod = await fresh();
     mkdirSync(mod.bytedcliHomeFor(ALICE), { recursive: true });
-    writeFileSync(join(mod.bytedcliHomeFor(ALICE), '.botmux-login-challenge'), '{}');
+    writeFileSync(join(mod.bytedcliHomeFor(ALICE), '.botmux-login-challenge.cn'), '{}');
 
     mod.clearBytedcliAuth(ALICE);
     expect(existsSync(mod.bytedcliHomeFor(ALICE))).toBe(false);
-    expect(await mod.hasBytedcliHome(ALICE)).toBe(false);
+    expect(await mod.hasBytedcliHome(ALICE, CN)).toBe(false);
   });
 });
 
@@ -471,14 +550,14 @@ describe('clearBytedcliAuth', () => {
 describe('authorization loop regressions', () => {
   async function begin(mod: Awaited<ReturnType<typeof fresh>>) {
     replies = [{ code: 0, stdout: envelope({ verification_uri_complete: 'https://example.test/login', complete_token: 'challenge' }) }];
-    await mod.beginBytedcliLogin(ALICE);
+    await mod.beginBytedcliLogin(ALICE, CN);
   }
 
   it.each([{ login_status: 'pending' }, { status: 'pending' }])('retains and reuses a pending challenge: %j', async data => {
     const mod = await fresh(); await begin(mod);
     replies = [{ code: 0, stdout: envelope(data) }];
-    expect(await mod.completeBytedcliLogin(ALICE, 'challenge')).toEqual({ state: 'pending' });
-    expect((await mod.beginBytedcliLogin(ALICE))?.completeToken).toBe('challenge');
+    expect(await mod.completeBytedcliLogin(ALICE, CN, 'challenge')).toEqual({ state: 'pending' });
+    expect((await mod.beginBytedcliLogin(ALICE, CN))?.completeToken).toBe('challenge');
     expect(calls.filter(c => c.args.includes('--begin'))).toHaveLength(1);
   });
 
@@ -490,28 +569,28 @@ describe('authorization loop regressions', () => {
     { code: 0, stdout: envelope({ login_status: 'success' }) },
   ])('does not turn an unverified completion into success or discard its challenge: %j', async reply => {
     const mod = await fresh(); await begin(mod); replies = [reply];
-    expect((await mod.completeBytedcliLogin(ALICE, 'challenge')).state).toBe('unavailable');
-    expect(mod.pendingBytedcliChallenge(ALICE)).toBe('challenge');
+    expect((await mod.completeBytedcliLogin(ALICE, CN, 'challenge')).state).toBe('unavailable');
+    expect(mod.pendingBytedcliChallenge(ALICE, CN)).toBe('challenge');
   });
 
   it('accepts modern success only after the personal provider confirms it', async () => {
     const mod = await fresh(); await begin(mod); authorize(mod, ALICE);
     replies = [{ code: 0, stdout: envelope({ login_status: 'success' }) }];
-    expect(await mod.completeBytedcliLogin(ALICE, 'challenge')).toEqual({ state: 'authorized' });
-    expect(mod.pendingBytedcliChallenge(ALICE)).toBeNull();
+    expect(await mod.completeBytedcliLogin(ALICE, CN, 'challenge')).toEqual({ state: 'authorized' });
+    expect(mod.pendingBytedcliChallenge(ALICE, CN)).toBeNull();
   });
 
   it('does not report exit-zero expiration as authorized', async () => {
     const mod = await fresh(); await begin(mod);
     replies = [{ code: 0, stdout: envelope({ login_status: 'expired' }) }];
-    expect((await mod.completeBytedcliLogin(ALICE, 'challenge')).state).toBe('failed');
-    expect(mod.pendingBytedcliChallenge(ALICE)).toBeNull();
+    expect((await mod.completeBytedcliLogin(ALICE, CN, 'challenge')).state).toBe('failed');
+    expect(mod.pendingBytedcliChallenge(ALICE, CN)).toBeNull();
   });
 
   it('coalesces simultaneous login attempts for the same user', async () => {
     const mod = await fresh();
     replies = [{ code: 0, stdout: envelope({ verification_uri_complete: 'https://example.test/login', complete_token: 'challenge' }) }];
-    const results = await Promise.all(Array.from({ length: 8 }, () => mod.beginBytedcliLogin(ALICE)));
+    const results = await Promise.all(Array.from({ length: 8 }, () => mod.beginBytedcliLogin(ALICE, CN)));
     expect(results.every(r => r?.completeToken === 'challenge')).toBe(true);
     expect(calls).toHaveLength(1);
   });
@@ -522,15 +601,15 @@ describe('authorization loop regressions', () => {
     { code: 0, stdout: envelope({ authenticated: false, bytecloud_auth: { status: 'error' } }) },
   ])('distinguishes provider failures from missing authorization: %j', async reply => {
     const mod = await fresh(); authorize(mod, ALICE);
-    statuses.set(mod.bytedcliHomeFor(ALICE), reply);
-    await expect(mod.mintBytedcliJwts(ALICE)).rejects.toThrow('service unavailable');
+    setStatus(mod, ALICE, CN, reply);
+    await expect(mod.mintBytedcliJwts(ALICE, CN)).rejects.toThrow('service unavailable');
     expect(calls).toEqual([]);
   });
 
   it('reports a failed JWT mint as unavailable instead of asking for another login', async () => {
     const mod = await fresh(); authorize(mod, ALICE);
     replies = [{ code: 1, stderr: 'network down' }];
-    await expect(mod.mintBytedcliJwts(ALICE)).rejects.toThrow('service unavailable');
+    await expect(mod.mintBytedcliJwts(ALICE, CN)).rejects.toThrow('service unavailable');
   });
 });
 
@@ -546,7 +625,7 @@ describe('provider timeout', () => {
     vi.mocked(spawn).mockReturnValueOnce(child as unknown as ReturnType<typeof spawn>);
     vi.useFakeTimers();
     try {
-      const first = mod.beginBytedcliLogin(ALICE);
+      const first = mod.beginBytedcliLogin(ALICE, CN);
       await vi.advanceTimersByTimeAsync(30_000);
       expect(await first).toBeNull();
       expect(child.kill).toHaveBeenCalledWith('SIGKILL');
@@ -554,6 +633,6 @@ describe('provider timeout', () => {
       expect(child.stderr.destroyed).toBe(true);
     } finally { vi.useRealTimers(); }
     replies = [{ code: 0, stdout: envelope({ verification_uri_complete: 'https://example.test/login', complete_token: 'retry' }) }];
-    expect((await mod.beginBytedcliLogin(ALICE))?.completeToken).toBe('retry');
+    expect((await mod.beginBytedcliLogin(ALICE, CN))?.completeToken).toBe('retry');
   });
 });

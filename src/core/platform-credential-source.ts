@@ -184,7 +184,7 @@ function toIdentity(tool: TriggerUserAuthTool, variables: Record<string, string>
   const cloudJwt = variables.BYTEDCLI_USER_CLOUD_JWT;
   if (!nonEmpty(cloudJwt)) return null;
   const codeJwt = variables.BYTEDCLI_USER_CODE_JWT;
-  return { tool, cloudJwt, ...(nonEmpty(codeJwt) ? { codeJwt } : {}) };
+  return { tool, cloudJwts: { cn: cloudJwt }, ...(nonEmpty(codeJwt) ? { codeJwt } : {}) };
 }
 
 /** The platform page a refused person should open (null when unbound). */

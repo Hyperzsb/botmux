@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
 import { enumerateScratchSecretPaths } from '../src/adapters/backend/scratch-credentials.js';
@@ -103,6 +103,31 @@ describe('enumerateScratchSecretPaths', () => {
     expect(got.has(join(home(), 'bin', 'botmux'))).toBe(false);
     expect(got.has(join(data(), 'schedules'))).toBe(false);
     delete process.env.LARKSUITE_CLI_DATA_DIR;
+  });
+
+  it.skipIf(process.platform === 'win32')('canonicalizes a symlinked HOME before carving the current session scratch', () => {
+    const realHome = join(root, 'real-home');
+    const linkedHome = join(root, 'linked-home');
+    mkdirSync(realHome, { recursive: true });
+    symlinkSync(realHome, linkedHome, 'dir');
+    const ownLexical = join(linkedHome, '.cache', 'botmux', 'session-tmp', 'profile', 'sess-1');
+    const siblingLexical = join(linkedHome, '.cache', 'botmux', 'session-tmp', 'profile', 'sess-OTHER');
+    mkdirSync(ownLexical, { recursive: true });
+    mkdirSync(siblingLexical, { recursive: true });
+
+    const secret = enumerateScratchSecretPaths({
+      botmuxHomes: [],
+      dataDirs: [],
+      homeDir: realpathSync(linkedHome),
+      sessionScratchDir: ownLexical,
+    });
+    const sharedCanonical = realpathSync(join(linkedHome, '.cache', 'botmux', 'session-tmp'));
+    const ownCanonical = realpathSync(ownLexical);
+    const siblingCanonical = realpathSync(siblingLexical);
+
+    expect(secret.denyPaths).toContain(sharedCanonical);
+    expect(secret.writableCarvePaths).toContain(ownCanonical);
+    expect(secret.writableCarvePaths).not.toContain(siblingCanonical);
   });
 
   it('adds external BOTS_CONFIG sidecar siblings outside the botmux home', () => {
