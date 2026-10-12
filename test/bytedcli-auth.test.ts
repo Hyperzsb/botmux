@@ -25,11 +25,13 @@ import { EventEmitter } from 'node:events';
 const statuses = new Map<string, { code: number; stdout?: string; stderr?: string }>();
 const statusCalls: Array<{ home: string | undefined; identity?: string }> = [];
 const calls: Array<{ args: string[]; home: string | undefined }> = [];
+const spawnEnvs: Array<Record<string, string | undefined>> = [];
 /** Queued replies, one per invocation, in order. */
 let replies: Array<{ code: number; stdout?: string; stderr?: string }> = [];
 
 vi.mock('node:child_process', () => ({
   spawn: vi.fn((_cmd: string, args: string[], opts: { env?: Record<string, string> }) => {
+    spawnEnvs.push({ ...opts?.env });
     const status = args[0] === 'auth' && args[1] === 'status';
     if (status) statusCalls.push({ home: opts?.env?.HOME, identity: opts?.env?.BYTECLOUD_AUTH_AS });
     else calls.push({ args, home: opts?.env?.HOME });
@@ -71,8 +73,9 @@ beforeEach(() => {
   replies = [];
   statuses.clear();
   statusCalls.length = 0;
+  spawnEnvs.length = 0;
 });
-afterEach(() => { rmSync(home, { recursive: true, force: true }); });
+afterEach(() => { vi.unstubAllEnvs(); rmSync(home, { recursive: true, force: true }); });
 
 /** bytedcli's `--json` envelope. */
 function envelope(data: unknown, status = 'success') {
@@ -109,6 +112,29 @@ function authorize(mod: { bytedcliHomeFor: (id: string) => string }, openId: str
 }
 
 describe('hasBytedcliHome — provider-owned login state', () => {
+  it('scrubs every inherited ByteCloud credential before invoking the provider', async () => {
+    vi.stubEnv('BYTECLOUD_CLI_API_JWT_TOKEN_CN', 'machine-cn');
+    vi.stubEnv('BYTECLOUD_AUTH_ACCESS_KEY_ID_I18N_BD', 'machine-ak');
+    vi.stubEnv('BYTECLOUD_SECRET_ACCESS_KEY', 'machine-sk');
+    vi.stubEnv('AIPAAS_BYTECLAW', '1');
+    vi.stubEnv('AIME_USER_CLOUD_JWT', 'machine-aime');
+    vi.stubEnv('BYTECLOUD_AUTH_AS', 'app');
+    const mod = await fresh();
+    authorize(mod, ALICE);
+
+    expect(await mod.hasBytedcliHome(ALICE)).toBe(true);
+    const env = spawnEnvs.at(-1)!;
+    expect(env.HOME).toBe(mod.bytedcliHomeFor(ALICE));
+    expect(env.BYTECLOUD_AUTH_AS).toBe('user');
+    for (const key of [
+      'BYTECLOUD_CLI_API_JWT_TOKEN_CN',
+      'BYTECLOUD_AUTH_ACCESS_KEY_ID_I18N_BD',
+      'BYTECLOUD_SECRET_ACCESS_KEY',
+      'AIPAAS_BYTECLAW',
+      'AIME_USER_CLOUD_JWT',
+    ]) expect(env[key]).toBeUndefined();
+  });
+
   it('accepts an SDK login without any legacy token file and forces personal identity', async () => {
     const mod = await fresh(); authorize(mod, ALICE);
     expect(await mod.hasBytedcliHome(ALICE)).toBe(true);

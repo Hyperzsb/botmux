@@ -66,6 +66,7 @@ const APP_SETUP_TIMEOUT_MS = 10 * 60_000;
 /** It should print the setup link promptly; otherwise the process is wedged. */
 const APP_SETUP_URL_TIMEOUT_MS = 30_000;
 const MAX_SETUP_OUTPUT_CHARS = 64 * 1024;
+const SETUP_DIAGNOSTIC_TAIL_CHARS = 2 * 1024;
 
 /** Baseline scopes used by trigger-user lark-cli calls. */
 export const LARK_CLI_DEVICE_SCOPES = [
@@ -304,8 +305,13 @@ async function beginPersonalAppSetup(openId: string, brand: Brand): Promise<stri
   const home = larkCliHomeFor(openId);
   // Old Botmux versions copied a machine/shared issuer into this same path.
   // No marker means none of it is trusted: start from an actually empty HOME.
-  rmSync(home, { recursive: true, force: true });
-  mkdirSync(home, { recursive: true, mode: 0o700 });
+  try {
+    rmSync(home, { recursive: true, force: true });
+    mkdirSync(home, { recursive: true, mode: 0o700 });
+  } catch (error) {
+    logger.warn(`[lark-cli-auth] personal credential storage initialization failed: ${error instanceof Error ? error.message : String(error)}`);
+    return null;
+  }
 
   if (appSetupRunnerOverride) {
     const result = await appSetupRunnerOverride(home, APP_SETUP_ARGS);
@@ -336,6 +342,7 @@ async function beginPersonalAppSetup(openId: string, brand: Brand): Promise<stri
   let resolveUrl!: (url: string | null) => void;
   let urlSettled = false;
   let output = '';
+  let diagnosticTail = '';
   let promptStep: 'language' | 'action' | 'platform' | 'waiting' = 'language';
   const terminal = new Terminal({ cols: 120, rows: 30, allowProposedApi: true });
   const terminalInput = terminal.onData(data => {
@@ -353,6 +360,7 @@ async function beginPersonalAppSetup(openId: string, brand: Brand): Promise<stri
     if (output.length < MAX_SETUP_OUTPUT_CHARS) {
       output += data.slice(0, MAX_SETUP_OUTPUT_CHARS - output.length);
     }
+    diagnosticTail = `${diagnosticTail}${data}`.slice(-SETUP_DIAGNOSTIC_TAIL_CHARS);
     const found = extractAppSetupUrl(output);
     if (found) settleUrl(found);
     // `config init` without --new deliberately opens lark-cli's native picker.
@@ -374,6 +382,11 @@ async function beginPersonalAppSetup(openId: string, brand: Brand): Promise<stri
     });
   };
   const urlTimer = setTimeout(() => {
+    const tail = diagnosticTail
+      .replace(/\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))/g, '')
+      .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '')
+      .trim();
+    logger.warn(`[lark-cli-auth] personal app setup timed out waiting for URL at step ${promptStep}; output tail: ${tail || '<empty>'}`);
     settleUrl(null);
     try { child.kill(); } catch { /* best effort */ }
   }, APP_SETUP_URL_TIMEOUT_MS);
@@ -606,9 +619,10 @@ export async function materializeLarkCliHomeForSession(
   const source = await resolveLarkCliHomeForTurn(openId);
   if (!source) return null;
 
-  // Give lark-cli a chance to validate/refresh the durable source before the
-  // snapshot. A transient verification failure does not discard an otherwise
-  // usable stored login; the copied CLI still enforces its own token state.
+  // Intentionally pay one bounded network verification per sandboxed turn so
+  // a refreshed token is captured before the immutable-at-spawn bind is copied.
+  // A transient verification failure does not discard an otherwise usable
+  // stored login; the copied CLI still enforces its own token state.
   try { await runAsUser(openId, ['auth', 'status', '--json', '--verify']); }
   catch { /* best effort; copy the last known personal state */ }
 
@@ -618,6 +632,7 @@ export async function materializeLarkCliHomeForSession(
   const staging = join(root, `.lark-cli-home.next-${process.pid}-${Date.now()}`);
   const cacheRoot = join(source, '.cache');
   const stateRoot = join(source, '.local', 'state');
+  const challenge = challengePath(openId);
   try {
     rmSync(staging, { recursive: true, force: true });
     cpSync(source, staging, {
@@ -625,7 +640,8 @@ export async function materializeLarkCliHomeForSession(
       force: false,
       errorOnExist: true,
       filter: path => path !== cacheRoot && !path.startsWith(`${cacheRoot}/`)
-        && path !== stateRoot && !path.startsWith(`${stateRoot}/`),
+        && path !== stateRoot && !path.startsWith(`${stateRoot}/`)
+        && path !== challenge,
     });
     rmSync(target, { recursive: true, force: true });
     renameSync(staging, target);

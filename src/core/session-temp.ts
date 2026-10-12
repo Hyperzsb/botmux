@@ -14,6 +14,10 @@ function sessionTempSegment(sessionId: string): string {
   return `sha256-${createHash('sha256').update(sessionId).digest('hex')}`;
 }
 
+export function sessionTempRootDir(): string {
+  return sessionTempRoot();
+}
+
 function sessionTempRoot(): string {
   return join(homedir(), '.cache', 'botmux', 'session-tmp');
 }

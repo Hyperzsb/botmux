@@ -78,7 +78,7 @@ import { isValidMarkerIdentityTurnId } from './core/turn-id-shape.js';
 import { markerBelongsToLiveProcess, readProcessStartIdentity } from './core/session-marker.js';
 import { cliSurvivesWorkerExit, handsCliPidMarkerToSuccessor } from './core/cli-pid-marker-handoff.js';
 import { roleLibraryRoot, roleLibrarySubtree } from './core/role-library.js';
-import { applySessionTempEnv, ensureSessionTempDir } from './core/session-temp.js';
+import { applySessionTempEnv, ensureSessionTempDir, sessionTempRootDir } from './core/session-temp.js';
 // Central no-transport predicate. Aliased because a local `const larkTransportEnabled`
 // (the role-library gate) already binds that name in one function scope.
 import { larkTransportEnabled as sessionLarkTransportEnabled } from './core/types.js';
@@ -22839,6 +22839,11 @@ async function spawnCli(
     ];
     const mandatoryDenyRegexes: string[] = [];
     const mandatoryReadOnlyPaths: string[] = [];
+    // Every bot/session for this OS account shares this cache parent. Seal it
+    // unconditionally: a session with trigger-user auth disabled must still be
+    // unable to read a credential snapshot left by another session. This
+    // session's own deeper sessionScratchDir grant is re-opened below.
+    mandatoryDenyPaths.push(canonical(sessionTempRootDir()));
     if (cfg.triggerUserAuth?.enabled && cfg.triggerUserAuth.tools.includes('larkdev')) {
       // The wrapper injects sender JWTs and uses a fresh LARKDEV_AUTH_DIR. Keep
       // the machine SDK login outside the sandbox even when workingDir=HOME or
@@ -23332,6 +23337,7 @@ async function spawnCli(
       botsConfigPath: cfg.loadedBotsConfigPath ? scratchCanonical(cfg.loadedBotsConfigPath) : undefined,
       homeDir: scratchHome,
       sessionId: cfg.sessionId,
+      sessionScratchDir,
     });
     const scratchDeny = [...new Set<string>([
       ...credentialRules.denyPaths.map(scratchCanonical),
@@ -23344,6 +23350,7 @@ async function spawnCli(
     // This session's own trigger-user identity files (under the sealed
     // cli-identity dir) must stay readable for the governed CLI / relay.
     const scratchReadOnlyCarves = scratchSecrets.readOnlyCarvePaths.map(scratchCanonical);
+    const scratchWritableCarves = scratchSecrets.writableCarvePaths.map(scratchCanonical);
 
     scratchNativeCodexHome = nativeCodexHome;
     scratchNativeTraeHome = nativeTraeHome;
@@ -23399,6 +23406,7 @@ async function spawnCli(
         cliBin: cliAdapter.resolvedBin,
         cliArgs: args,
         denyPaths: scratchDeny,
+        writableCarvePaths: scratchWritableCarves,
         mcpGatewaySocketPath: sessionMcpGatewayHost?.socketPath,
         net: spawnNetworkShape.netEnabled,
       });
@@ -23439,6 +23447,7 @@ async function spawnCli(
         mcpGatewaySocketPath: sessionMcpGatewayHost?.socketPath,
         childEnvForce: { CODEX_HOME: nativeCodexHome, TRAE_HOME: nativeTraeHome },
         readOnlyCarvePaths: scratchReadOnlyCarves,
+        writableCarvePaths: scratchWritableCarves,
         useBwrapArgsFile: effectiveBackendType === 'tmux',
       });
       if (!sbx) {

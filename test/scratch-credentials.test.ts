@@ -36,6 +36,8 @@ function layout() {
   writeFileSync(join(data(), 'lark-cli-home', 'ou_p', 'token.enc'), 'personal');
   mkdirSync(join(home(), '.larkdev', 'auth'), { recursive: true });
   writeFileSync(join(home(), '.larkdev', 'auth', 'refresh.json'), 'bytecloud');
+  mkdirSync(join(home(), '.cache', 'botmux', 'session-tmp', 'profile', 'sess-1'), { recursive: true });
+  mkdirSync(join(home(), '.cache', 'botmux', 'session-tmp', 'profile', 'sess-OTHER'), { recursive: true });
   // trigger-user identity (#1543 layout): <sid>.bin/ wrapper dir containing
   // .data/<tool>.env + turn; another person's session sits in a sibling .bin dir.
   mkdirSync(join(data(), 'cli-identity', 'sess-1.bin', '.data'), { recursive: true });
@@ -65,9 +67,11 @@ describe('enumerateScratchSecretPaths', () => {
       botsConfigPath: join(home(), 'bots.json'),
       homeDir: home(),
       sessionId: 'sess-1',
+      sessionScratchDir: join(home(), '.cache', 'botmux', 'session-tmp', 'profile', 'sess-1'),
     });
     const got = new Set(secret.denyPaths);
     const carve = new Set(secret.readOnlyCarvePaths);
+    const writableCarve = new Set(secret.writableCarvePaths);
     expect(got.has(join(home(), 'bots.json'))).toBe(true);
     expect(got.has(`${join(home(), 'bots.json')}.bak-2`)).toBe(true);
     expect(got.has(join(home(), '.dashboard-secret'))).toBe(true);
@@ -84,6 +88,9 @@ describe('enumerateScratchSecretPaths', () => {
     expect(got.has(join(data(), 'bytedcli-home'))).toBe(true);
     expect(got.has(join(data(), 'lark-cli-home'))).toBe(true);
     expect(got.has(join(home(), '.larkdev', 'auth'))).toBe(true);
+    expect(got.has(join(home(), '.cache', 'botmux', 'session-tmp'))).toBe(true);
+    expect(writableCarve.has(join(home(), '.cache', 'botmux', 'session-tmp', 'profile', 'sess-1'))).toBe(true);
+    expect(writableCarve.has(join(home(), '.cache', 'botmux', 'session-tmp', 'profile', 'sess-OTHER'))).toBe(false);
     // cli-identity/ whole dir sealed, own session's <sid>.bin/ dir carved ro
     expect(got.has(join(data(), 'cli-identity'))).toBe(true);
     expect(carve.has(join(data(), 'cli-identity', 'sess-1.bin'))).toBe(true);

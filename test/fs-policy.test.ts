@@ -139,6 +139,30 @@ describe('buildFsPolicy', () => {
     expect(accessForPath(p.rules, `${sessionDataDir}/turn-send-ledger/s`).access).toBe('readWrite');
   });
 
+  it.each(['linux', 'darwin'] as const)(
+    '%s seals sibling session-tmp snapshots while keeping only this session writable',
+    platform => {
+      const home = platform === 'linux' ? '/home/u' : '/Users/u';
+      const shared = `${home}/.cache/botmux/session-tmp`;
+      const own = `${shared}/data-profile/session-own`;
+      const sibling = `${shared}/data-profile/session-sibling`;
+      const p = buildFsPolicy(ctx({
+        platform,
+        homeDir: home,
+        botmuxHome: `${home}/.botmux`,
+        sessionDataDir: `${home}/.botmux/data`,
+        workingDir: `${home}/proj`,
+        botHome: `${home}/.botmux/bots/cli_self`,
+        mandatoryDenyPaths: [shared],
+        extraWritePaths: [own],
+      }));
+
+      expect(accessForPath(p.rules, shared).access).toBe('deny');
+      expect(accessForPath(p.rules, `${sibling}/lark-cli-home/token.enc`).access).toBe('deny');
+      expect(accessForPath(p.rules, `${own}/lark-cli-home/token.enc`).access).toBe('readWrite');
+    },
+  );
+
   it('keeps daemon host-only roots denied even under broad or nested allows', () => {
     const root = '/Users/u/.botmux/data/schedule-preconditions';
     const externalServiceCredential = '/Users/u/.service/credential.json';
@@ -819,6 +843,14 @@ describe('resolveRedirectedAdapterAuthPaths (redirect authPath suppression)', ()
     expect(src).toMatch(/mandatoryDenyPaths\.push\(canonicalManagedSessionsRoot\)/);
     expect(ctx).toMatch(/extraWritePaths:[^\n]*canonicalManagedSessionDir/);
     expect(src).toMatch(/relative\(canonicalManagedSessionsRoot,\s*canonicalManagedSessionDir\)/);
+  });
+
+  it('WIRING GUARD: worker always seals shared session-tmp and wires larkdev host auth denies', () => {
+    const src = readFileSync(resolve('src/worker.ts'), 'utf8');
+    expect(src).toContain('mandatoryDenyPaths.push(canonical(sessionTempRootDir()))');
+    expect(src).toContain('extraWritePaths: keepExisting([sessionScratchDir, canonicalManagedSessionDir])');
+    expect(src).toMatch(/triggerUserAuth\?\.enabled[\s\S]*?tools\.includes\('larkdev'\)[\s\S]*?hostOnlyDenyPaths\.push\(canonical\(join\(hostHomeDir, '\.larkdev', 'auth'\)\)\)/);
+    expect(src).toMatch(/process\.env\.LARKDEV_AUTH_DIR\?\.startsWith\('\/'\)[\s\S]*?hostOnlyDenyPaths\.push\(canonical\(process\.env\.LARKDEV_AUTH_DIR\)\)/);
   });
 
   it('SYMLINKED-HOME regression (codex #605 P1): worker-assembly under /home/u → /data00/home/u keeps Claude/Codex dropped, Seed/Relay bytedcli kept', () => {
