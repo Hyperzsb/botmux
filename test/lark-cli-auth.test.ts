@@ -162,6 +162,7 @@ describe('lark-cli per-person HOME layout', () => {
 
   it('atomically replaces a sandbox session copy when the sender changes', async () => {
     simulateUserToken(ALICE, { personalOpenId: PERSONAL_OPEN });
+    writeFileSync(join(larkCliHomeFor(ALICE), '.botmux-login-challenge'), JSON.stringify({ deviceCode: 'secret' }));
     simulateUserToken(BOB, { personalOpenId: PERSONAL_OPEN_B });
     const dataDir = join(homeRoot, 'session-data');
     const sessionId = 'sess-sandbox-copy';
@@ -173,6 +174,7 @@ describe('lark-cli per-person HOME layout', () => {
     expect(aliceCopy).toBe(join(tempRoot, 'lark-cli-home'));
     expect(readFileSync(join(aliceCopy!, '.local', 'share', 'lark-cli', `${APP_ID}_${PERSONAL_OPEN}.enc`), 'utf8'))
       .toBe('their-user-token');
+    expect(existsSync(join(aliceCopy!, '.botmux-login-challenge'))).toBe(false);
 
     const bobCopy = await materializeLarkCliHomeForSession(BOB, dataDir, sessionId);
     expect(bobCopy).toBe(aliceCopy);

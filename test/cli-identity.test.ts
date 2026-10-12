@@ -853,6 +853,7 @@ printf '%s|%s|%s|%s|%s|%s|%s|%s' \
     });
     expect(authDir).toMatch(/botmux-larkdev-auth\/invocation\./);
     expect(authDir).not.toBe('/machine/auth');
+    expect(existsSync(authDir)).toBe(false);
   });
 
   it('intercepts login-shell commands before viewer startup, then follows each turn and revocation', () => {
