@@ -930,6 +930,46 @@ printf %s "$?"
     expect(readdirSync(join(dir, 'botmux-bytedcli-home'))).toEqual([]);
   });
 
+  it('preserves larkdev termination status until its isolated auth directory is cleaned', () => {
+    const ready = join(dir, 'larkdev-child-ready');
+    const terminated = join(dir, 'larkdev-child-terminated');
+    const authPresent = join(dir, 'larkdev-auth-present');
+    const bin = join(dir, 'larkdev-real');
+    writeFileSync(bin, `#!/bin/sh
+trap 'printf terminated > "$TERMINATED"; sleep 0.2; [ -d "$LARKDEV_AUTH_DIR" ] && printf present > "$AUTH_PRESENT"; exit 42' TERM
+printf ready > "$READY"
+while :; do sleep 1; done
+`, { mode: 0o755 });
+    const wrapper = join(dir, 'larkdev-wrapper');
+    writeFileSync(wrapper, renderIdentityWrapper('larkdev', bin), { mode: 0o755 });
+    writeSessionIdentity(dir, SESSION, {
+      tool: 'larkdev', cloudJwts: { cn: 'alice-cn' }, turnId: 'turn-a',
+    });
+    publishActiveTurn(dir, SESSION, 'turn-a');
+
+    const status = execFileSync('/bin/sh', ['-c', `
+"$WRAPPER" & wrapper_pid=$!
+i=0
+while [ ! -f "$READY" ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+kill -TERM "$wrapper_pid"
+wait "$wrapper_pid"
+printf %s "$?"
+`], {
+      encoding: 'utf8', timeout: 10_000,
+      env: {
+        PATH: '/usr/bin:/bin', TMPDIR: dir,
+        SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION,
+        WRAPPER: wrapper, READY: ready, TERMINATED: terminated, AUTH_PRESENT: authPresent,
+      },
+    });
+    // 42 is deliberately not the conventional TERM status (143): this proves
+    // the wrapper returns the child's actual status instead of synthesizing one.
+    expect(status).toBe('42');
+    expect(readFileSync(terminated, 'utf8')).toBe('terminated');
+    expect(readFileSync(authPresent, 'utf8')).toBe('present');
+    expect(readdirSync(join(dir, 'botmux-larkdev-auth'))).toEqual([]);
+  });
+
   it.each([
     ['--as', 'app'],
     ['--as=app'],

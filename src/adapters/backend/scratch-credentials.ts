@@ -22,7 +22,7 @@
  *
  * Paths that don't exist are skipped (the mask compiler existence-filters).
  */
-import { existsSync, lstatSync, readdirSync } from 'node:fs';
+import { existsSync, lstatSync, readdirSync, realpathSync } from 'node:fs';
 import { join, dirname, basename, resolve, sep } from 'node:path';
 import { homedir as osHomedir } from 'node:os';
 import { resolveLarkCliLinuxStoreDir } from '../cli/fs-policy.js';
@@ -78,6 +78,12 @@ function isDir(p: string): boolean {
   try { return lstatSync(p).isDirectory(); } catch { return false; }
 }
 
+/** Resolve symlink aliases when the path exists, while retaining a stable
+ * lexical fallback for optional paths that have not been created yet. */
+function canonical(p: string): string {
+  try { return realpathSync(p); } catch { return resolve(p); }
+}
+
 export function enumerateScratchSecretPaths(input: ScratchSecretInput): ScratchSecrets {
   const out = new Set<string>();
   const readOnlyCarve = new Set<string>();
@@ -92,11 +98,12 @@ export function enumerateScratchSecretPaths(input: ScratchSecretInput): ScratchS
   // parent and re-open only this session's own scratch tree. This is independent
   // of triggerUserAuth: a non-participating session must not read a sibling's
   // snapshot created by a participating bot.
-  const sessionTempRoot = resolve(homeDir, '.cache', 'botmux', 'session-tmp');
+  const sessionTempRoot = canonical(resolve(homeDir, '.cache', 'botmux', 'session-tmp'));
   if (isDir(sessionTempRoot)) out.add(sessionTempRoot);
   if (input.sessionScratchDir) {
-    const ownScratch = resolve(input.sessionScratchDir);
-    if (ownScratch.startsWith(`${sessionTempRoot}${sep}`) && isDir(ownScratch)) {
+    const ownScratchInput = resolve(input.sessionScratchDir);
+    const ownScratch = canonical(ownScratchInput);
+    if (ownScratch.startsWith(`${sessionTempRoot}${sep}`) && isDir(ownScratchInput)) {
       writableCarve.add(ownScratch);
     }
   }
