@@ -493,6 +493,8 @@ import { larkToolBindingPath, readLarkToolBinding } from './lark-tool-binding.js
 import { sessionAuthRequests } from './session-auth-requests.js';
 import { resolveUserToken } from '../utils/user-token.js';
 import { getLarkToolDelegation } from './lark-tool-delegation.js';
+import { beginLarkCliLogin, completeLarkCliLogin, larkCliHomeForTurn, larkCliLoginScopes, materializeLarkCliHomeForSession } from '../services/lark-cli-auth.js';
+import type { SessionAuthorization } from './session-auth-requests.js';
 import { platformAuthRequestRedirect, resolveBoundLarkUserCredential } from './lark-tool-platform-credential.js';
 import type { ReplyStyleConfig } from '../im/lark/reply-card-style.js';
 import {
@@ -3391,7 +3393,7 @@ for (const action of ['auth-request', 'auth-status']) {
         if (!boundTool) {
           const storageModel = identityStorageModelForDaemonSession(ds);
           if (!refreshSessionIdentity(config.session.dataDir, params.sessionId, {
-            tool: 'lark-cli', appId: cfg.larkAppId, userAccessToken: result.token, turnId: identityTurnId,
+            tool: 'lark-cli', ...('home' in result ? { mode: 'user-home' as const, home: result.home } : { appId: cfg.larkAppId, userAccessToken: result.token }), turnId: identityTurnId,
             openId: callerOpenId,
           }, storageModel)) {
             // Material for this turn is gone for good (collected / never
@@ -3431,8 +3433,7 @@ for (const action of ['auth-request', 'auth-status']) {
       const liveIdentityTurnId = liveOrigin!.identityTurnId ?? liveOrigin!.turnId!;
       if (!refreshSessionIdentity(config.session.dataDir, params.sessionId, {
         tool: 'lark-cli',
-        appId: cfg.larkAppId,
-        userAccessToken: result.token,
+        ...('home' in result ? { mode: 'user-home' as const, home: result.home } : { appId: cfg.larkAppId, userAccessToken: result.token }),
         turnId: liveIdentityTurnId,
         openId: request.callerOpenId,
       }, storageModel)) {
@@ -3517,11 +3518,43 @@ for (const action of ['auth-request', 'auth-status']) {
           scopes: request.authorization.scopes, expiresIn: Math.max(1, Math.ceil((request.expiresAt - Date.now()) / 1_000)), autoCallback: true });
       }
     }
-    let authorization: Awaited<ReturnType<typeof requestUserAuthorization>>;
+    let authorization: SessionAuthorization;
     try {
-      authorization = await requestUserAuthorization(
-        cfg.larkAppId, appSecret, brand, scopes, callerOpenId, isAuthorizationValid,
-      );
+      if (boundTool) {
+        authorization = await requestUserAuthorization(
+          cfg.larkAppId, appSecret, brand, scopes, callerOpenId, isAuthorizationValid,
+        );
+      } else {
+        // Legacy governed tools use the human's personal app, while the bound
+        // tool retains upstream's explicit bot-app/platform credential flow.
+        // A delegated target open_id is app-scoped; local login state stays
+        // keyed by the verified issuer's credential identity.
+        const credentialOpenId = delegated?.credentialOpenId ?? callerOpenId;
+        const login = await (brand === 'lark'
+          ? beginLarkCliLogin(credentialOpenId, scopes, brand)
+          : beginLarkCliLogin(credentialOpenId, scopes));
+        if (!isCurrent()) return jsonRes(res, 409, { ok: false, error: 'auth_turn_changed' });
+        if (!login) return jsonRes(res, 502, { ok: false, error: 'authorization_request_failed' });
+        if (login.stage === 'app-setup') {
+          return jsonRes(res, 409, { ok: false, error: 'personal_lark_app_required', authUrl: login.authUrl });
+        }
+        authorization = {
+          authUrl: login.authUrl,
+          scopes: login.scopes ?? larkCliLoginScopes(scopes),
+          expiresIn: 9 * 60,
+          poll: async () => {
+            const completed = await completeLarkCliLogin(credentialOpenId);
+            if (completed.state === 'pending') return { status: 'pending' };
+            if (completed.state === 'failed') return { status: 'failed', error: completed.detail ?? 'authorization_failed' };
+            if (!isAuthorizationValid()) return { status: 'failed', error: 'auth_turn_changed' };
+            const sandbox = ds.session.sandbox;
+            const home = sandbox === true || sandbox === 'oncall' || sandbox === 'scratch'
+              ? await materializeLarkCliHomeForSession(credentialOpenId, config.session.dataDir, params.sessionId)
+              : larkCliHomeForTurn(credentialOpenId);
+            return home ? { status: 'ready', home } : { status: 'failed', error: 'authorization_identity_unavailable' };
+          },
+        };
+      }
     } catch {
       return jsonRes(res, 502, { ok: false, error: 'authorization_request_failed' });
     }

@@ -10,7 +10,12 @@
 import type { requestUserAuthorization } from '../utils/user-token.js';
 
 /** Provider poll handle; the store never inspects it. */
-export type SessionAuthPoll = Awaited<ReturnType<typeof requestUserAuthorization>>['poll'];
+export type SessionAuthPoll = () => Promise<
+  Awaited<ReturnType<Awaited<ReturnType<typeof requestUserAuthorization>>['poll']>>
+  | { status: 'ready'; home: string }
+>;
+
+export type SessionAuthorization = Omit<Awaited<ReturnType<typeof requestUserAuthorization>>, 'poll'> & { poll: SessionAuthPoll };
 
 export interface SessionAuthRequest {
   sessionId: string;
@@ -23,7 +28,7 @@ export interface SessionAuthRequest {
    *  even when the live turn rotates while the human is authorizing, the
    *  original turn's material must survive terminal GC until this settles. */
   identityTurnId: string;
-  authorization: Awaited<ReturnType<typeof requestUserAuthorization>>;
+  authorization: SessionAuthorization;
   /** Creating-turn closure: true only while the exact originating turn is live. */
   isCurrent: () => boolean;
   /** Session/app liveness used to keep or retire the daemon-side background poll. */

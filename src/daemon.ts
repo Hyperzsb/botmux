@@ -558,9 +558,9 @@ import {
   durablePrimaryExistingTurnDisposition,
 } from './services/durable-primary-turn-admission.js';
 import { computeInputHash } from './utils/canonical-input-hash.js';
-import { authorizeDelegatedScheduleRun, authorizeScheduleSelfManage } from './core/schedule-delegated-runtime.js';
+import { authorizeDelegatedScheduleRun, authorizeScheduleSelfManage, DELEGATED_SCHEDULE_REQUIRED_IDENTITY_TOOLS } from './core/schedule-delegated-runtime.js';
 import { parseScheduledTurnId, trustedCallerForScheduledTask } from './core/scheduled-turn-provenance.js';
-import { TRIGGER_USER_AUTH_TOOLS, delegatesOnMention } from './services/trigger-user-auth.js';
+import { delegatesOnMention } from './services/trigger-user-auth.js';
 import { triggerSessionTurn, reconcileIdempotencyLeasesOnBoot, convergeIdempotentAsyncTurnOnWorkerExit, externalEventOpensOwnTopic } from './core/trigger-session.js';
 import {
   runIdempotencyFailClose,
@@ -4398,6 +4398,7 @@ async function prepareDelegatedScheduledTurnIdentity(
   );
   await publishTurnCliIdentity({
     botConfig: getBot(ds.larkAppId).config,
+    sessionSandbox: ds.session.sandbox,
     sessionDataDir: config.session.dataDir,
     sessionId: ds.session.sessionId,
     senderOpenId: undefined,
@@ -4456,6 +4457,7 @@ async function refreshTurnCliIdentity(ds: DaemonSession, turnId: string): Promis
   }
   await publishTurnCliIdentity({
     botConfig,
+    sessionSandbox: ds.session.sandbox,
     sessionDataDir: config.session.dataDir,
     sessionId: ds.session.sessionId,
     senderOpenId: delegationBlocked
@@ -8117,7 +8119,9 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
       const targetPolicy = readGlobalConfig().scheduleDelegation;
       const targetTriggerPolicy = getBot(ds.larkAppId).config.triggerUserAuth;
       if (!targetTriggerPolicy?.enabled
-        || !TRIGGER_USER_AUTH_TOOLS.every(tool => targetTriggerPolicy.tools.includes(tool))) {
+        || !DELEGATED_SCHEDULE_REQUIRED_IDENTITY_TOOLS.every(
+          tool => targetTriggerPolicy.tools.includes(tool),
+        )) {
         return jsonRes(res, 403, { ok: false, error: 'schedule_delegation_target_identity_isolation_required' });
       }
       if (capability.allowedRunScopes.some(scope => !targetPolicy?.runScopes?.includes(scope)

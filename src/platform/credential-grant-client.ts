@@ -69,6 +69,10 @@ export const GRANT_VARIABLE_KEYS: Record<TriggerUserAuthTool, { required: readon
     required: ['LARKSUITE_CLI_APP_ID', 'LARKSUITE_CLI_USER_ACCESS_TOKEN'],
     optional: [],
   },
+  larkdev: {
+    required: [],
+    optional: ['BYTECLOUD_CLI_API_JWT_TOKEN_CN', 'BYTECLOUD_CLI_API_JWT_TOKEN_I18N_TT', 'BYTECLOUD_CLI_API_JWT_TOKEN_I18N_BD', 'BYTECLOUD_CLI_API_JWT_TOKEN_EU_TTP', 'BYTECLOUD_CLI_API_JWT_TOKEN_US_TTP'],
+  },
   bytedcli: {
     required: ['BYTEDCLI_USER_CLOUD_JWT'],
     optional: ['BYTEDCLI_USER_CODE_JWT'],

@@ -2,7 +2,7 @@
  * Trigger-user CLI authentication policy.
  *
  * Default OFF. When a bot enables it, that bot's CLI calls out to `lark-cli` /
- * `bytedcli` run as **the person who sent the current message**, instead of
+ * `bytedcli` / `larkdev` run as **the person who sent the current message**, instead of
  * "whoever happens to be logged in on this machine".
  *
  * ## The rule this file encodes
@@ -18,7 +18,7 @@
  * bugs are silent — nothing errors, the audit trail just names the wrong
  * person.
  *
- * ## Why the two tools cannot share one rule
+ * ## Why the tools cannot share one rule
  *
  * `lark-cli` has a real non-human identity (app id + secret resolve
  * `identity: bot`), so most calls can degrade safely. `bytedcli` has only SSO
@@ -38,7 +38,7 @@
  */
 
 /** Tools whose credentials botmux can inject per person. */
-export const TRIGGER_USER_AUTH_TOOLS = ['lark-cli', 'bytedcli'] as const;
+export const TRIGGER_USER_AUTH_TOOLS = ['lark-cli', 'bytedcli', 'larkdev'] as const;
 export type TriggerUserAuthTool = typeof TRIGGER_USER_AUTH_TOOLS[number];
 
 /**
@@ -60,6 +60,18 @@ export type TriggerUserAuthTool = typeof TRIGGER_USER_AUTH_TOOLS[number];
  */
 export const TRIGGER_USER_AUTH_CREDENTIAL_SOURCES = ['auto', 'platform', 'local'] as const;
 export type TriggerUserAuthCredentialSource = typeof TRIGGER_USER_AUTH_CREDENTIAL_SOURCES[number];
+
+/**
+ * Compatibility default for configs written before larkdev support existed.
+ * Omitting `tools` historically meant exactly these two tools; silently adding
+ * a third wrapper during an upgrade would change live bot behavior. larkdev is
+ * therefore explicit opt-in while the complete supported set remains exposed
+ * through {@link TRIGGER_USER_AUTH_TOOLS}.
+ */
+export const TRIGGER_USER_AUTH_DEFAULT_TOOLS: readonly TriggerUserAuthTool[] = [
+  'lark-cli',
+  'bytedcli',
+];
 
 /**
  * Policy intent for a sender who has not authorized this tool.
@@ -184,9 +196,7 @@ export function parseTriggerUserAuthConfig(raw: unknown): TriggerUserAuthConfig 
 
   let tools: TriggerUserAuthTool[];
   if (rec.tools === undefined) {
-    // Enabling without naming tools means "all of them" — the operator asked
-    // for the boundary, so apply it everywhere rather than nowhere.
-    tools = [...TRIGGER_USER_AUTH_TOOLS];
+    tools = [...TRIGGER_USER_AUTH_DEFAULT_TOOLS];
   } else if (Array.isArray(rec.tools)) {
     const unknownTools = rec.tools.filter(item => !isTool(item));
     if (unknownTools.length) {

@@ -11,12 +11,21 @@
  * ever used. Missing credentials produce a denial in that turn's snapshot.
  */
 import { logger } from '../utils/logger.js';
-import { resolveUserToken, lookupAuthorizedUserName } from '../utils/user-token.js';
+import { lookupAuthorizedUserName } from '../utils/user-token.js';
 import { t } from '../i18n/index.js';
 import type { Locale } from '../i18n/index.js';
 import { normalizeBrand } from '../im/lark/lark-hosts.js';
-import { beginBytedcliLogin, mintBytedcliJwts } from '../services/bytedcli-auth.js';
-import { resolveLarkCliHomeForTurn, beginLarkCliLogin } from '../services/lark-cli-auth.js';
+import {
+  beginBytedcliLogin,
+  mintBytedcliJwts,
+  mintLarkdevByteCloudJwts,
+} from '../services/bytedcli-auth.js';
+import {
+  resolveLarkCliHomeForTurn,
+  materializeLarkCliHomeForSession,
+  beginLarkCliLogin,
+  type LarkCliLoginChallenge,
+} from '../services/lark-cli-auth.js';
 import type { BotConfig } from '../bot-registry.js';
 import { isLarkToolBound } from './lark-tool-binding.js';
 import { rememberLarkToolDelegation } from './lark-tool-delegation.js';
@@ -70,6 +79,8 @@ export interface DelegatedCliIdentity {
 
 export interface PublishTurnIdentityArgs {
   botConfig: BotConfig;
+  /** Sandbox mode frozen on the session at creation time. */
+  sessionSandbox?: BotConfig['sandbox'];
   sessionDataDir: string;
   sessionId: string;
   /** The person who sent THIS turn. Absent for turns with no human sender. */
@@ -87,6 +98,24 @@ export interface PublishTurnIdentityArgs {
    *  legacy single-snapshot file (single). The caller derives this with the
    *  same predicate the worker uses to render the wrapper. */
   storageModel: IdentityStorageModel;
+}
+
+function isByteCloudTool(tool: TriggerUserAuthTool): boolean {
+  return tool === 'bytedcli' || tool === 'larkdev';
+}
+
+async function larkCliHomeForExecution(
+  sandbox: BotConfig['sandbox'],
+  sessionDataDir: string,
+  sessionId: string,
+  openId: string,
+): Promise<string | null> {
+  const sandboxed = sandbox === true
+    || sandbox === 'oncall'
+    || sandbox === 'scratch';
+  return sandboxed
+    ? await materializeLarkCliHomeForSession(openId, sessionDataDir, sessionId)
+    : await resolveLarkCliHomeForTurn(openId);
 }
 
 /**
@@ -122,7 +151,17 @@ export async function publishTurnCliIdentity(
     try {
       outcomes.push(args.delegatedIdentity
         ? await publishDelegated(tool, args, args.delegatedIdentity)
-        : await publishOne(tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId, storageModel));
+        : await publishOne(
+            tool,
+            botConfig,
+            args.sessionSandbox ?? botConfig.sandbox,
+            sessionDataDir,
+            sessionId,
+            senderOpenId,
+            locale,
+            turnId,
+            storageModel,
+          ));
     } catch (e) {
       // Fail closed through the SAME policy as an ordinary missing token, so a
       // credential-store outage and "this person never authorized" cannot end
@@ -131,13 +170,13 @@ export async function publishTurnCliIdentity(
         `[trigger-user-auth] withheld ${tool} identity for session ${sessionId}: `
         + `${e instanceof Error ? e.message : String(e)}`,
       );
-      if (tool === 'bytedcli') {
+      if (isByteCloudTool(tool)) {
         try {
           writeSessionIdentity(sessionDataDir, sessionId, {
             tool, mode: 'denied', ...(turnId ? { turnId } : {}),
             message: locale === 'en'
-              ? 'botmux: bytedcli authorization service is unavailable. Stop automatic retries and repeated login requests; retry after the service recovers. Existing authorization is retained.'
-              : 'botmux: bytedcli 授权服务暂时不可用。请停止自动重试和重复要求用户登录；服务恢复后再重试，已有授权会保留。',
+              ? `botmux: ${tool} ByteCloud authorization service is unavailable. Stop automatic retries and repeated login requests; retry after the service recovers. Existing authorization is retained.`
+              : `botmux: ${tool} 的 ByteCloud 授权服务暂时不可用。请停止自动重试和重复要求用户登录；服务恢复后再重试，已有授权会保留。`,
           }, storageModel);
         } catch { clearSessionIdentity(sessionDataDir, sessionId, tool, turnId, storageModel); }
         outcomes.push({ tool, state: 'unavailable' });
@@ -194,15 +233,19 @@ async function publishDelegated(tool: TriggerUserAuthTool, args: PublishTurnIden
     const jwt = await mintBytedcliJwts(user.credentialOpenId);
     if (jwt) identity = { tool, cloudJwt: jwt.cloudJwt, ...(jwt.codeJwt ? { codeJwt: jwt.codeJwt } : {}) };
   } else if (!identity && tool === 'lark-cli') {
-    const home = await resolveLarkCliHomeForTurn(user.credentialOpenId);
+    const home = await larkCliHomeForExecution(
+      args.sessionSandbox ?? args.botConfig.sandbox,
+      args.sessionDataDir,
+      args.sessionId,
+      user.credentialOpenId,
+    );
     if (home) identity = { tool, mode: 'user-home', home };
-    else if (user.targetOpenId && args.botConfig.larkAppId && args.botConfig.larkAppSecret) {
-      // Legacy bot-app OAuth is application-bound: only a target-app token is
-      // valid here. A source-app OAuth token is never presented as a target one.
-      const token = await resolveUserToken(args.botConfig.larkAppId, args.botConfig.larkAppSecret,
-        normalizeBrand(args.botConfig.brand), user.targetOpenId);
-      if (token) identity = { tool, appId: args.botConfig.larkAppId, userAccessToken: token };
-    }
+    // No bot-app OAuth fallback. Delegation may carry the original human's
+    // personal lark-cli HOME, but it must never turn a receiving Bot's shared
+    // app into that person's OAuth client.
+  } else if (!identity && tool === 'larkdev') {
+    const cloudJwts = await mintLarkdevByteCloudJwts(user.credentialOpenId);
+    if (cloudJwts) identity = { tool, cloudJwts };
   }
   if (!identity) return denyDelegated(tool, args, user);
   writeSessionIdentity(args.sessionDataDir, args.sessionId, {
@@ -216,6 +259,7 @@ async function publishDelegated(tool: TriggerUserAuthTool, args: PublishTurnIden
 async function publishOne(
   tool: TriggerUserAuthTool,
   botConfig: BotConfig,
+  sessionSandbox: BotConfig['sandbox'],
   sessionDataDir: string,
   sessionId: string,
   senderOpenId: string | undefined,
@@ -255,14 +299,14 @@ async function publishOne(
     if (platform.state === 'granted') return publish(platform.identity);
     if (source === 'platform' || platform.state !== 'unbound') {
       if (source === 'auto') {
-        const local = await resolveIdentityFor(tool, botConfig, senderOpenId);
+        const local = await resolveIdentityFor(tool, botConfig, sessionSandbox, sessionDataDir, sessionId, senderOpenId);
         if (local) return publish(local);
       }
       return refuseViaPlatform(tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId, storageModel, platform);
     }
   }
 
-  const identity = await resolveIdentityFor(tool, botConfig, senderOpenId);
+  const identity = await resolveIdentityFor(tool, botConfig, sessionSandbox, sessionDataDir, sessionId, senderOpenId);
   if (!identity) return await withheld();
   return publish(identity);
 }
@@ -283,7 +327,7 @@ function refuseViaPlatform(
   storageModel: IdentityStorageModel,
   platform: Exclude<PlatformIdentityResolution, { state: 'granted' }>,
 ): ToolIdentityOutcome {
-  const provider = tool === 'bytedcli' ? 'ByteCloud' : t('trigger_user_auth.provider_lark', undefined, locale);
+  const provider = isByteCloudTool(tool) ? 'ByteCloud' : t('trigger_user_auth.provider_lark', undefined, locale);
   const vars = { tool, provider };
   let tail: string[];
   let state: ToolIdentityOutcome['state'] = 'needs-authorization';
@@ -341,22 +385,28 @@ async function withholdIdentity(
   // of asking the person to type a command. Beginning only mints a link and
   // messages nobody, so non-CLI turns are not disturbed. Uses a fresh, still
   // unexpired challenge when one exists.
-  let authUrl: string | undefined;
+  let login: LarkCliLoginChallenge | undefined;
   if (senderOpenId) {
     try {
-      authUrl = tool === 'bytedcli'
-        ? (await beginBytedcliLogin(senderOpenId))?.authUrl
-        : (await beginLarkCliLogin(senderOpenId))?.authUrl;
-      if (tool === 'bytedcli' && !authUrl) throw new Error('bytedcli login provider unavailable');
+      if (isByteCloudTool(tool)) {
+        const started = await beginBytedcliLogin(senderOpenId);
+        if (!started?.authUrl) throw new Error('bytedcli login provider unavailable');
+        login = { authUrl: started.authUrl, stage: 'user-login' };
+      } else {
+        const brand = normalizeBrand(botConfig.brand);
+        login = await (brand === 'lark'
+          ? beginLarkCliLogin(senderOpenId, [], brand)
+          : beginLarkCliLogin(senderOpenId)) ?? undefined;
+      }
     } catch (e) {
-      if (tool === 'bytedcli') throw e;
+      if (isByteCloudTool(tool)) throw e;
       logger.warn(
         `[trigger-user-auth] could not pre-fetch ${tool} auth link for session ${sessionId}: `
         + `${e instanceof Error ? e.message : String(e)}`,
       );
     }
   }
-  writeDenial(sessionDataDir, sessionId, tool, senderOpenId, botConfig, locale, turnId, storageModel, authUrl);
+  writeDenial(sessionDataDir, sessionId, tool, senderOpenId, botConfig, locale, turnId, storageModel, login);
   return { tool, state: 'needs-authorization' };
 }
 
@@ -381,7 +431,7 @@ function writeDenial(
   locale: Locale | undefined,
   turnId: string | undefined,
   storageModel: IdentityStorageModel,
-  authUrl?: string,
+  login?: LarkCliLoginChallenge,
   /** Replaces the local-login tail (auto-link or /login how-to) when the
    *  authorization lives elsewhere — e.g. on the central platform. */
   tailOverride?: string[],
@@ -395,7 +445,7 @@ function writeDenial(
     // Name the right provider. bytedcli authenticates against ByteCloud, so
     // saying "Feishu authorization" would send the reader to authorize the
     // wrong thing — the same mistake as naming the wrong /login command.
-    const provider = tool === 'bytedcli'
+    const provider = isByteCloudTool(tool)
       ? 'ByteCloud'
       : t('trigger_user_auth.provider_lark', undefined, locale);
     // With no name, address the reader directly rather than printing a raw
@@ -418,15 +468,27 @@ function writeDenial(
         // one-tap instruction and a clear "authorize once" framing so it reads
         // as "one step left", not as a broken bot. Without a link (fetch failed
         // or no human sender), fall back to the /login instructions.
-        ...(tailOverride ? tailOverride : authUrl
+        ...(tailOverride ? tailOverride : login
           ? [
-              t('trigger_user_auth.denied_auto_login', { tool, provider }, locale),
-              authUrl,
-              t('trigger_user_auth.denied_auto_retry', undefined, locale),
+              t(
+                login.stage === 'app-setup'
+                  ? 'trigger_user_auth.denied_personal_app_setup'
+                  : 'trigger_user_auth.denied_auto_login',
+                { tool, provider },
+                locale,
+              ),
+              login.authUrl,
+              t(
+                login.stage === 'app-setup'
+                  ? 'trigger_user_auth.denied_personal_app_retry'
+                  : 'trigger_user_auth.denied_auto_retry',
+                undefined,
+                locale,
+              ),
             ]
           : [t(
               'trigger_user_auth.denied_howto',
-              { command: tool === 'bytedcli' ? '/login bytedcli' : '/login' },
+              { command: isByteCloudTool(tool) ? '/login bytedcli' : '/login' },
               locale,
             ),
             t('trigger_user_auth.denied_howto_status', undefined, locale)]),
@@ -444,6 +506,9 @@ function writeDenial(
 async function resolveIdentityFor(
   tool: TriggerUserAuthTool,
   botConfig: BotConfig,
+  sessionSandbox: BotConfig['sandbox'],
+  sessionDataDir: string,
+  sessionId: string,
   senderOpenId: string,
 ): Promise<CliIdentity | null> {
   if (tool === 'lark-cli') {
@@ -456,22 +521,28 @@ async function resolveIdentityFor(
     // The resolver polls a pending device login once before deciding: a browser
     // approval writes nothing locally, so without that poll "tap the link, then
     // retry" could never succeed on the turn path.
-    const home = await resolveLarkCliHomeForTurn(senderOpenId);
+    const home = await larkCliHomeForExecution(
+      sessionSandbox,
+      sessionDataDir,
+      sessionId,
+      senderOpenId,
+    );
     if (home) {
       return { tool: 'lark-cli', mode: 'user-home', home };
     }
-    // Back-compat: a bot-app OAuth user token already stored server-side.
-    if (!botConfig.larkAppId || !botConfig.larkAppSecret) return null;
-    const token = await resolveUserToken(
-      botConfig.larkAppId,
-      botConfig.larkAppSecret,
-      normalizeBrand(botConfig.brand),
-      senderOpenId,
-    );
-    if (!token) return null;
-    // The app id travels with the token: lark-cli refuses a token without it
-    // ("blocked by env: …USER_ACCESS_TOKEN is set but …APP_ID is missing").
-    return { tool: 'lark-cli', appId: botConfig.larkAppId, userAccessToken: token };
+    // Strict boundary: trigger-user lark-cli accepts only the sender's personal
+    // app + login HOME. A bot-app token is per-user but still shares one OAuth
+    // application, which is the identity escape this mode must prevent.
+    return null;
+  }
+
+  if (tool === 'larkdev') {
+    // larkdev uses the same ByteCloud person as bytedcli, but receives
+    // site-specific short-lived JWTs. Its wrapper points LARKDEV_AUTH_DIR at a
+    // fresh directory, so an unavailable region cannot fall back to the
+    // operator's ~/.larkdev/auth state.
+    const cloudJwts = await mintLarkdevByteCloudJwts(senderOpenId);
+    return cloudJwts ? { tool: 'larkdev', cloudJwts } : null;
   }
 
   // bytedcli authenticates against ByteCloud SSO, a different provider from
