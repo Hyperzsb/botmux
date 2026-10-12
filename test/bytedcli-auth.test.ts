@@ -118,6 +118,11 @@ describe('hasBytedcliHome — provider-owned login state', () => {
     vi.stubEnv('BYTECLOUD_SECRET_ACCESS_KEY', 'machine-sk');
     vi.stubEnv('AIPAAS_BYTECLAW', '1');
     vi.stubEnv('AIME_USER_CLOUD_JWT', 'machine-aime');
+    vi.stubEnv('BYTEDCLI_SERVICE_ACCOUNT_JWT_US_TTP', 'machine-app-jwt');
+    vi.stubEnv('BYTEDCLI_SERVICE_ACCOUNT_US_TTP_ACCESS_KEY_ID', 'machine-app-ak');
+    vi.stubEnv('BYTEDCLI_AI_AUTH_APP_KEY', 'machine-ai-app');
+    vi.stubEnv('BYTEDCLI_AI_AUTH_SUBJECT', 'someone-else');
+    vi.stubEnv('BYTEDCLI_USE_ZTI_JWT', '1');
     vi.stubEnv('BYTECLOUD_AUTH_AS', 'app');
     const mod = await fresh();
     authorize(mod, ALICE);
@@ -132,6 +137,11 @@ describe('hasBytedcliHome — provider-owned login state', () => {
       'BYTECLOUD_SECRET_ACCESS_KEY',
       'AIPAAS_BYTECLAW',
       'AIME_USER_CLOUD_JWT',
+      'BYTEDCLI_SERVICE_ACCOUNT_JWT_US_TTP',
+      'BYTEDCLI_SERVICE_ACCOUNT_US_TTP_ACCESS_KEY_ID',
+      'BYTEDCLI_AI_AUTH_APP_KEY',
+      'BYTEDCLI_AI_AUTH_SUBJECT',
+      'BYTEDCLI_USE_ZTI_JWT',
     ]) expect(env[key]).toBeUndefined();
   });
 
@@ -379,6 +389,28 @@ describe('mintLarkdevByteCloudJwts — per-plane sender identity', () => {
     const jwts = await mod.mintLarkdevByteCloudJwts(ALICE);
     expect(jwts?.cn).toBe('cn.jwt');
     expect(jwts?.['i18n-bd']).toBeUndefined();
+  });
+
+  it('single-flights all regional mints for the same sender', async () => {
+    const mod = await fresh();
+    authorize(mod, ALICE);
+    replies = [
+      { code: 0, stdout: 'cn.jwt\n' },
+      { code: 0, stdout: 'code.jwt\n' },
+      { code: 0, stdout: 'tt.jwt\n' },
+      { code: 0, stdout: 'bd.jwt\n' },
+      { code: 0, stdout: 'eu.jwt\n' },
+      { code: 0, stdout: 'us.jwt\n' },
+    ];
+
+    const [first, second] = await Promise.all([
+      mod.mintByteCloudUserJwts(ALICE),
+      mod.mintByteCloudUserJwts(ALICE),
+    ]);
+
+    expect(second).toEqual(first);
+    expect(statusCalls).toHaveLength(1);
+    expect(calls).toHaveLength(6);
   });
 });
 

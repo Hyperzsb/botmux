@@ -19,8 +19,7 @@ import type { Locale } from '../i18n/index.js';
 import { normalizeBrand } from '../im/lark/lark-hosts.js';
 import {
   beginBytedcliLogin,
-  mintBytedcliJwts,
-  mintLarkdevByteCloudJwts,
+  mintByteCloudUserJwts,
 } from '../services/bytedcli-auth.js';
 import {
   resolveLarkCliHomeForTurn,
@@ -188,8 +187,8 @@ async function publishDelegated(tool: TriggerUserAuthTool, args: PublishTurnIden
   if (tool === 'bytedcli') {
     // Keep the issuer-scoped credential key; do not copy a source open_id into
     // the target app or duplicate/extend the lifetime of the user's login.
-    const jwt = await mintBytedcliJwts(user.credentialOpenId);
-    if (jwt) identity = { tool, cloudJwt: jwt.cloudJwt, ...(jwt.codeJwt ? { codeJwt: jwt.codeJwt } : {}) };
+    const cloudJwts = await mintByteCloudUserJwts(user.credentialOpenId);
+    if (cloudJwts) identity = { tool, cloudJwts };
   } else if (tool === 'lark-cli') {
     const home = await larkCliHomeForExecution(
       args.sessionSandbox ?? args.botConfig.sandbox,
@@ -202,7 +201,7 @@ async function publishDelegated(tool: TriggerUserAuthTool, args: PublishTurnIden
     // personal lark-cli HOME, but it must never turn a receiving Bot's shared
     // app into that person's OAuth client.
   } else {
-    const cloudJwts = await mintLarkdevByteCloudJwts(user.credentialOpenId);
+    const cloudJwts = await mintByteCloudUserJwts(user.credentialOpenId);
     if (cloudJwts) identity = { tool, cloudJwts };
   }
   if (!identity) return denyDelegated(tool, args, user);
@@ -420,21 +419,19 @@ async function resolveIdentityFor(
     // site-specific short-lived JWTs. Its wrapper points LARKDEV_AUTH_DIR at a
     // fresh directory, so an unavailable region cannot fall back to the
     // operator's ~/.larkdev/auth state.
-    const cloudJwts = await mintLarkdevByteCloudJwts(senderOpenId);
+    const cloudJwts = await mintByteCloudUserJwts(senderOpenId);
     return cloudJwts ? { tool: 'larkdev', cloudJwts } : null;
   }
 
   // bytedcli authenticates against ByteCloud SSO, a different provider from
-  // Lark OAuth — a Lark user token is not convertible into a ByteCloud JWT. So
-  // this person's credentials come from their own bytedcli login, minted fresh
-  // per turn: the ByteCloud JWT lives ~2 hours while the login behind it lives
-  // ~3 weeks, and bytedcli refreshes it internally, so asking each time is what
-  // keeps people from being sent back to a QR code every couple of hours.
+  // Lark OAuth — a Lark user token is not convertible into a ByteCloud JWT. Mint
+  // this person's real ByteCloud SDK JWT inputs for every supported site. The
+  // wrapper runs the real bytedcli in an empty HOME, so a missing regional JWT
+  // fails closed instead of falling back to the operator's persistent login.
   //
   // Null when they have not authorized (or their login has ended), which the
   // caller turns into the ordinary "authorize, then retry" refusal rather than
   // falling back to the machine's own SSO session.
-  const jwts = await mintBytedcliJwts(senderOpenId);
-  if (!jwts) return null;
-  return { tool: 'bytedcli', cloudJwt: jwts.cloudJwt, ...(jwts.codeJwt ? { codeJwt: jwts.codeJwt } : {}) };
+  const cloudJwts = await mintByteCloudUserJwts(senderOpenId);
+  return cloudJwts ? { tool: 'bytedcli', cloudJwts } : null;
 }

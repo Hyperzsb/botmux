@@ -24,11 +24,9 @@ vi.mock('../src/utils/user-token.js', () => ({
 }));
 
 // bytedcli shells out to the real CLI; here we control who is authorized.
-const bytedcliJwts = new Map<string, { cloudJwt: string; codeJwt?: string }>();
-const larkdevJwts = new Map<string, Record<string, string>>();
+const byteCloudJwts = new Map<string, Record<string, string>>();
 vi.mock('../src/services/bytedcli-auth.js', () => ({
-  mintBytedcliJwts: vi.fn(async (openId: string) => bytedcliJwts.get(openId) ?? null),
-  mintLarkdevByteCloudJwts: vi.fn(async (openId: string) => larkdevJwts.get(openId) ?? null),
+  mintByteCloudUserJwts: vi.fn(async (openId: string) => byteCloudJwts.get(openId) ?? null),
   beginBytedcliLogin: vi.fn(async () => ({
     authUrl: 'https://cloud.example.com/auth?state=auto',
     completeToken: 'tok-auto',
@@ -67,8 +65,7 @@ const SESSION = 'sess-1';
 let dir: string;
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'botmux-turn-identity-'));
-  bytedcliJwts.clear();
-  larkdevJwts.clear();
+  byteCloudJwts.clear();
   larkHomes.clear();
   pendingChallenges.clear();
   resolveLarkCliHomeForTurn.mockClear();
@@ -279,20 +276,21 @@ describe('publishTurnCliIdentity — withholding removes, never inherits', () =>
   });
 
   it('publishes this person\'s own ByteCloud JWTs once they have authorized', async () => {
-    bytedcliJwts.set(ALICE, { cloudJwt: 'cloud-alice', codeJwt: 'code-alice' });
+    byteCloudJwts.set(ALICE, { cn: 'cloud-alice', 'i18n-bd': 'bd-alice' });
     const config = botConfig({ enabled: true, tools: ['bytedcli'] });
     const outcomes = await publish(config, ALICE);
 
     expect(outcomes.find(o => o.tool === 'bytedcli')?.state).toBe('user');
     const body = readFileSync(sessionIdentityPath(dir, SESSION, 'bytedcli'), 'utf8');
-    expect(body).toContain("BYTEDCLI_USER_CLOUD_JWT='cloud-alice'");
-    // git attribution rides this one.
-    expect(body).toContain("BYTEDCLI_USER_CODE_JWT='code-alice'");
+    expect(body).toContain("BOTMUX_IDENTITY_MODE='bytedcli-user'");
+    expect(body).toContain("BYTECLOUD_CLI_API_JWT_TOKEN_CN='cloud-alice'");
+    expect(body).toContain("BYTECLOUD_CLI_API_JWT_TOKEN_I18N_BD='bd-alice'");
+    expect(body).not.toContain('BYTEDCLI_USER_CLOUD_JWT');
   });
 
   // Alice authorized, Bob did not. Bob's turn must not inherit her JWT.
   it('never hands one person\'s ByteCloud JWT to another', async () => {
-    bytedcliJwts.set(ALICE, { cloudJwt: 'cloud-alice' });
+    byteCloudJwts.set(ALICE, { cn: 'cloud-alice' });
     const config = botConfig({ enabled: true, tools: ['bytedcli'] });
     await publish(config, ALICE);
     const outcomes = await publish(config, BOB);
@@ -303,7 +301,7 @@ describe('publishTurnCliIdentity — withholding removes, never inherits', () =>
   });
 
   it('publishes larkdev site JWTs for this sender and clears them for the next', async () => {
-    larkdevJwts.set(ALICE, {
+    byteCloudJwts.set(ALICE, {
       cn: 'alice-cn', 'i18n-tt': 'alice-tt', 'us-ttp': 'alice-us',
     });
     const config = botConfig({ enabled: true, tools: ['larkdev'] });
@@ -401,8 +399,8 @@ describe('verified cross-bot delegation', () => {
     delegatedIdentity: { ...delegatedIdentity, tools },
   });
   it('uses original user login for CLI identities and stamps the target turn', async () => {
-    bytedcliJwts.set(ALICE, { cloudJwt: 'alice-cloud' });
-    bytedcliJwts.set('ou_source_bot', { cloudJwt: 'wrong-bot' });
+    byteCloudJwts.set(ALICE, { cn: 'alice-cloud' });
+    byteCloudJwts.set('ou_source_bot', { cn: 'wrong-bot' });
     larkHomes.set(ALICE, '/isolated/alice');
     expect(await delegated()).toEqual([
       { tool: 'lark-cli', state: 'user' },
@@ -416,9 +414,9 @@ describe('verified cross-bot delegation', () => {
     expect(env).not.toContain('wrong-bot');
   });
   it('rechecks authorization on retry and clears revoked credentials', async () => {
-    bytedcliJwts.set(ALICE, { cloudJwt: 'revocable' });
+    byteCloudJwts.set(ALICE, { cn: 'revocable' });
     await delegated();
-    bytedcliJwts.delete(ALICE);
+    byteCloudJwts.delete(ALICE);
     await delegated();
     const env = readFileSync(sessionIdentityPath(dir, SESSION, 'bytedcli'), 'utf8');
     expect(env).not.toContain('revocable');
@@ -435,7 +433,7 @@ describe('verified cross-bot delegation', () => {
     expect(body).not.toContain(APP);
   });
   it('target cannot widen delegated tool permissions', async () => {
-    bytedcliJwts.set(ALICE, { cloudJwt: 'alice-cloud' });
+    byteCloudJwts.set(ALICE, { cn: 'alice-cloud' });
     larkHomes.set(ALICE, '/isolated/alice');
     expect(await delegated('om_narrow', ['bytedcli'])).toEqual([
       { tool: 'lark-cli', state: 'needs-authorization' },
@@ -445,8 +443,8 @@ describe('verified cross-bot delegation', () => {
     expect(readFileSync(larkPath(), 'utf8')).not.toContain('/isolated/alice');
   });
   it('a later direct human turn uses that human and never inherits delegation', async () => {
-    bytedcliJwts.set(ALICE, { cloudJwt: 'alice-cloud' });
-    bytedcliJwts.set(BOB, { cloudJwt: 'bob-cloud' });
+    byteCloudJwts.set(ALICE, { cn: 'alice-cloud' });
+    byteCloudJwts.set(BOB, { cn: 'bob-cloud' });
     await delegated();
     await publish(botConfig({ enabled: true, tools: ['bytedcli'] }), BOB, 'om_bob');
     const env = readFileSync(sessionIdentityPath(dir, SESSION, 'bytedcli'), 'utf8');
@@ -519,7 +517,7 @@ describe('target daemon consumes signed message authority', () => {
     if (mode === 'live') h.ds.activeInteractiveTurn = { turnId: 'om_human', caller: {
       senderType: 'user', requestLarkAppId: APP, requestUserOpenId: BOB,
     } };
-    bytedcliJwts.set(BOB, { cloudJwt: 'direct-human' });
+    byteCloudJwts.set(BOB, { cn: 'direct-human' });
     await h.run('om_human');
     expect(readFileSync(sessionIdentityPath(dir, SESSION, 'bytedcli'), 'utf8')).toContain('direct-human');
     expect(h.resolveTargetAppOpenId).not.toHaveBeenCalled();
@@ -527,8 +525,8 @@ describe('target daemon consumes signed message authority', () => {
   it('a delegated bot turn still refuses a corrupt delegation store', async () => {
     const h = await targetHarness();
     writeFileSync(join(dir, 'dispatch-user-delegations.json'), 'corrupt-json');
-    bytedcliJwts.set(ALICE, { cloudJwt: 'must-not-leak' });
-    bytedcliJwts.set('ou_peer', { cloudJwt: 'must-not-use-peer' });
+    byteCloudJwts.set(ALICE, { cn: 'must-not-leak' });
+    byteCloudJwts.set('ou_peer', { cn: 'must-not-use-peer' });
     await h.run();
     const env = readFileSync(sessionIdentityPath(dir, SESSION, 'bytedcli'), 'utf8');
     expect(env).not.toContain('must-not-');
@@ -541,13 +539,13 @@ describe('target daemon consumes signed message authority', () => {
     if (evidence === 'quote') {
       h.ds.session.quoteTargetId = 'om_peer'; h.ds.session.quoteTargetSenderIsBot = true;
     }
-    bytedcliJwts.set('ou_peer', { cloudJwt: 'must-not-use-peer' });
+    byteCloudJwts.set('ou_peer', { cn: 'must-not-use-peer' });
     await h.run('om_peer');
     expect(readFileSync(sessionIdentityPath(dir, SESSION, 'bytedcli'), 'utf8')).not.toContain('must-not-use-peer');
   });
   it('reports unavailable member verification without telling the human to log in again', async () => {
     const h = await targetHarness({ memberError: true });
-    bytedcliJwts.set(ALICE, { cloudJwt: 'must-not-leak' });
+    byteCloudJwts.set(ALICE, { cn: 'must-not-leak' });
     await h.run();
     const env = readFileSync(sessionIdentityPath(dir, SESSION, 'bytedcli'), 'utf8');
     expect(env).toContain('membership verification is unavailable');
@@ -557,14 +555,14 @@ describe('target daemon consumes signed message authority', () => {
   });
   it.each(['chat', 'thread'] as const)('publishes original credentials after signed dispatch + cross-app resolution (%s)', async scope => {
     const h = await targetHarness({ scope });
-    bytedcliJwts.set(ALICE, { cloudJwt: 'original-user' });
+    byteCloudJwts.set(ALICE, { cn: 'original-user' });
     await h.run();
     expect(h.resolveTargetAppOpenId).toHaveBeenCalledExactlyOnceWith(APP, 'on_alice');
     expect(readFileSync(sessionIdentityPath(dir, SESSION, 'bytedcli'), 'utf8')).toContain('original-user');
   });
   it.each([{ mapping: 'transient' as const }, { member: false }, { talk: false }])('denies identity when target cannot validate user %j', async options => {
     const h = await targetHarness(options);
-    bytedcliJwts.set(ALICE, { cloudJwt: 'must-not-leak' });
+    byteCloudJwts.set(ALICE, { cn: 'must-not-leak' });
     await h.run();
     const env = readFileSync(sessionIdentityPath(dir, SESSION, 'bytedcli'), 'utf8');
     expect(env).not.toContain('must-not-leak');
@@ -572,7 +570,7 @@ describe('target daemon consumes signed message authority', () => {
   });
   it('never uses root binding for an unrelated later turn', async () => {
     const h = await targetHarness();
-    bytedcliJwts.set(ALICE, { cloudJwt: 'must-not-leak' });
+    byteCloudJwts.set(ALICE, { cn: 'must-not-leak' });
     await h.run('om_unrelated');
     expect(h.resolveTargetAppOpenId).not.toHaveBeenCalled();
     expect(readFileSync(sessionIdentityPath(dir, SESSION, 'bytedcli'), 'utf8')).not.toContain('must-not-leak');
@@ -594,7 +592,7 @@ describe('target daemon consumes signed message authority', () => {
       runEnabled: true, runScopes: ['bytedcli'],
     } });
     h.scopeValues.getDashboardAdminOpenIds = () => ['ou_alice_target'];
-    bytedcliJwts.set(ALICE, { cloudJwt: 'scheduled-original-user' });
+    byteCloudJwts.set(ALICE, { cn: 'scheduled-original-user' });
     await h.run(turnId);
     expect(readFileSync(sessionIdentityPath(dir, SESSION, 'bytedcli'), 'utf8'))
       .toContain('scheduled-original-user');
@@ -605,8 +603,8 @@ describe('target daemon consumes signed message authority', () => {
 it('does not begin another login when the bytedcli provider fails', async () => {
   const provider = await import('../src/services/bytedcli-auth.js');
   vi.mocked(provider.beginBytedcliLogin).mockClear();
-  vi.mocked(provider.mintBytedcliJwts).mockRejectedValueOnce(new Error('provider unavailable'));
-  writeSessionIdentity(dir, SESSION, { tool: 'bytedcli', cloudJwt: 'old-sender-credential' });
+  vi.mocked(provider.mintByteCloudUserJwts).mockRejectedValueOnce(new Error('provider unavailable'));
+  writeSessionIdentity(dir, SESSION, { tool: 'bytedcli', cloudJwts: { cn: 'old-sender-credential' } });
   const result = await publishTurnCliIdentity({
     botConfig: botConfig({ enabled: true, tools: ['bytedcli'] }), sessionDataDir: dir, sessionId: SESSION, senderOpenId: ALICE,
   });

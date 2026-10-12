@@ -35,10 +35,14 @@ import { existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import {
+  BYTECLOUD_USER_SITES,
+  type ByteCloudUserSite,
+} from '../utils/bytecloud-sites.js';
 import { logger } from '../utils/logger.js';
 import { isUsableOpenId } from '../utils/user-token.js';
 import {
-  scrubByteCloudCredentialEnv,
+  scrubCredentialLikeEnv,
   scrubSessionTurnMarkerEnv,
 } from '../utils/child-env.js';
 
@@ -125,10 +129,11 @@ async function runAsUser(openId: string, args: string[]): Promise<BytedcliResult
   mkdirSync(home, { recursive: true, mode: 0o700 });
   const env = { ...process.env };
   scrubSessionTurnMarkerEnv(env);
-  // ByteCloud Auth reads injected JWTs and AK/SK before the isolated HOME.
-  // Leaving even one site-specific value in place would silently act as the
-  // daemon/operator instead of this sender.
-  scrubByteCloudCredentialEnv(env);
+  // bytedcli subcommands accept ByteCloud JWTs/AK/SKs as well as many
+  // domain-specific tokens, cookies and passwords. Leaving any ambient
+  // credential in place could silently act as the daemon/operator instead of
+  // this sender even though HOME itself is isolated.
+  scrubCredentialLikeEnv(env);
   for (const key of [
     'BYTEDCLI_PROFILE', 'BYTEDCLI_CODEBASE_APP_ID', 'BYTEDCLI_CODEBASE_APP_SECRET',
     'BYTEDCLI_CLOUD_SITE', 'BYTEDCLI_AUTH_SITE',
@@ -330,43 +335,54 @@ export interface BytedcliJwts {
   codeJwt?: string;
 }
 
-/** ByteCloud sites larkdev can select through its control-plane flag. BOE is
- * an alias of CN in larkdev's SDK, so one CN token covers both planes. */
-export const LARKDEV_BYTECLOUD_SITES = [
-  'cn',
-  'i18n-tt',
-  'i18n-bd',
-  'eu-ttp',
-  'us-ttp',
-] as const;
-export type LarkdevByteCloudSite = typeof LARKDEV_BYTECLOUD_SITES[number];
+const allSiteMinting = new Map<
+  string,
+  Promise<Partial<Record<ByteCloudUserSite, string>> | null>
+>();
 
 /**
- * Mint the current sender's ByteCloud JWT for every larkdev plane that their
- * login can reach. Missing regional access is represented by an absent entry,
- * never by falling through to a machine login inside larkdev.
+ * Mint the current sender's ByteCloud JWT for every control plane their login
+ * can reach. Missing regional access is represented by an absent entry, never
+ * by falling through to a machine login inside a governed CLI.
  */
-export async function mintLarkdevByteCloudJwts(
+export async function mintByteCloudUserJwts(
   openId: string,
-): Promise<Partial<Record<LarkdevByteCloudSite, string>> | null> {
+): Promise<Partial<Record<ByteCloudUserSite, string>> | null> {
+  const existing = allSiteMinting.get(openId);
+  if (existing) return existing;
+  const work = mintAllSiteUserJwts(openId);
+  allSiteMinting.set(openId, work);
+  try { return await work; } finally { allSiteMinting.delete(openId); }
+}
+
+async function mintAllSiteUserJwts(
+  openId: string,
+): Promise<Partial<Record<ByteCloudUserSite, string>> | null> {
   // Reuse the existing CN mint path so pending-login completion, provider
   // verification and in-flight de-duplication stay identical to bytedcli.
   const primary = await mintBytedcliJwts(openId);
   if (!primary) return null;
-  const result: Partial<Record<LarkdevByteCloudSite, string>> = {
+  const result: Partial<Record<ByteCloudUserSite, string>> = {
     cn: primary.cloudJwt,
   };
-  await Promise.all(LARKDEV_BYTECLOUD_SITES.filter(site => site !== 'cn').map(async site => {
+  // Keep one process at a time inside the same durable HOME. ByteCloud Auth
+  // may rotate and persist login state while minting; concurrent regional
+  // processes must not race those writes.
+  for (const site of BYTECLOUD_USER_SITES) {
+    if (site === 'cn') continue;
     const minted = await runAsUser(openId, [
       '--site', site,
       'auth', 'get-bytecloud-jwt-token',
     ]);
     const jwt = minted.stdout.trim();
     if (minted.ok && jwt) result[site] = jwt;
-    else logger.debug(`[bytedcli-auth] no personal ByteCloud JWT available for larkdev site ${site}`);
-  }));
+    else logger.debug(`[bytedcli-auth] no personal ByteCloud JWT available for governed CLI site ${site}`);
+  }
   return result;
 }
+
+/** Backward-compatible name for callers that only use the tokens with larkdev. */
+export const mintLarkdevByteCloudJwts = mintByteCloudUserJwts;
 
 /**
  * Mint this person's JWTs for the current turn.
