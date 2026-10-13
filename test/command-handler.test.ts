@@ -111,7 +111,7 @@ vi.mock('../src/services/role-profile-store.js', () => ({
 // not about the real CLI being installed and logged in.
 vi.mock('../src/services/bytedcli-auth.js', () => ({
   hasBytedcliHome: vi.fn(async () => false),
-  beginBytedcliLogin: vi.fn(async () => ({ authUrl: 'https://cloud.example.com/auth?state=x', completeToken: 'tok-1' })),
+  beginBytedcliLogin: vi.fn(async (_openId: string, site: string) => ({ site, authUrl: 'https://cloud.example.com/auth?state=x', completeToken: 'tok-1' })),
   completeBytedcliLogin: vi.fn(async () => ({ state: 'authorized' as const })),
   pendingBytedcliChallenge: vi.fn(() => null),
 }));
@@ -3913,61 +3913,13 @@ describe('handleCommand', () => {
         expect(text).toContain('命令会被拒绝');
       });
 
-      // The bug this split fixes: ByteCloud is a separate identity provider, so
-      // an authorized Lark token says nothing about bytedcli. This sender has a
-      // Lark token and no bytedcli login, and the two lines must disagree.
-      it('reports bytedcli separately even when Lark is authorized', async () => {
-        vi.mocked(hasBytedcliHome).mockResolvedValue(false);
+      it('reports that bytedcli authorization is checked per site', async () => {
         const text = await statusText(
           statusWith({ enabled: true, tools: ['lark-cli', 'bytedcli'] }, true),
         );
         expect(text).toContain('lark-cli: 以你自己的身份调用');
-        expect(text).toContain('bytedcli: 你未授权');
-        expect(text).toContain('首次调用被拒时会自动返回登录链接');
-      });
-
-      it('reports provider outages without telling the user to authorize again', async () => {
-        vi.mocked(hasBytedcliHome).mockRejectedValueOnce(new Error('provider unavailable'));
-        const text = await statusText(statusWith({ enabled: true, tools: ['bytedcli'] }, false));
-        expect(text).toContain('授权服务暂时不可用');
-        expect(text).not.toContain('你未授权');
-      });
-
-      it('reports bytedcli as authorized once that person has logged in', async () => {
-        vi.mocked(hasBytedcliHome).mockResolvedValue(true);
-        const text = await statusText(
-          statusWith({ enabled: true, tools: ['bytedcli'] }, false),
-        );
-        expect(text).toContain('bytedcli: 以你自己的身份调用');
-      });
-
-      it('does not call a merely pending device login authorized when there is no HOME', async () => {
-        vi.mocked(hasBytedcliHome).mockResolvedValue(false);
-        vi.mocked(pendingBytedcliChallenge).mockReturnValue('tok-pending');
-        try {
-          const text = await statusText(
-            statusWith({ enabled: true, tools: ['bytedcli'] }, false),
-          );
-          expect(text).toContain('bytedcli: 你未授权');
-          expect(text).toContain('首次调用被拒时会自动返回登录链接');
-        } finally {
-          vi.mocked(pendingBytedcliChallenge).mockReturnValue(null);
-        }
-      });
-
-      // With the soft-gate mint, a pending challenge never vetoes an existing
-      // login — status must keep saying "authorized" while a fresh link is open.
-      it('still reports authorized with a pending challenge atop an existing HOME', async () => {
-        vi.mocked(hasBytedcliHome).mockResolvedValue(true);
-        vi.mocked(pendingBytedcliChallenge).mockReturnValue('tok-pending');
-        try {
-          const text = await statusText(
-            statusWith({ enabled: true, tools: ['bytedcli'] }, false),
-          );
-          expect(text).toContain('bytedcli: 以你自己的身份调用');
-        } finally {
-          vi.mocked(pendingBytedcliChallenge).mockReturnValue(null);
-        }
+        expect(text).toContain('bytedcli: 按站点使用你的 ByteCloud 身份');
+        expect(text).toContain('/login status <site>');
       });
     });
   });
@@ -6067,8 +6019,8 @@ describe('handleCommand', () => {
     });
 
     describe('/login bytedcli', () => {
-      it.each(['/login bytedcli done', '/login done'])('retains authorization on provider outage: %s', async command => {
-        vi.mocked(pendingBytedcliChallenge).mockReturnValue('tok-1');
+      it.each(['/login bytedcli i18n-bd done', '/login done'])('retains authorization on provider outage: %s', async command => {
+        vi.mocked(pendingBytedcliChallenge).mockImplementation((_openId, site) => site === 'i18n-bd' ? 'tok-1' : null);
         vi.mocked(completeBytedcliLogin).mockResolvedValueOnce({ state: 'unavailable' });
         const deps = makeDeps(makeDaemonSession());
         await handleCommand('/login', ROOT_ID, makeLarkMessage(command), deps, LARK_APP_ID);
@@ -6086,7 +6038,7 @@ describe('handleCommand', () => {
         vi.mocked(hasBytedcliHome).mockRejectedValueOnce(new Error('provider unavailable'));
         try {
           const deps = makeDeps(makeDaemonSession());
-          await handleCommand('/login', ROOT_ID, makeLarkMessage('/login status'), deps, LARK_APP_ID);
+          await handleCommand('/login', ROOT_ID, makeLarkMessage('/login status i18n-bd'), deps, LARK_APP_ID);
           const text = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
           expect(text).toContain('授权服务暂时不可用');
           expect(text).not.toContain('未授权');
@@ -6095,14 +6047,36 @@ describe('handleCommand', () => {
 
       it('returns the ByteCloud link and says it is separate from Feishu', async () => {
         const deps = makeDeps(makeDaemonSession());
-        await handleCommand('/login', ROOT_ID, makeLarkMessage('/login bytedcli'), deps, LARK_APP_ID);
+        await handleCommand('/login', ROOT_ID, makeLarkMessage('/login bytedcli i18n-bd'), deps, LARK_APP_ID);
 
         const text = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
-        expect(beginBytedcliLogin).toHaveBeenCalledWith('ou_sender');
+        expect(beginBytedcliLogin).toHaveBeenCalledWith('ou_sender', 'i18n-bd');
         expect(text).toContain('https://cloud.example.com/auth?state=x');
-        expect(text).toContain('/login bytedcli done');
+        expect(text).toContain('/login bytedcli i18n-bd done');
         // Without this the person reasonably assumes their Feishu /login covered it.
-        expect(text).toContain('两边都要授权');
+        expect(text).toContain('和飞书 /login 是两回事');
+      });
+
+      it('requires an explicit supported site', async () => {
+        for (const command of ['/login bytedcli', '/login bytedcli unknown']) {
+          const deps = makeDeps(makeDaemonSession());
+          await handleCommand('/login', ROOT_ID, makeLarkMessage(command), deps, LARK_APP_ID);
+          expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1]).toContain('/login bytedcli <站点>');
+        }
+        expect(beginBytedcliLogin).not.toHaveBeenCalled();
+      });
+
+      it.each([
+        ['boe', 'cn'],
+        ['i18n', 'i18n-bd'],
+        ['eu-ttp-limited', 'eu-ttp'],
+        ['eu-ttp-full', 'eu-ttp'],
+        ['us-ttp-bdee', 'us-ttp'],
+        ['us-ttp-usts', 'us-ttp'],
+      ])('normalizes public site alias %s to %s before starting authorization', async (alias, site) => {
+        const deps = makeDeps(makeDaemonSession());
+        await handleCommand('/login', ROOT_ID, makeLarkMessage(`/login bytedcli ${alias}`), deps, LARK_APP_ID);
+        expect(beginBytedcliLogin).toHaveBeenCalledWith('ou_sender', site);
       });
 
       it.each([
@@ -6112,18 +6086,18 @@ describe('handleCommand', () => {
         { name: 'bytedcli', policy: { enabled: true, tools: ['bytedcli'] }, enabled: true, git: false },
         { name: 'bytedcli with git', policy: { enabled: true, tools: ['bytedcli'], gitHost: 'code.example.com' }, enabled: true, git: true },
       ])('reports saved authorization and the $name policy on done', async ({ policy, enabled, git }) => {
-        vi.mocked(pendingBytedcliChallenge).mockReturnValue('tok-1');
+        vi.mocked(pendingBytedcliChallenge).mockImplementation((_openId, site) => site === 'i18n-bd' ? 'tok-1' : null);
         vi.mocked(completeBytedcliLogin).mockResolvedValue({ state: 'authorized' });
         const bot = defaultGetBot();
         vi.mocked(getBot).mockReturnValue({
           ...bot,
           config: { ...bot.config, triggerUserAuth: parseTriggerUserAuthConfig(policy) ?? undefined },
         } as any);
-        for (const command of ['/login bytedcli done', '/login done']) {
+        for (const command of ['/login bytedcli i18n-bd done', '/login done']) {
           const deps = makeDeps(makeDaemonSession());
           await handleCommand('/login', ROOT_ID, makeLarkMessage(command), deps, LARK_APP_ID);
 
-          expect(completeBytedcliLogin).toHaveBeenCalledWith('ou_sender', 'tok-1');
+          expect(completeBytedcliLogin).toHaveBeenCalledWith('ou_sender', 'i18n-bd', 'tok-1');
           const text = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
           expect(text).toContain('授权已保存');
           if (enabled) {
@@ -6141,10 +6115,10 @@ describe('handleCommand', () => {
       // Not an error: they just have not clicked yet. Reporting a failure would
       // send them off to start over for no reason.
       it('says pending, not failed, when the person has not authorized yet', async () => {
-        vi.mocked(pendingBytedcliChallenge).mockReturnValue('tok-1');
+        vi.mocked(pendingBytedcliChallenge).mockImplementation((_openId, site) => site === 'i18n-bd' ? 'tok-1' : null);
         vi.mocked(completeBytedcliLogin).mockResolvedValue({ state: 'pending' });
         const deps = makeDeps(makeDaemonSession());
-        await handleCommand('/login', ROOT_ID, makeLarkMessage('/login bytedcli done'), deps, LARK_APP_ID);
+        await handleCommand('/login', ROOT_ID, makeLarkMessage('/login bytedcli i18n-bd done'), deps, LARK_APP_ID);
 
         const text = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
         expect(text).toContain('还没检测到授权完成');
@@ -6153,7 +6127,7 @@ describe('handleCommand', () => {
       it('tells them to start one when done arrives with no challenge', async () => {
         vi.mocked(pendingBytedcliChallenge).mockReturnValue(null);
         const deps = makeDeps(makeDaemonSession());
-        await handleCommand('/login', ROOT_ID, makeLarkMessage('/login bytedcli done'), deps, LARK_APP_ID);
+        await handleCommand('/login', ROOT_ID, makeLarkMessage('/login bytedcli i18n-bd done'), deps, LARK_APP_ID);
 
         expect(completeBytedcliLogin).not.toHaveBeenCalled();
         expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1]).toContain('/login bytedcli');
@@ -6162,11 +6136,11 @@ describe('handleCommand', () => {
       // The challenge is keyed by the person who started it, so one person's
       // `done` can never complete somebody else's login.
       it('resumes the challenge belonging to the sender', async () => {
-        vi.mocked(pendingBytedcliChallenge).mockReturnValue('tok-1');
+        vi.mocked(pendingBytedcliChallenge).mockImplementation((_openId, site) => site === 'i18n-bd' ? 'tok-1' : null);
         const deps = makeDeps(makeDaemonSession());
-        await handleCommand('/login', ROOT_ID, makeLarkMessage('/login bytedcli done'), deps, LARK_APP_ID);
+        await handleCommand('/login', ROOT_ID, makeLarkMessage('/login bytedcli i18n-bd done'), deps, LARK_APP_ID);
 
-        expect(pendingBytedcliChallenge).toHaveBeenCalledWith('ou_sender');
+        expect(pendingBytedcliChallenge).toHaveBeenCalledWith('ou_sender', 'i18n-bd');
       });
     });
 
@@ -6176,17 +6150,17 @@ describe('handleCommand', () => {
       it('completes a pending bytedcli login while reporting lark already authorized', async () => {
         vi.mocked(pendingLarkCliChallenge).mockReturnValue(null);
         vi.mocked(hasLarkCliHome).mockReturnValue(true);
-        vi.mocked(pendingBytedcliChallenge).mockReturnValue('tok-1');
+        vi.mocked(pendingBytedcliChallenge).mockImplementation((_openId, site) => site === 'i18n-bd' ? 'tok-1' : null);
         vi.mocked(completeBytedcliLogin).mockResolvedValue({ state: 'authorized' });
         try {
           const deps = makeDeps(makeDaemonSession());
           await handleCommand('/login', ROOT_ID, makeLarkMessage('/login done'), deps, LARK_APP_ID);
 
           expect(completeLarkCliLogin).not.toHaveBeenCalled();
-          expect(completeBytedcliLogin).toHaveBeenCalledWith('ou_sender', 'tok-1');
+          expect(completeBytedcliLogin).toHaveBeenCalledWith('ou_sender', 'i18n-bd', 'tok-1');
           const text = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
           expect(text).toContain(t('cmd.login.lark_status_yes', undefined, 'zh'));
-          expect(text).toContain(t('cmd.login.bytedcli_ok', undefined, 'zh'));
+          expect(text).toContain(t('cmd.login.bytedcli_ok', { site: 'i18n-bd' }, 'zh'));
         } finally {
           vi.mocked(pendingLarkCliChallenge).mockReturnValue(null);
           vi.mocked(hasLarkCliHome).mockReturnValue(false);
@@ -6200,17 +6174,17 @@ describe('handleCommand', () => {
           deviceCode: 'dc-1', authUrl: 'https://lark/x', scopes: [], createdAt: Date.now(),
         });
         vi.mocked(completeLarkCliLogin).mockResolvedValue({ state: 'authorized' });
-        vi.mocked(pendingBytedcliChallenge).mockReturnValue('tok-1');
+        vi.mocked(pendingBytedcliChallenge).mockImplementation((_openId, site) => site === 'i18n-bd' ? 'tok-1' : null);
         vi.mocked(completeBytedcliLogin).mockResolvedValue({ state: 'authorized' });
         try {
           const deps = makeDeps(makeDaemonSession());
           await handleCommand('/login', ROOT_ID, makeLarkMessage('/login done'), deps, LARK_APP_ID);
 
           expect(completeLarkCliLogin).toHaveBeenCalledWith('ou_sender');
-          expect(completeBytedcliLogin).toHaveBeenCalledWith('ou_sender', 'tok-1');
+          expect(completeBytedcliLogin).toHaveBeenCalledWith('ou_sender', 'i18n-bd', 'tok-1');
           const text = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
           expect(text).toContain(t('cmd.login.lark_ok', undefined, 'zh'));
-          expect(text).toContain(t('cmd.login.bytedcli_ok', undefined, 'zh'));
+          expect(text).toContain(t('cmd.login.bytedcli_ok', { site: 'i18n-bd' }, 'zh'));
         } finally {
           vi.mocked(pendingLarkCliChallenge).mockReturnValue(null);
           vi.mocked(completeLarkCliLogin).mockResolvedValue({ state: 'failed', detail: 'no active login — please start again' });
@@ -6219,9 +6193,8 @@ describe('handleCommand', () => {
         }
       });
 
-      it('reports both sides already authorized with no pending challenge', async () => {
+      it('reports lark status without guessing a ByteCloud site when no challenge is pending', async () => {
         vi.mocked(hasLarkCliHome).mockReturnValue(true);
-        vi.mocked(hasBytedcliHome).mockResolvedValue(true);
         try {
           const deps = makeDeps(makeDaemonSession());
           await handleCommand('/login', ROOT_ID, makeLarkMessage('/login done'), deps, LARK_APP_ID);
@@ -6230,10 +6203,9 @@ describe('handleCommand', () => {
           expect(completeBytedcliLogin).not.toHaveBeenCalled();
           const text = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
           expect(text).toContain(t('cmd.login.lark_status_yes', undefined, 'zh'));
-          expect(text).toContain(t('cmd.login.bytedcli_status_yes', undefined, 'zh'));
+          expect(text).not.toContain('ByteCloud（bytedcli，站点');
         } finally {
           vi.mocked(hasLarkCliHome).mockReturnValue(false);
-          vi.mocked(hasBytedcliHome).mockResolvedValue(false);
         }
       });
 

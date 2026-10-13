@@ -4045,10 +4045,10 @@ async function refreshTurnCliIdentity(ds: DaemonSession, turnId: string): Promis
   // refused) it stayed silent.
   //
   // The refusal already carries this. The wrapper prints, on stderr, which tool
-  // was refused and how to authorize it — including a direct ByteCloud login
-  // link when bytedcli can start one automatically — at the moment of the
-  // refusal, for that tool only. That is strictly better information than a
-  // pre-turn guess, so the chat notice stays absent.
+  // was refused and how to authorize it. ByteCloud instructions require the
+  // command's explicit site instead of guessing CN before the tool is called.
+  // This is better information than a pre-turn guess, so the chat notice stays
+  // absent.
 }
 
 /** Freeze the source independently of a later destination or live turn.

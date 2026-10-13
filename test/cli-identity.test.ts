@@ -996,6 +996,91 @@ printf %s "$?"
     expect(existsSync(marker)).toBe(false);
   });
 
+  it('refuses a bytedcli site whose turn JWT is missing and names the exact login command', () => {
+    const marker = join(dir, 'real-ran');
+    const bin = join(dir, 'bytedcli-real');
+    writeFileSync(bin, `#!/bin/sh\nprintf ran > ${JSON.stringify(marker)}\n`, { mode: 0o755 });
+    const wrapper = join(dir, 'bytedcli-wrapper');
+    writeFileSync(wrapper, renderIdentityWrapper('bytedcli', bin), { mode: 0o755 });
+    writeSessionIdentity(dir, SESSION, {
+      tool: 'bytedcli', cloudJwts: { cn: 'alice-cn' }, turnId: 'turn-a',
+    });
+    publishActiveTurn(dir, SESSION, 'turn-a');
+
+    expect(() => execFileSync(wrapper, ['--site=i18n-bd', 'auth', 'status'], {
+      encoding: 'utf8',
+      env: {
+        PATH: '/usr/bin:/bin', TMPDIR: dir,
+        SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION,
+      },
+    })).toThrow(/\/login bytedcli i18n-bd/);
+    expect(existsSync(marker)).toBe(false);
+  });
+
+  it('normalizes a bytedcli site alias to its injected credential partition', () => {
+    const bin = join(dir, 'bytedcli-real');
+    writeFileSync(bin, '#!/bin/sh\nprintf %s "$BYTECLOUD_CLI_API_JWT_TOKEN_I18N_BD"\n', { mode: 0o755 });
+    const wrapper = join(dir, 'bytedcli-wrapper');
+    writeFileSync(wrapper, renderIdentityWrapper('bytedcli', bin), { mode: 0o755 });
+    writeSessionIdentity(dir, SESSION, {
+      tool: 'bytedcli', cloudJwts: { 'i18n-bd': 'alice-bd' }, turnId: 'turn-a',
+    });
+    publishActiveTurn(dir, SESSION, 'turn-a');
+
+    expect(execFileSync(wrapper, ['--site', 'i18n', 'auth', 'status'], {
+      encoding: 'utf8',
+      env: {
+        PATH: '/usr/bin:/bin', TMPDIR: dir,
+        SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION,
+      },
+    })).toBe('alice-bd');
+  });
+
+  it('applies the same site-specific refusal to larkdev control planes', () => {
+    const marker = join(dir, 'real-ran');
+    const bin = join(dir, 'larkdev-real');
+    writeFileSync(bin, `#!/bin/sh\nprintf ran > ${JSON.stringify(marker)}\n`, { mode: 0o755 });
+    const wrapper = join(dir, 'larkdev-wrapper');
+    writeFileSync(wrapper, renderIdentityWrapper('larkdev', bin), { mode: 0o755 });
+    writeSessionIdentity(dir, SESSION, {
+      tool: 'larkdev', cloudJwts: { cn: 'alice-cn' }, turnId: 'turn-a',
+    });
+    publishActiveTurn(dir, SESSION, 'turn-a');
+
+    expect(() => execFileSync(wrapper, ['auth', 'status', '--control-plane', 'I18N_BD'], {
+      encoding: 'utf8',
+      env: {
+        PATH: '/usr/bin:/bin', TMPDIR: dir,
+        SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION,
+      },
+    })).toThrow(/\/login bytedcli i18n-bd/);
+    expect(existsSync(marker)).toBe(false);
+  });
+
+  it.each([
+    ['--control-plane', /control plane 参数缺少值/],
+    ['--plane=UNKNOWN', /不支持为 larkdev control plane UNKNOWN/],
+  ])('refuses an unusable larkdev control-plane selector: %s', (selector, expected) => {
+    const marker = join(dir, 'real-ran');
+    const bin = join(dir, 'larkdev-real');
+    writeFileSync(bin, `#!/bin/sh\nprintf ran > ${JSON.stringify(marker)}\n`, { mode: 0o755 });
+    const wrapper = join(dir, 'larkdev-wrapper');
+    writeFileSync(wrapper, renderIdentityWrapper('larkdev', bin), { mode: 0o755 });
+    writeSessionIdentity(dir, SESSION, {
+      tool: 'larkdev', cloudJwts: { cn: 'alice-cn' }, turnId: 'turn-a',
+    });
+    publishActiveTurn(dir, SESSION, 'turn-a');
+
+    expect(() => execFileSync(wrapper, [selector], {
+      encoding: 'utf8',
+      env: {
+        PATH: '/usr/bin:/bin', TMPDIR: dir,
+        SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION,
+      },
+    })).toThrow(expected);
+    expect(existsSync(marker)).toBe(false);
+  });
+
   it('runs larkdev with only this turn JWTs and a fresh auth directory', () => {
     const bin = join(dir, 'larkdev-real');
     writeFileSync(bin, `#!/bin/sh

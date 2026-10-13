@@ -26,6 +26,7 @@ if [ -n "$BOTMUX_IDENTITY_BIN$BOTMUX_SESSION_ID$BYTEDCLI_USER_CLOUD_JWT$AIME_USE
 fi
 [ "$BYTECLOUD_AUTH_AS" = user ] || exit 78
 case "$HOME" in */bytedcli-home/ou_alice|*/bytedcli-home/ou_bob) ;; *) exit 79 ;; esac
+if [ "$1" = --site ]; then shift 2; fi
 printf '%s\\n' "$2" >> "$HOME/provider-calls"
 case "$2" in
   login) printf '%s\\n' '{"status":"success","data":{"verification_uri_complete":"https://example.test/login","complete_token":"challenge"}}' ;;
@@ -66,11 +67,11 @@ esac
     expect(findRealToolBinary('bytedcli', process.env.PATH)).toBe(real);
     vi.resetModules();
     const provider = await import('../src/services/bytedcli-auth.js');
-    expect((await provider.beginBytedcliLogin('ou_alice'))?.completeToken).toBe('challenge');
+    expect((await provider.beginBytedcliLogin('ou_alice', 'i18n-bd'))?.completeToken).toBe('challenge');
     // The test exercises the real spawn, wrapper lookup, HOME and provider API.
-    expect(await provider.hasBytedcliHome('ou_alice')).toBe(true);
-    await provider.beginBytedcliLogin('ou_bob');
-    expect(await provider.hasBytedcliHome('ou_bob')).toBe(false);
+    expect(await provider.hasBytedcliHome('ou_alice', 'i18n-bd')).toBe(true);
+    await provider.beginBytedcliLogin('ou_bob', 'us-ttp');
+    expect(await provider.hasBytedcliHome('ou_bob', 'us-ttp')).toBe(false);
     expect(readFileSync(join(provider.bytedcliHomeFor('ou_alice'), 'provider-calls'), 'utf8')).toBe('login\nstatus\n');
     expect(process.env.BOTMUX_IDENTITY_BIN).toBe(wrappers);
   });

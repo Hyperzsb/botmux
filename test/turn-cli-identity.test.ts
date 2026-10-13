@@ -256,10 +256,13 @@ describe('publishTurnCliIdentity — withholding removes, never inherits', () =>
     // authorize the other provider and hit this same refusal again.
     expect(body).toContain('ByteCloud');
     expect(body).not.toContain('飞书');
-    expect(body).toContain('https://cloud.example.com/auth?state=auto');
-    // Friendly one-time framing: it names the tool/provider and says authorize once.
+    // ByteCloud login cannot be started safely until the caller supplies the
+    // concrete credential site; the refusal therefore gives the site-aware
+    // command instead of minting a default-CN link.
+    expect(body).not.toContain('https://cloud.example.com/auth?state=auto');
     expect(body).toContain('bytedcli');
-    expect(body).toMatch(/只需授权这一次|authorize just once/i);
+    expect(body).toContain('/login bytedcli <site>');
+    expect(body).toContain('/login status <site>');
     // Someone refused for lack of authorization usually has no stored name, so
     // the nameless path is the common one — it must read as a sentence, not
     // print a raw open_id back at the person.
@@ -316,7 +319,7 @@ describe('publishTurnCliIdentity — withholding removes, never inherits', () =>
     const denied = readFileSync(path, 'utf8');
     expect(denied).not.toContain('alice-cn');
     expect(denied).toContain('ByteCloud');
-    expect(denied).toContain('https://cloud.example.com/auth?state=auto');
+    expect(denied).toContain('/login bytedcli <site>');
   });
 });
 

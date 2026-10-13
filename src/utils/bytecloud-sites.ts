@@ -21,3 +21,29 @@ export type ByteCloudUserSite = keyof typeof BYTECLOUD_USER_JWT_ENV_BY_SITE;
 export const BYTECLOUD_USER_SITES = Object.freeze(
   Object.keys(BYTECLOUD_USER_JWT_ENV_BY_SITE) as ByteCloudUserSite[],
 );
+
+/**
+ * Every public spelling accepted by bytedcli that maps to one credential
+ * partition. Login/status commands preserve the selected control plane by
+ * normalizing aliases here instead of silently falling back to CN.
+ */
+export const BYTECLOUD_USER_SITE_ALIASES: Readonly<Record<string, ByteCloudUserSite>> = Object.freeze({
+  cn: 'cn',
+  boe: 'cn',
+  i18n: 'i18n-bd',
+  'i18n-bd': 'i18n-bd',
+  'i18n-tt': 'i18n-tt',
+  'eu-ttp': 'eu-ttp',
+  'eu-ttp-limited': 'eu-ttp',
+  'eu-ttp-full': 'eu-ttp',
+  'us-ttp': 'us-ttp',
+  'us-ttp-bdee': 'us-ttp',
+  'us-ttp-usts': 'us-ttp',
+});
+
+export function normalizeByteCloudUserSite(value: string | undefined): ByteCloudUserSite | null {
+  if (!value) return null;
+  return BYTECLOUD_USER_SITE_ALIASES[value.trim().toLowerCase()] ?? null;
+}
+
+export const BYTECLOUD_USER_SITE_USAGE = BYTECLOUD_USER_SITES.join('|');

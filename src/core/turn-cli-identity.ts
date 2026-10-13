@@ -18,7 +18,6 @@ import { t } from '../i18n/index.js';
 import type { Locale } from '../i18n/index.js';
 import { normalizeBrand } from '../im/lark/lark-hosts.js';
 import {
-  beginBytedcliLogin,
   mintByteCloudUserJwts,
 } from '../services/bytedcli-auth.js';
 import {
@@ -262,19 +261,14 @@ async function withholdIdentity(
   locale: Locale | undefined,
   turnId: string | undefined,
 ): Promise<ToolIdentityOutcome> {
-  // Pre-fetch a ready, valid authorization link for either tool so the moment a
-  // governed command is actually refused, the agent has a link to relay instead
-  // of asking the person to type a command. Beginning only mints a link and
-  // messages nobody, so non-CLI turns are not disturbed. Uses a fresh, still
-  // unexpired challenge when one exists.
+  // Pre-fetch a ready lark-cli authorization link so the moment that tool is
+  // refused, the agent has a link to relay instead of asking the person to type
+  // a command. ByteCloud cannot do this safely: the turn has not selected a
+  // site yet, so its refusal names the explicit site-bearing login command.
   let login: LarkCliLoginChallenge | undefined;
   if (senderOpenId) {
     try {
-      if (isByteCloudTool(tool)) {
-        const started = await beginBytedcliLogin(senderOpenId);
-        if (!started?.authUrl) throw new Error('bytedcli login provider unavailable');
-        login = { authUrl: started.authUrl, stage: 'user-login' };
-      } else {
+      if (!isByteCloudTool(tool)) {
         const brand = normalizeBrand(botConfig.brand);
         login = await (brand === 'lark'
           ? beginLarkCliLogin(senderOpenId, [], brand)
@@ -366,10 +360,16 @@ function writeDenial(
             ]
           : [t(
               'trigger_user_auth.denied_howto',
-              { command: isByteCloudTool(tool) ? '/login bytedcli' : '/login' },
+              { command: isByteCloudTool(tool) ? '/login bytedcli <site>' : '/login' },
               locale,
             ),
-            t('trigger_user_auth.denied_howto_status', undefined, locale)]),
+            t(
+              isByteCloudTool(tool)
+                ? 'trigger_user_auth.denied_howto_status_bytedcli'
+                : 'trigger_user_auth.denied_howto_status',
+              undefined,
+              locale,
+            )]),
       ].join('\n'),
     });
   } catch (e) {

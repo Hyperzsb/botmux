@@ -12,6 +12,12 @@ import { buildTerminalUrl } from './terminal-url.js';
 import { getBot, getAllBots, getBotOpenId, getOwnerOpenId, findOncallChat, effectiveDefaultWorkingDir, loadBotConfigs, type BotConfig } from '../bot-registry.js';
 import { triggerUserAuthApplies } from '../services/trigger-user-auth.js';
 import { beginBytedcliLogin, completeBytedcliLogin, pendingBytedcliChallenge, hasBytedcliHome } from '../services/bytedcli-auth.js';
+import {
+  BYTECLOUD_USER_SITES,
+  BYTECLOUD_USER_SITE_USAGE,
+  normalizeByteCloudUserSite,
+  type ByteCloudUserSite,
+} from '../utils/bytecloud-sites.js';
 import { beginLarkCliLogin, completeLarkCliLogin, pendingLarkCliChallenge, hasLarkCliHome } from '../services/lark-cli-auth.js';
 import { isKnownLarkUserScope } from '../utils/lark-scope-catalog.js';
 import { readGlobalConfig, repoPickerScanOptions, isWorkflowFeatureEnabled } from '../global-config.js';
@@ -1163,11 +1169,11 @@ async function applyAllowedUsersSet(
   await reply(t('cmd.config.allow_ok', { count: r.resolved.length, total: r.raw.length }, loc));
 }
 
-function bytedcliLoginSuccessReply(botConfig: BotConfig, locale: Locale): string {
+function bytedcliLoginSuccessReply(botConfig: BotConfig, locale: Locale, site: ByteCloudUserSite): string {
   const policy = botConfig.triggerUserAuth;
   const enabled = triggerUserAuthApplies(policy, 'bytedcli');
   const lines = [
-    t('cmd.login.bytedcli_ok', undefined, locale),
+    t('cmd.login.bytedcli_ok', { site }, locale),
     t(enabled ? 'cmd.login.bytedcli_enabled' : 'cmd.login.bytedcli_configure', undefined, locale),
   ];
   if (enabled && policy?.gitHost) {
@@ -1228,9 +1234,12 @@ function loginPromptLines(
   ];
 }
 
-async function bytedcliLoginStatus(openId: string | undefined): Promise<'authorized' | 'unauthorized' | 'unavailable'> {
+async function bytedcliLoginStatus(
+  openId: string | undefined,
+  site: ByteCloudUserSite,
+): Promise<'authorized' | 'unauthorized' | 'unavailable'> {
   if (!openId) return 'unauthorized';
-  try { return await hasBytedcliHome(openId) ? 'authorized' : 'unauthorized'; }
+  try { return await hasBytedcliHome(openId, site) ? 'authorized' : 'unauthorized'; }
   catch { return 'unavailable'; }
 }
 
@@ -1254,7 +1263,6 @@ async function triggerUserAuthStatusLines(
   // the sender-keyed HOME created from scratch counts as lark-cli authorization.
   const larkAuthorized = senderOpenId !== undefined && hasLarkCliHome(senderOpenId);
 
-  const bytedStatus = policy.tools.includes('bytedcli') ? await bytedcliLoginStatus(senderOpenId) : undefined;
   const lines = ['Trigger-user auth: 已开启'];
   for (const tool of policy.tools) {
     lines.push(`  ${tool}: ${
@@ -1271,11 +1279,7 @@ async function triggerUserAuthStatusLines(
         // authorized for one and refused by the other. There is no bot identity
         // to degrade to here either; the mint path tries the existing HOME even
         // while a fresh challenge is pending; ask the provider for the current status.
-        : bytedStatus === 'unavailable'
-          ? '授权服务暂时不可用，已有授权会保留；服务恢复后重试，无需重新授权'
-          : bytedStatus === 'authorized'
-          ? '以你自己的身份调用'
-          : '你未授权 —— 首次调用被拒时会自动返回登录链接'
+        : `按站点使用你的 ByteCloud 身份；发 /login status <site> 检查具体站点（${BYTECLOUD_USER_SITE_USAGE}）`
     }`);
   }
   return lines;
@@ -3630,7 +3634,9 @@ export async function handleCommand(
         }
         // 授权归属到「发起这条 /login 的人」。每个人的 lark-cli HOME 独立。
         const loginOpenId = message.senderId;
-        if (subCmd === 'status' || subCmd === '状态') {
+        if (/^(?:status|状态)(?:\s|$)/i.test(subCmd)) {
+          const siteInput = subCmd.split(/\s+/)[1];
+          const site = normalizeByteCloudUserSite(siteInput);
           // Per-person status lines, only for governed tools.
           const lines: string[] = [];
           if (loginOpenId && triggerUserAuthApplies(botCfg2.triggerUserAuth, 'lark-cli')) {
@@ -3638,14 +3644,18 @@ export async function handleCommand(
           }
           // ByteCloud 是另一个身份提供方，飞书授权了不代表这边也授权了。
           if (loginOpenId && triggerUserAuthApplies(botCfg2.triggerUserAuth, 'bytedcli')) {
-            const status = await bytedcliLoginStatus(loginOpenId);
-            lines.push(t(
-              status === 'unavailable' ? 'cmd.login.bytedcli_unavailable'
-                : status === 'authorized' ? 'cmd.login.bytedcli_status_yes'
-                  : 'cmd.login.bytedcli_status_no',
-              undefined,
-              loc,
-            ));
+            if (!site || subCmd.split(/\s+/).length !== 2) {
+              lines.push(t('cmd.login.bytedcli_usage', { sites: BYTECLOUD_USER_SITE_USAGE }, loc));
+            } else {
+              const status = await bytedcliLoginStatus(loginOpenId, site);
+              lines.push(t(
+                status === 'unavailable' ? 'cmd.login.bytedcli_unavailable'
+                  : status === 'authorized' ? 'cmd.login.bytedcli_status_yes'
+                    : 'cmd.login.bytedcli_status_no',
+                { site },
+                loc,
+              ));
+            }
           }
           // Legacy bot-app OAuth status when lark-cli is not governed by the
           // per-person device-code flow.
@@ -3672,20 +3682,17 @@ export async function handleCommand(
           } else if (hasLarkCliHome(loginOpenId)) {
             doneLines.push(t('cmd.login.lark_status_yes', undefined, loc));
           }
-          const bytedPending = pendingBytedcliChallenge(loginOpenId);
-          if (bytedPending) {
-            const { state, detail } = await completeBytedcliLogin(loginOpenId, bytedPending);
+          for (const site of BYTECLOUD_USER_SITES) {
+            const bytedPending = pendingBytedcliChallenge(loginOpenId, site);
+            if (!bytedPending) continue;
+            const { state, detail } = await completeBytedcliLogin(loginOpenId, site, bytedPending);
             doneLines.push(state === 'authorized'
-              ? bytedcliLoginSuccessReply(botCfg2, loc)
+              ? bytedcliLoginSuccessReply(botCfg2, loc, site)
               : state === 'pending'
-                ? t('cmd.login.bytedcli_pending', undefined, loc)
+                ? t('cmd.login.bytedcli_pending', { site }, loc)
                 : state === 'unavailable'
-                  ? t('cmd.login.bytedcli_unavailable', undefined, loc)
-                  : t('cmd.login.bytedcli_failed', { detail: detail ?? 'unknown' }, loc));
-          } else {
-            const status = await bytedcliLoginStatus(loginOpenId);
-            if (status === 'authorized') doneLines.push(t('cmd.login.bytedcli_status_yes', undefined, loc));
-            else if (status === 'unavailable') doneLines.push(t('cmd.login.bytedcli_unavailable', undefined, loc));
+                  ? t('cmd.login.bytedcli_unavailable', { site }, loc)
+                  : t('cmd.login.bytedcli_failed', { site, detail: detail ?? 'unknown' }, loc));
           }
           if (!doneLines.length) doneLines.push(t('cmd.login.no_challenge', undefined, loc));
           await sessionReply(rootId, doneLines.join('\n'));
@@ -3781,44 +3788,61 @@ export async function handleCommand(
           break;
         }
 
-        // `/login bytedcli` —— ByteCloud SSO 授权。跟飞书 OAuth 是两个身份提供方，
+        // `/login bytedcli <site>` —— ByteCloud SSO 授权。跟飞书 OAuth 是两个身份提供方，
         // 换不过来，所以必须各授权一次；这条命令只管 ByteCloud 那一半。
         //
         // 分两步而不是一步等：设备码流程要人去点链接，阻塞等待会把会话卡住，所以
         // `--begin` 拿链接先回，人点完再发 `done` 收尾。
         if (subCmd === 'bytedcli' || subCmd.startsWith('bytedcli ')) {
           if (!loginOpenId) { await sessionReply(rootId, t('cmd.login.no_credentials', undefined, loc)); break; }
-          const done = subCmd.slice('bytedcli'.length).trim();
-          if (done === 'done' || done === '完成') {
-            const challenge = pendingBytedcliChallenge(loginOpenId);
-            if (!challenge) {
-              await sessionReply(rootId, t('cmd.login.bytedcli_no_challenge', undefined, loc));
-              break;
-            }
-            const { state, detail } = await completeBytedcliLogin(loginOpenId, challenge);
-            await sessionReply(rootId, state === 'authorized'
-              ? bytedcliLoginSuccessReply(botCfg2, loc)
-              : state === 'pending'
-                ? t('cmd.login.bytedcli_pending', undefined, loc)
-                : state === 'unavailable'
-                  ? t('cmd.login.bytedcli_unavailable', undefined, loc)
-                  : t('cmd.login.bytedcli_failed', { detail: detail ?? 'unknown' }, loc));
+          const parts = subCmd.slice('bytedcli'.length).trim().split(/\s+/).filter(Boolean);
+          const site = normalizeByteCloudUserSite(parts[0]);
+          const action = parts[1]?.toLowerCase();
+          if (!site || parts.length > 2 || (action && !['done', '完成', 'status', '状态'].includes(action))) {
+            await sessionReply(rootId, t('cmd.login.bytedcli_usage', { sites: BYTECLOUD_USER_SITE_USAGE }, loc));
             break;
           }
-          const started = await beginBytedcliLogin(loginOpenId);
+          if (action === 'status' || action === '状态') {
+            const status = await bytedcliLoginStatus(loginOpenId, site);
+            await sessionReply(rootId, t(
+              status === 'unavailable' ? 'cmd.login.bytedcli_unavailable'
+                : status === 'authorized' ? 'cmd.login.bytedcli_status_yes'
+                  : 'cmd.login.bytedcli_status_no',
+              { site },
+              loc,
+            ));
+            break;
+          }
+          if (action === 'done' || action === '完成') {
+            const challenge = pendingBytedcliChallenge(loginOpenId, site);
+            if (!challenge) {
+              await sessionReply(rootId, t('cmd.login.bytedcli_no_challenge', { site }, loc));
+              break;
+            }
+            const { state, detail } = await completeBytedcliLogin(loginOpenId, site, challenge);
+            await sessionReply(rootId, state === 'authorized'
+              ? bytedcliLoginSuccessReply(botCfg2, loc, site)
+              : state === 'pending'
+                ? t('cmd.login.bytedcli_pending', { site }, loc)
+                : state === 'unavailable'
+                  ? t('cmd.login.bytedcli_unavailable', { site }, loc)
+                  : t('cmd.login.bytedcli_failed', { site, detail: detail ?? 'unknown' }, loc));
+            break;
+          }
+          const started = await beginBytedcliLogin(loginOpenId, site);
           if (!started) {
-            await sessionReply(rootId, t('cmd.login.bytedcli_begin_failed', { detail: 'bytedcli auth login --begin' }, loc));
+            await sessionReply(rootId, t('cmd.login.bytedcli_begin_failed', { site, detail: `bytedcli --site ${site} auth login --begin` }, loc));
             break;
           }
           await sessionReply(rootId, [
-            t('cmd.login.bytedcli_title', undefined, loc),
+            t('cmd.login.bytedcli_title', { site }, loc),
             '',
             t('cmd.login.bytedcli_step1', undefined, loc),
             started.authUrl,
             '',
-            t('cmd.login.bytedcli_step2', undefined, loc),
+            t('cmd.login.bytedcli_step2', { site }, loc),
             '',
-            t('cmd.login.bytedcli_note', undefined, loc),
+            t('cmd.login.bytedcli_note', { site }, loc),
           ].join('\n'));
           break;
         }

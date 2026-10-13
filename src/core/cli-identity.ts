@@ -534,6 +534,80 @@ const DYNAMIC_BYTECLOUD_IDENTITY_SCRUB = [
 export function renderIdentityWrapper(tool: TriggerUserAuthTool, realBinaryPath: string): string {
   const exportKeys = IDENTITY_ENV_KEYS[tool].join(' ');
   const dynamicByteCloudScrub = tool === 'lark-cli' ? [] : DYNAMIC_BYTECLOUD_IDENTITY_SCRUB;
+  const bytedcliSiteGuard = tool === 'bytedcli'
+    ? [
+        '    __botmux_site=cn',
+        '    __botmux_site_next=',
+        '    for __botmux_site_arg in "$@"; do',
+        '      if [ -n "$__botmux_site_next" ]; then',
+        '        __botmux_site="$__botmux_site_arg"',
+        '        __botmux_site_next=',
+        '        continue',
+        '      fi',
+        '      case "$__botmux_site_arg" in',
+        '        --site) __botmux_site_next=1 ;;',
+        '        --site=*) __botmux_site="${__botmux_site_arg#--site=}" ;;',
+        '      esac',
+        '    done',
+        '    if [ -n "$__botmux_site_next" ]; then',
+        `      printf '%s\n' 'botmux: bytedcli 的 --site 缺少值，命令未执行。' >&2`,
+        `      exit ${IDENTITY_DENIED_EXIT_CODE}`,
+        '    fi',
+        '    case "$__botmux_site" in',
+        '      cn|boe) __botmux_site=cn; __botmux_site_jwt="$BYTECLOUD_CLI_API_JWT_TOKEN_CN" ;;',
+        '      i18n|i18n-bd) __botmux_site=i18n-bd; __botmux_site_jwt="$BYTECLOUD_CLI_API_JWT_TOKEN_I18N_BD" ;;',
+        '      i18n-tt) __botmux_site=i18n-tt; __botmux_site_jwt="$BYTECLOUD_CLI_API_JWT_TOKEN_I18N_TT" ;;',
+        '      eu-ttp|eu-ttp-limited|eu-ttp-full) __botmux_site=eu-ttp; __botmux_site_jwt="$BYTECLOUD_CLI_API_JWT_TOKEN_EU_TTP" ;;',
+        '      us-ttp|us-ttp-bdee|us-ttp-usts) __botmux_site=us-ttp; __botmux_site_jwt="$BYTECLOUD_CLI_API_JWT_TOKEN_US_TTP" ;;',
+        '      *)',
+        `        printf '%s\n' "botmux: 不支持为 bytedcli 站点 $__botmux_site 注入按人身份；命令未执行。支持：cn|i18n-bd|i18n-tt|eu-ttp|us-ttp。" >&2`,
+        `        exit ${IDENTITY_DENIED_EXIT_CODE}`,
+        '        ;;',
+        '    esac',
+        '    if [ -z "$__botmux_site_jwt" ]; then',
+        `      printf '%s\n' "botmux: 当前消息发起人没有站点 $__botmux_site 的 ByteCloud 凭证，命令未执行。请发送 /login bytedcli $__botmux_site 完成授权后重试。" >&2`,
+        `      exit ${IDENTITY_DENIED_EXIT_CODE}`,
+        '    fi',
+        '    unset __botmux_site_arg __botmux_site_next __botmux_site_jwt __botmux_site',
+      ]
+    : [];
+  const larkdevSiteGuard = tool === 'larkdev'
+    ? [
+        '    __botmux_site=cn',
+        '    __botmux_site_next=',
+        '    for __botmux_site_arg in "$@"; do',
+        '      if [ -n "$__botmux_site_next" ]; then',
+        '        __botmux_site="$__botmux_site_arg"',
+        '        __botmux_site_next=',
+        '        continue',
+        '      fi',
+        '      case "$__botmux_site_arg" in',
+        '        --control-plane|--plane) __botmux_site_next=1 ;;',
+        '        --control-plane=*|--plane=*) __botmux_site="${__botmux_site_arg#*=}" ;;',
+        '      esac',
+        '    done',
+        '    if [ -n "$__botmux_site_next" ]; then',
+        `      printf '%s\n' 'botmux: larkdev 的 control plane 参数缺少值，命令未执行。' >&2`,
+        `      exit ${IDENTITY_DENIED_EXIT_CODE}`,
+        '    fi',
+        '    case "$__botmux_site" in',
+        '      cn|CN|boe|BOE) __botmux_site=cn; __botmux_site_jwt="$BYTECLOUD_CLI_API_JWT_TOKEN_CN" ;;',
+        '      i18n|I18N|i18n-bd|I18N_BD) __botmux_site=i18n-bd; __botmux_site_jwt="$BYTECLOUD_CLI_API_JWT_TOKEN_I18N_BD" ;;',
+        '      i18n-tt|I18N_TT) __botmux_site=i18n-tt; __botmux_site_jwt="$BYTECLOUD_CLI_API_JWT_TOKEN_I18N_TT" ;;',
+        '      eu-ttp|EU_TTP) __botmux_site=eu-ttp; __botmux_site_jwt="$BYTECLOUD_CLI_API_JWT_TOKEN_EU_TTP" ;;',
+        '      us-ttp|US_TTP) __botmux_site=us-ttp; __botmux_site_jwt="$BYTECLOUD_CLI_API_JWT_TOKEN_US_TTP" ;;',
+        '      *)',
+        `        printf '%s\n' "botmux: 不支持为 larkdev control plane $__botmux_site 注入按人身份；命令未执行。支持：CN|BOE|I18N_BD|I18N_TT|EU_TTP|US_TTP。" >&2`,
+        `        exit ${IDENTITY_DENIED_EXIT_CODE}`,
+        '        ;;',
+        '    esac',
+        '    if [ -z "$__botmux_site_jwt" ]; then',
+        `      printf '%s\n' "botmux: 当前消息发起人没有站点 $__botmux_site 的 ByteCloud 凭证，larkdev 命令未执行。请发送 /login bytedcli $__botmux_site 完成授权后重试。" >&2`,
+        `      exit ${IDENTITY_DENIED_EXIT_CODE}`,
+        '    fi',
+        '    unset __botmux_site_arg __botmux_site_next __botmux_site_jwt __botmux_site',
+      ]
+    : [];
   const legacyUserMode = tool === 'bytedcli'
     ? [
         `    printf '%s\\n' 'botmux: bytedcli 身份文件仍是旧格式，命令未执行。请重新发起当前操作。' >&2`,
@@ -629,6 +703,7 @@ export function renderIdentityWrapper(tool: TriggerUserAuthTool, realBinaryPath:
     '      esac',
     '    done',
     '    unset __botmux_arg',
+    ...bytedcliSiteGuard,
     // A single BYTEDCLI_USER_CLOUD_JWT is valid but bound to one region; when a
     // command selects another site bytedcli deliberately skips it. The SDK's
     // site-specific variables avoid that ambiguity. Run in a fresh HOME so an
@@ -696,6 +771,7 @@ export function renderIdentityWrapper(tool: TriggerUserAuthTool, realBinaryPath:
     '    exit "$__botmux_bytedcli_status"',
     '    ;;',
     '  larkdev-user)',
+    ...larkdevSiteGuard,
     // A fresh auth directory per invocation makes every non-injected site fail
     // closed instead of consulting ~/.larkdev/auth or state left by another
     // turn. Injected SDK JWTs are not persisted as login credentials.

@@ -26,9 +26,9 @@
  * it internally; a person is only interrupted when the 3-week login really ends.
  *
  * So: nothing in this module holds a credential. It holds a path, and shells
- * out to `bytedcli` with `HOME` set to it. When a governed call finds no usable
- * login, Botmux starts the device flow automatically; after the person opens
- * that link, the next retry completes the saved challenge before minting JWTs.
+ * out to `bytedcli` with `HOME` set to it. Login callers must name the intended
+ * site; after the person opens that site's device-flow link, the next retry can
+ * complete only that saved site challenge before minting its JWT.
  */
 import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
@@ -84,9 +84,9 @@ class BytedcliAuthUnavailableError extends Error {
   }
 }
 
-async function readLoginState(openId: string): Promise<boolean> {
+async function readLoginState(openId: string, site: ByteCloudUserSite): Promise<boolean> {
   if (!existsSync(bytedcliHomeFor(openId))) return false;
-  const result = await runAsUser(openId, ['auth', 'status', '--json']);
+  const result = await runAsUser(openId, ['--site', site, 'auth', 'status', '--json']);
   const envelope = parseEnvelope(result.stdout);
   const data = envelope?.data as Record<string, unknown> | undefined;
   if (!result.ok || envelope?.status !== 'success' || typeof data?.authenticated !== 'boolean') {
@@ -102,8 +102,8 @@ async function readLoginState(openId: string): Promise<boolean> {
   return data.authenticated;
 }
 
-export async function hasBytedcliHome(openId: string): Promise<boolean> {
-  return await readLoginState(openId);
+export async function hasBytedcliHome(openId: string, site: ByteCloudUserSite): Promise<boolean> {
+  return await readLoginState(openId, site);
 }
 
 /** Forget one person's bytedcli authorization entirely. */
@@ -198,36 +198,37 @@ function parseEnvelope(stdout: string): Record<string, unknown> | null {
  * belongs to means clearing one person's authorization clears their pending
  * login with it, and no lookup can hand it to anyone else.
  */
-function challengePath(openId: string): string {
-  return join(bytedcliHomeFor(openId), '.botmux-login-challenge');
+function challengePath(openId: string, site: ByteCloudUserSite): string {
+  return join(bytedcliHomeFor(openId), `.botmux-login-challenge.${site}`);
 }
 
 /** The resume token from this person's in-progress login, if it is still
  *  usable. ByteCloud gives the challenge about an hour; we expire slightly
  *  earlier so a token we hand back is not rejected the moment it is used. */
-function pendingBytedcliLogin(openId: string): BytedcliLoginChallenge | null {
+function pendingBytedcliLogin(openId: string, site: ByteCloudUserSite): BytedcliLoginChallenge | null {
   try {
-    const raw = JSON.parse(readFileSync(challengePath(openId), 'utf8')) as
-      { token?: unknown; authUrl?: unknown; createdAt?: unknown };
+    const raw = JSON.parse(readFileSync(challengePath(openId, site), 'utf8')) as
+      { token?: unknown; authUrl?: unknown; createdAt?: unknown; site?: unknown };
     if (typeof raw.token !== 'string' || !raw.token || typeof raw.createdAt !== 'number'
-      || !Number.isFinite(raw.createdAt) || raw.createdAt > Date.now()) return null;
+      || !Number.isFinite(raw.createdAt) || raw.createdAt > Date.now() || raw.site !== site) return null;
     if (Date.now() - raw.createdAt > CHALLENGE_TTL_MS) return null;
     return {
+      site,
       completeToken: raw.token,
       authUrl: typeof raw.authUrl === 'string' ? raw.authUrl : '',
     };
   } catch { return null; }
 }
 
-export function pendingBytedcliChallenge(openId: string): string | null {
-  return pendingBytedcliLogin(openId)?.completeToken ?? null;
+export function pendingBytedcliChallenge(openId: string, site: ByteCloudUserSite): string | null {
+  return pendingBytedcliLogin(openId, site)?.completeToken ?? null;
 }
 
-function saveChallenge(openId: string, token: string, authUrl: string): boolean {
+function saveChallenge(openId: string, site: ByteCloudUserSite, token: string, authUrl: string): boolean {
   try {
     atomicWriteFileSync(
-      challengePath(openId),
-      JSON.stringify({ token, authUrl, createdAt: Date.now() }),
+      challengePath(openId, site),
+      JSON.stringify({ site, token, authUrl, createdAt: Date.now() }),
       { mode: 0o600 },
     );
     return true;
@@ -238,11 +239,13 @@ function saveChallenge(openId: string, token: string, authUrl: string): boolean 
   }
 }
 
-function clearChallenge(openId: string): void {
-  try { rmSync(challengePath(openId), { force: true }); } catch { /* already gone */ }
+function clearChallenge(openId: string, site: ByteCloudUserSite): void {
+  try { rmSync(challengePath(openId, site), { force: true }); } catch { /* already gone */ }
 }
 
 export interface BytedcliLoginChallenge {
+  /** Canonical ByteCloud credential site this challenge belongs to. */
+  site: ByteCloudUserSite;
   /** The page the person opens to authorize. */
   authUrl: string;
   /** Opaque token that resumes this login; valid about an hour. */
@@ -259,19 +262,26 @@ export interface BytedcliLoginChallenge {
  */
 const beginnings = new Map<string, Promise<BytedcliLoginChallenge | null>>();
 
-export async function beginBytedcliLogin(openId: string): Promise<BytedcliLoginChallenge | null> {
-  const existing = beginnings.get(openId);
+export async function beginBytedcliLogin(
+  openId: string,
+  site: ByteCloudUserSite,
+): Promise<BytedcliLoginChallenge | null> {
+  const key = `${openId}\0${site}`;
+  const existing = beginnings.get(key);
   if (existing) return existing;
-  const work = beginLogin(openId);
-  beginnings.set(openId, work);
-  try { return await work; } finally { beginnings.delete(openId); }
+  const work = beginLogin(openId, site);
+  beginnings.set(key, work);
+  try { return await work; } finally { beginnings.delete(key); }
 }
 
-async function beginLogin(openId: string): Promise<BytedcliLoginChallenge | null> {
-  const pending = pendingBytedcliLogin(openId);
+async function beginLogin(openId: string, site: ByteCloudUserSite): Promise<BytedcliLoginChallenge | null> {
+  const pending = pendingBytedcliLogin(openId, site);
   if (pending?.authUrl) return pending;
 
-  const { ok, stdout } = await runAsUser(openId, ['auth', 'login', '--begin', '--json']);
+  const { ok, stdout } = await runAsUser(openId, [
+    '--site', site,
+    'auth', 'login', '--begin', '--json',
+  ]);
   const env = parseEnvelope(stdout);
   const data = env?.data as Record<string, unknown> | undefined;
   const authUrl = typeof data?.verification_uri_complete === 'string'
@@ -282,8 +292,8 @@ async function beginLogin(openId: string): Promise<BytedcliLoginChallenge | null
     logger.warn('[bytedcli-auth] could not start a login; provider failed or returned an invalid challenge');
     return null;
   }
-  if (!saveChallenge(openId, completeToken, authUrl)) return null;
-  return { authUrl, completeToken };
+  if (!saveChallenge(openId, site, completeToken, authUrl)) return null;
+  return { site, authUrl, completeToken };
 }
 
 export type BytedcliLoginState = 'authorized' | 'pending' | 'failed' | 'unavailable';
@@ -296,11 +306,12 @@ export type BytedcliLoginState = 'authorized' | 'pending' | 'failed' | 'unavaila
  */
 export async function completeBytedcliLogin(
   openId: string,
+  site: ByteCloudUserSite,
   completeToken: string,
 ): Promise<{ state: BytedcliLoginState; detail?: string }> {
   const { ok, stdout } = await runAsUser(
     openId,
-    ['auth', 'login', '--complete', completeToken, '--json'],
+    ['--site', site, 'auth', 'login', '--complete', completeToken, '--json'],
   );
   const env = parseEnvelope(stdout);
   const data = env?.data as Record<string, unknown> | undefined;
@@ -312,8 +323,8 @@ export async function completeBytedcliLogin(
   if (ok && env?.status === 'success' && (state === 'success' || state === 'ok')) {
     // Completion is not authority until the isolated provider can use the login.
     try {
-      if (await readLoginState(openId)) {
-        clearChallenge(openId);
+      if (await readLoginState(openId, site)) {
+        clearChallenge(openId, site);
         return { state: 'authorized' };
       }
     } catch { /* Preserve the challenge until the provider can verify it. */ }
@@ -323,7 +334,7 @@ export async function completeBytedcliLogin(
     || ['BYTECLOUD_AUTH_LOGIN_EXPIRED', 'BYTECLOUD_AUTH_LOGIN_DENIED',
       'BYTECLOUD_AUTH_LOGIN_INVALID_TICKET', 'BYTECLOUD_AUTH_LOGIN_CHALLENGE_INVALID'].includes(errorCode);
   // Network errors, timeouts and unknown output do not invalidate a challenge.
-  if (terminal) clearChallenge(openId);
+  if (terminal) clearChallenge(openId, site);
   return { state: terminal ? 'failed' : 'unavailable', detail: terminal
     ? 'Login challenge expired or was rejected.'
     : 'Authorization service unavailable; the existing login challenge was retained. Retry later without reauthorizing.' };
@@ -358,27 +369,24 @@ export async function mintByteCloudUserJwts(
 async function mintAllSiteUserJwts(
   openId: string,
 ): Promise<Partial<Record<ByteCloudUserSite, string>> | null> {
-  // Reuse the existing CN mint path so pending-login completion, provider
-  // verification and in-flight de-duplication stay identical to bytedcli.
-  const primary = await mintBytedcliJwts(openId);
-  if (!primary) return null;
-  const result: Partial<Record<ByteCloudUserSite, string>> = {
-    cn: primary.cloudJwt,
-  };
+  const result: Partial<Record<ByteCloudUserSite, string>> = {};
+  let unavailable: unknown;
   // Keep one process at a time inside the same durable HOME. ByteCloud Auth
   // may rotate and persist login state while minting; concurrent regional
-  // processes must not race those writes.
+  // processes must not race those writes. Every site is authoritative for
+  // itself: CN being absent must not suppress an authorized I18N/US/EU site.
   for (const site of BYTECLOUD_USER_SITES) {
-    if (site === 'cn') continue;
-    const minted = await runAsUser(openId, [
-      '--site', site,
-      'auth', 'get-bytecloud-jwt-token',
-    ]);
-    const jwt = minted.stdout.trim();
-    if (minted.ok && jwt) result[site] = jwt;
-    else logger.debug(`[bytedcli-auth] no personal ByteCloud JWT available for governed CLI site ${site}`);
+    try {
+      const jwt = await mintSiteCloudJwt(openId, site);
+      if (jwt) result[site] = jwt;
+    } catch (error) {
+      unavailable = error;
+      logger.debug(`[bytedcli-auth] personal ByteCloud JWT unavailable for governed CLI site ${site}`);
+    }
   }
-  return result;
+  if (Object.keys(result).length) return result;
+  if (unavailable) throw unavailable;
+  return null;
 }
 
 /** Backward-compatible name for callers that only use the tokens with larkdev. */
@@ -392,9 +400,9 @@ export const mintLarkdevByteCloudJwts = mintByteCloudUserJwts;
  * internally when it is expiring, so asking each time is what keeps a person
  * from being sent back to a QR code every couple of hours.
  *
- * If an automatic device login is pending, first try to complete it. This makes
- * "open the link, then retry" sufficient; `/login bytedcli done` remains a
- * compatibility path, not a required user step.
+ * If a device login is pending for this site, first try to complete it. This
+ * makes "open the link, then retry" sufficient while keeping the challenge,
+ * status check and minted JWT on the same explicit site.
  *
  * The completion is BEST-EFFORT, never a gate: a still-pending (or just-failed)
  * challenge says nothing about whether this person already has a valid login,
@@ -406,28 +414,44 @@ export const mintLarkdevByteCloudJwts = mintByteCloudUserJwts;
  */
 const minting = new Map<string, Promise<BytedcliJwts | null>>();
 
-export async function mintBytedcliJwts(openId: string): Promise<BytedcliJwts | null> {
-  const existing = minting.get(openId);
+export async function mintBytedcliJwts(
+  openId: string,
+  site: ByteCloudUserSite,
+): Promise<BytedcliJwts | null> {
+  const key = `${openId}\0${site}`;
+  const existing = minting.get(key);
   if (existing) return existing;
-  const work = mintJwts(openId);
-  minting.set(openId, work);
-  try { return await work; } finally { minting.delete(openId); }
+  const work = mintJwts(openId, site);
+  minting.set(key, work);
+  try { return await work; } finally { minting.delete(key); }
 }
 
-async function mintJwts(openId: string): Promise<BytedcliJwts | null> {
-  const challenge = pendingBytedcliChallenge(openId);
+async function mintSiteCloudJwt(openId: string, site: ByteCloudUserSite): Promise<string | null> {
+  const challenge = pendingBytedcliChallenge(openId, site);
   if (challenge) {
-    await completeBytedcliLogin(openId, challenge);
+    await completeBytedcliLogin(openId, site, challenge);
   }
-  if (!await readLoginState(openId)) return null;
-  const cloud = await runAsUser(openId, ['auth', 'get-bytecloud-jwt-token']);
+  if (!await readLoginState(openId, site)) return null;
+  const cloud = await runAsUser(openId, [
+    '--site', site,
+    'auth', 'get-bytecloud-jwt-token',
+  ]);
   const cloudJwt = cloud.stdout.trim();
   if (!cloud.ok || !cloudJwt) {
-    throw new BytedcliAuthUnavailableError('mint personal JWT');
+    throw new BytedcliAuthUnavailableError(`mint personal JWT for site ${site}`);
   }
+  return cloudJwt;
+}
+
+async function mintJwts(openId: string, site: ByteCloudUserSite): Promise<BytedcliJwts | null> {
+  const cloudJwt = await mintSiteCloudJwt(openId, site);
+  if (!cloudJwt) return null;
   // The Codebase JWT is optional: without it lark/bytedcli calls still work and
   // only git attribution degrades, so a failure here must not deny the turn.
-  const code = await runAsUser(openId, ['auth', 'get-codebase-jwt-token']);
+  const code = await runAsUser(openId, [
+    '--site', site,
+    'auth', 'get-codebase-jwt-token',
+  ]);
   const codeJwt = code.ok ? code.stdout.trim() : '';
   if (!codeJwt) {
     logger.debug(`[bytedcli-auth] no Codebase JWT for ${openId}; git attribution will fall back`);
