@@ -4,6 +4,7 @@ import {
   remapIntoMerged,
   prepareScratchSandbox,
   compileScratchWritableCarveArgs,
+  attachScratchSession,
 } from '../src/adapters/backend/scratch-sandbox.js';
 import {
   scratchMergedRootFor,
@@ -20,6 +21,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync, existsSync
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { rmSandboxScratch } from './helpers/rm-sandbox-scratch.js';
+import { scratchMountRuntimeAvailable } from './helpers/scratch-mount-probe.js';
 
 describe('Linux scratch host-view mapping', () => {
   const merged = '/var/lib/botmux/data/sandboxes/sid-1/root';
@@ -148,6 +150,37 @@ describe('scratchViewPath canonicalises symlink-aliased input (mac /tmp → /pri
   });
 });
 
+describe('attachScratchSession (warm reattach of a live scratch pane)', () => {
+  it('re-serves the preserved outbox and never recreates one the pane cannot see', () => {
+    if (process.platform !== 'linux') return;
+    const dataDir = realpathSync(mkdtempSync(join(tmpdir(), 'scratch-attach-')));
+    const sessionId = 'sid-live';
+    const sessionRoot = join(dataDir, 'sandboxes', sessionId);
+    const outbox = join(sessionRoot, 'outbox');
+    const merged = join(sessionRoot, 'root');
+    try {
+      // No scratch tree at all.
+      expect(attachScratchSession({ sessionId, dataDir })).toBeNull();
+      mkdirSync(merged, { recursive: true });
+      writeFileSync(join(sessionRoot, 'scratch.json'), JSON.stringify({
+        v: 1, sid: sessionId, storage: 'disk', lower: '/', merged,
+        upper: join(sessionRoot, 'upper'), work: join(sessionRoot, 'work'), createdAt: 1,
+      }));
+      // Meta survived but the outbox the pane bound by inode did not.
+      expect(attachScratchSession({ sessionId, dataDir })).toBeNull();
+      expect(existsSync(outbox)).toBe(false);
+      mkdirSync(outbox);
+      const inode = statSync(outbox).ino;
+      const attached = attachScratchSession({ sessionId, dataDir });
+      expect(attached?.outbox).toBe(outbox);
+      expect(attached?.mergedHostPath).toBe(merged);
+      expect(statSync(attached!.outbox).ino).toBe(inode);
+    } finally {
+      rmSandboxScratch(dataDir);
+    }
+  });
+});
+
 describe('prepareScratchSandbox tmux argument transport', () => {
   it('compiles a trusted session as a later-wins writable carve below the shared root', () => {
     const shared = '/home/u/.cache/botmux/session-tmp';
@@ -247,8 +280,10 @@ describe('prepareScratchSandbox tmux argument transport', () => {
     }
   });
 
-  it('reclaims the scratch sandbox tree if compact launch preparation rejects invalid argv', () => {
-    if (process.platform !== 'linux' || process.getuid?.() !== 0) return;
+  // Reaching the argv check needs the host-side overlay to come up first; in a
+  // container without the mount primitives prepareScratchSandbox returns null
+  // before it ever looks at the argv, so gate on the real capability.
+  it.skipIf(process.getuid?.() !== 0 || !scratchMountRuntimeAvailable('disk'))('reclaims the scratch sandbox tree if compact launch preparation rejects invalid argv', () => {
     const root = mkdtempSync(join(tmpdir(), 'scratch-sbx-tmux-invalid-'));
     const dataDir = join(root, 'data');
     const workingDir = join(root, 'work');

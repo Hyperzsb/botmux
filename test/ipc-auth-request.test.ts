@@ -6,13 +6,15 @@ import { readProcessStartIdentity } from '../src/utils/process-identity.js';
 import * as workerPool from '../src/core/worker-pool.js';
 import * as botRegistry from '../src/bot-registry.js';
 import * as identities from '../src/im/lark/identity-cache.js';
-import * as larkCliAuth from '../src/services/lark-cli-auth.js';
+import * as tokens from '../src/utils/user-token.js';
 import * as cliIdentity from '../src/core/cli-identity.js';
+import { config } from '../src/config.js';
+import { rememberLarkToolDelegation, clearLarkToolDelegations } from '../src/core/lark-tool-delegation.js';
 
 const CAP = 'ab'.repeat(32);
 const SECRET = 'auth-request-test-secret';
 const AUTH_URL = 'https://accounts.feishu.cn/oauth/device?user_code=test';
-let completeLogin: ReturnType<typeof vi.fn>;
+let poll: ReturnType<typeof vi.fn>;
 let requestId: string;
 let ipc: IpcServerHandle;
 let session: any;
@@ -28,19 +30,17 @@ beforeEach(async () => {
   vi.spyOn(botRegistry, 'getBot').mockReturnValue({ config: { larkAppId: 'cli_test', larkAppSecret: 'test-secret', triggerUserAuth: { enabled: true, tools: ['lark-cli'], fallback: 'none' } } } as any);
   vi.spyOn(identities, 'getIdentity').mockReturnValue({ openId: 'ou_sender', type: 'user', source: 'sender', updatedAt: 0 });
   vi.spyOn(identities, 'resolveVerifiedUserIdentity').mockResolvedValue(undefined);
-  completeLogin = vi.fn().mockResolvedValue({ state: 'pending' });
-  vi.spyOn(larkCliAuth, 'beginLarkCliLogin').mockImplementation(async (_openId, scopes) => ({
-    authUrl: AUTH_URL, stage: 'user-login', scopes: larkCliAuth.larkCliLoginScopes(scopes),
-  }));
-  vi.spyOn(larkCliAuth, 'completeLarkCliLogin').mockImplementation((...args) => completeLogin(...args));
-  vi.spyOn(larkCliAuth, 'larkCliHomeForTurn').mockReturnValue(null);
-  vi.spyOn(larkCliAuth, 'materializeLarkCliHomeForSession').mockResolvedValue(null);
+  poll = vi.fn().mockResolvedValue({ status: 'pending' });
+  vi.spyOn(tokens, 'requestUserAuthorization').mockResolvedValue({
+    authUrl: AUTH_URL, scopes: ['offline_access', 'im:chat:read'], expiresIn: 600, poll,
+  });
   vi.spyOn(cliIdentity, 'refreshSessionIdentity').mockReturnValue(true);
   setIpcAuthSecret(SECRET);
   ipc = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
 });
 
 afterEach(async () => {
+  clearLarkToolDelegations(config.session.dataDir, 'auth-session');
   await ipc.close();
   setIpcAuthSecret(null);
   vi.restoreAllMocks();
@@ -58,14 +58,105 @@ function post(action = 'auth-request', overrides: Record<string, unknown> = {}, 
 }
 
 describe('agent authorization', () => {
+  function delegate(targetOpenId = 'ou_target_human', turnId = 'om_turn', overrides = {}) {
+    session.managedTurnOrigin.callerOpenId = 'ou_dispatch_bot';
+    rememberLarkToolDelegation(config.session.dataDir, 'auth-session', turnId, {
+      credentialOpenId: 'ou_source_human', targetOpenId,
+      tools: ['lark-cli'], dispatchRoot: 'om_dispatch_root', ...overrides,
+    });
+  }
+
+  it('requests and completes target-app authorization for the verified delegated human', async () => {
+    delegate();
+    const request = await (await post()).json();
+    expect(request).toMatchObject({ ok: true, authUrl: AUTH_URL });
+    expect(tokens.requestUserAuthorization).toHaveBeenCalledExactlyOnceWith(
+      'cli_test', 'test-secret', 'feishu', ['im:chat:read'], 'ou_target_human', expect.any(Function),
+    );
+    expect(identities.resolveVerifiedUserIdentity).not.toHaveBeenCalled();
+    poll.mockResolvedValue({ status: 'ready', token: 'target-app-grant' });
+    expect(await (await post('auth-status', { requestId: request.requestId })).json()).toEqual({ ok: true, status: 'ready' });
+    expect(cliIdentity.refreshSessionIdentity).toHaveBeenCalledWith(expect.any(String), 'auth-session', {
+      tool: 'lark-cli', appId: 'cli_test', userAccessToken: 'target-app-grant', turnId: 'om_turn', openId: 'ou_target_human',
+    });
+  });
+
+  it.each([
+    { tools: ['bytedcli'] }, { denialReason: 'target_access_denied' },
+    { denialReason: 'target_validation_unavailable' }, { targetOpenId: undefined },
+  ])('does not request authorization for a denied delegation: %j', async overrides => {
+    delegate('ou_target_human', 'om_turn', overrides);
+    expect((await post()).status).toBe(403);
+    expect(tokens.requestUserAuthorization).not.toHaveBeenCalled();
+  });
+
+  it('does not turn an ordinary bot message into an authorization request', async () => {
+    session.managedTurnOrigin.callerOpenId = 'ou_dispatch_bot';
+    expect((await post()).status).toBe(403);
+    expect(tokens.requestUserAuthorization).not.toHaveBeenCalled();
+  });
+
+  it('refuses a delegated grant when target policy is withdrawn', async () => {
+    delegate();
+    vi.mocked(botRegistry.getBot).mockReturnValue({ config: {
+      larkAppId: 'cli_test', larkAppSecret: 'test-secret', triggerUserAuth: { enabled: false, tools: ['lark-cli'] },
+    } } as any);
+    expect((await post()).status).toBe(403);
+    expect(tokens.requestUserAuthorization).not.toHaveBeenCalled();
+  });
+
+  it('rejects a delegation replaced while the authorization link is being created', async () => {
+    delegate();
+    vi.mocked(tokens.requestUserAuthorization).mockImplementation(async () => {
+      delegate('ou_other_human');
+      return { authUrl: AUTH_URL, scopes: [], expiresIn: 600, poll };
+    });
+    expect((await post()).status).toBe(409);
+  });
+
+  it('lets the same delegated human finish authorization in a later turn', async () => {
+    delegate();
+    const request = await (await post()).json();
+    const stillAuthorized = vi.mocked(tokens.requestUserAuthorization).mock.calls[0][5];
+    session.managedTurnOrigin.turnId = 'om_next';
+    delegate('ou_target_human', 'om_next');
+    expect(stillAuthorized()).toBe(true);
+    poll.mockResolvedValue({ status: 'ready', token: 'target-app-grant' });
+    expect((await post('auth-status', { requestId: request.requestId, originTurnId: 'om_next' })).status).toBe(200);
+    expect(cliIdentity.refreshSessionIdentity).toHaveBeenCalledWith(expect.any(String), 'auth-session', {
+      tool: 'lark-cli', appId: 'cli_test', userAccessToken: 'target-app-grant', turnId: 'om_next', openId: 'ou_target_human',
+    });
+  });
+
+  it('rejects another human behind the same dispatch bot before polling', async () => {
+    delegate();
+    const request = await (await post()).json();
+    const stillAuthorized = vi.mocked(tokens.requestUserAuthorization).mock.calls[0][5];
+    session.managedTurnOrigin.turnId = 'om_next';
+    delegate('ou_other_human', 'om_next');
+    expect(stillAuthorized()).toBe(false);
+    expect((await post('auth-status', { requestId: request.requestId, originTurnId: 'om_next' })).status).toBe(409);
+    expect(poll).not.toHaveBeenCalled();
+    expect(cliIdentity.refreshSessionIdentity).not.toHaveBeenCalled();
+  });
+
+  it('stops a pending authorization when the delegation is revoked', async () => {
+    delegate();
+    await post();
+    const stillAuthorized = vi.mocked(tokens.requestUserAuthorization).mock.calls[0][5];
+    clearLarkToolDelegations(config.session.dataDir, 'auth-session');
+    expect(stillAuthorized()).toBe(false);
+  });
+
   it.each([false, true])('binds the link to the daemon sender (signed=%s)', async signed => {
     const response = await post('auth-request', {}, signed);
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({
-      ok: true, authUrl: AUTH_URL, requestId: expect.any(String),
-      scopes: larkCliAuth.larkCliLoginScopes(['im:chat:read']), expiresIn: 540, autoCallback: true,
+      ok: true, authUrl: AUTH_URL, requestId: expect.any(String), scopes: ['offline_access', 'im:chat:read'], expiresIn: 600, autoCallback: true,
     });
-    expect(larkCliAuth.beginLarkCliLogin).toHaveBeenCalledWith('ou_sender', ['im:chat:read']);
+    expect(tokens.requestUserAuthorization).toHaveBeenCalledWith(
+      'cli_test', 'test-secret', 'feishu', ['im:chat:read'], 'ou_sender', expect.any(Function),
+    );
   });
 
   it.each([
@@ -74,19 +165,21 @@ describe('agent authorization', () => {
   ])('rejects incomplete or stale turn claims even with host authorization: %j', async fields => {
     const response = await post('auth-request', fields, true);
     expect(response.status).toBe(403);
-    expect(larkCliAuth.beginLarkCliLogin).not.toHaveBeenCalled();
+    expect(tokens.requestUserAuthorization).not.toHaveBeenCalled();
   });
 
   it('rejects identity overrides and misspelled permissions', async () => {
     expect((await post('auth-request', { callerOpenId: 'ou_other' })).status).toBe(400);
     expect((await post('auth-request', { scopes: ['im:chat:raed'] })).status).toBe(400);
-    expect(larkCliAuth.beginLarkCliLogin).not.toHaveBeenCalled();
+    expect(tokens.requestUserAuthorization).not.toHaveBeenCalled();
   });
 
   it('accepts the legacy chat permissions reported by the API', async () => {
     const scopes = ['im:chat', 'im:chat:readonly', 'im:chat:read'];
     expect((await post('auth-request', { scopes })).status).toBe(200);
-    expect(larkCliAuth.beginLarkCliLogin).toHaveBeenCalledWith('ou_sender', scopes);
+    expect(tokens.requestUserAuthorization).toHaveBeenCalledWith(
+      'cli_test', 'test-secret', 'feishu', scopes, 'ou_sender', expect.any(Function),
+    );
   });
 
   it.each([
@@ -100,43 +193,29 @@ describe('agent authorization', () => {
     const response = await post();
     expect(response.status).toBe(409);
     expect(await response.json()).toEqual({ ok: false, error: 'lark_user_auth_disabled' });
-    expect(larkCliAuth.beginLarkCliLogin).not.toHaveBeenCalled();
+    expect(tokens.requestUserAuthorization).not.toHaveBeenCalled();
   });
 
   it('returns default scopes and waits for the device grant when no extra scope is requested', async () => {
     const request = await (await post('auth-request', { scopes: [] })).json();
-    expect(request.scopes).toEqual(larkCliAuth.larkCliLoginScopes([]));
+    expect(request.scopes).toEqual(['offline_access', 'im:chat:read']);
     const response = await post('auth-status', { requestId: request.requestId });
     expect(await response.json()).toEqual({ ok: true, status: 'pending' });
-    expect(completeLogin).toHaveBeenCalledWith('ou_sender');
+    expect(poll).toHaveBeenCalledOnce();
     expect(cliIdentity.refreshSessionIdentity).not.toHaveBeenCalled();
   });
 
-  it('returns the personal-app setup link without creating a shared-app auth request', async () => {
-    vi.mocked(larkCliAuth.beginLarkCliLogin).mockResolvedValueOnce({
-      authUrl: 'https://open.feishu.cn/page/cli?user_code=PERSONAL', stage: 'app-setup',
-    });
-    const response = await post();
-    expect(response.status).toBe(409);
-    expect(await response.json()).toEqual({
-      ok: false,
-      error: 'personal_lark_app_required',
-      authUrl: 'https://open.feishu.cn/page/cli?user_code=PERSONAL',
-    });
-    expect(completeLogin).not.toHaveBeenCalled();
-  });
-
   it('returns a safe error when creating the device grant fails', async () => {
-    vi.mocked(larkCliAuth.beginLarkCliLogin).mockRejectedValue(new Error('secret-bearing upstream error'));
+    vi.mocked(tokens.requestUserAuthorization).mockRejectedValue(new Error('secret-bearing upstream error'));
     const response = await post();
     expect(response.status).toBe(502);
     expect(await response.json()).toEqual({ ok: false, error: 'authorization_request_failed' });
   });
 
   it('rejects a turn change while creating the device grant', async () => {
-    vi.mocked(larkCliAuth.beginLarkCliLogin).mockImplementation(async () => {
+    vi.mocked(tokens.requestUserAuthorization).mockImplementation(async () => {
       session.managedTurnOrigin.turnId = 'om_next';
-      return { authUrl: AUTH_URL, stage: 'user-login', scopes: [] };
+      return { authUrl: AUTH_URL, scopes: [], expiresIn: 600, poll };
     });
     const response = await post();
     expect(response.status).toBe(409);
@@ -145,21 +224,34 @@ describe('agent authorization', () => {
 
   it('reports a failed grant without refreshing credentials', async () => {
     requestId = (await (await post()).json()).requestId;
-    completeLogin.mockResolvedValue({ state: 'failed', detail: 'authorization_user_mismatch' });
+    poll.mockResolvedValue({ status: 'failed', error: 'authorization_user_mismatch' });
     const response = await post('auth-status', { requestId });
     expect(response.status).toBe(400);
     expect(await response.json()).toEqual({ ok: false, status: 'failed', error: 'authorization_user_mismatch' });
     expect(cliIdentity.refreshSessionIdentity).not.toHaveBeenCalled();
   });
 
-  it('refuses to publish credentials when the turn changes during token resolution', async () => {
+  it('hands the granted token to the same human’s live follow-up turn', async () => {
     requestId = (await (await post()).json()).requestId;
-    completeLogin.mockImplementation(async () => {
-      session.managedTurnOrigin.turnId = 'om_next';
-      return { state: 'authorized' };
+    // The follow-up turn is live BEFORE the waiting CLI polls again, and that
+    // CLI presents the new turn tuple — same human, newer turn.
+    session.managedTurnOrigin.turnId = 'om_next';
+    poll.mockResolvedValue({ status: 'ready', token: 'test-user-token' });
+    const response = await post('auth-status', { requestId, originTurnId: 'om_next' });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ ok: true, status: 'ready' });
+    expect(cliIdentity.refreshSessionIdentity).toHaveBeenCalledWith(expect.any(String), 'auth-session', {
+      tool: 'lark-cli', appId: 'cli_test', userAccessToken: 'test-user-token',
+      turnId: 'om_next', openId: 'ou_sender',
     });
-    vi.mocked(larkCliAuth.larkCliHomeForTurn).mockReturnValue('/homes/ou_sender');
-    const response = await post('auth-status', { requestId });
+  });
+
+  it('refuses to hand the token to a different human’s live turn', async () => {
+    requestId = (await (await post()).json()).requestId;
+    session.managedTurnOrigin.turnId = 'om_next';
+    session.managedTurnOrigin.callerOpenId = 'ou_other';
+    poll.mockResolvedValue({ status: 'ready', token: 'test-user-token' });
+    const response = await post('auth-status', { requestId, originTurnId: 'om_next' });
     expect(response.status).toBe(409);
     expect(await response.json()).toEqual({ ok: false, error: 'auth_turn_changed' });
     expect(cliIdentity.refreshSessionIdentity).not.toHaveBeenCalled();
@@ -172,7 +264,7 @@ describe('agent authorization', () => {
       return { openId: 'ou_sender', type: 'user' };
     });
     expect((await post()).status).toBe(403);
-    expect(larkCliAuth.beginLarkCliLogin).not.toHaveBeenCalled();
+    expect(tokens.requestUserAuthorization).not.toHaveBeenCalled();
   });
 
   it('reports pending, then refreshes only the requesting turn after authorization', async () => {
@@ -180,43 +272,27 @@ describe('agent authorization', () => {
     const pending = await post('auth-status', { requestId });
     expect(await pending.json()).toEqual({ ok: true, status: 'pending' });
     expect(cliIdentity.refreshSessionIdentity).not.toHaveBeenCalled();
-    completeLogin.mockResolvedValue({ state: 'authorized' });
-    vi.mocked(larkCliAuth.larkCliHomeForTurn).mockReturnValue('/homes/ou_sender-personal-app');
+    poll.mockResolvedValue({ status: 'ready', token: 'test-user-token' });
     const ready = await post('auth-status', { requestId });
     expect(await ready.json()).toEqual({ ok: true, status: 'ready' });
     expect(cliIdentity.refreshSessionIdentity).toHaveBeenCalledWith(expect.any(String), 'auth-session', {
-      tool: 'lark-cli', mode: 'user-home', home: '/homes/ou_sender-personal-app', turnId: 'om_turn',
-    });
-  });
-
-  it('publishes a session-local HOME after authorization in a frozen sandbox session', async () => {
-    session.session.sandbox = 'oncall';
-    requestId = (await (await post()).json()).requestId;
-    completeLogin.mockResolvedValue({ state: 'authorized' });
-    vi.mocked(larkCliAuth.materializeLarkCliHomeForSession)
-      .mockResolvedValue('/session-tmp/auth-session/lark-cli-home');
-    const ready = await post('auth-status', { requestId });
-    expect(await ready.json()).toEqual({ ok: true, status: 'ready' });
-    expect(larkCliAuth.materializeLarkCliHomeForSession).toHaveBeenCalledWith(
-      'ou_sender', expect.any(String), 'auth-session',
-    );
-    expect(larkCliAuth.larkCliHomeForTurn).not.toHaveBeenCalled();
-    expect(cliIdentity.refreshSessionIdentity).toHaveBeenCalledWith(expect.any(String), 'auth-session', {
-      tool: 'lark-cli', mode: 'user-home',
-      home: '/session-tmp/auth-session/lark-cli-home', turnId: 'om_turn',
+      tool: 'lark-cli', appId: 'cli_test', userAccessToken: 'test-user-token', turnId: 'om_turn',
+      openId: 'ou_sender',
     });
   });
 
   it('preserves newer queued credentials and refuses a rotated worker', async () => {
     requestId = (await (await post()).json()).requestId;
-    completeLogin.mockResolvedValue({ state: 'authorized' });
-    vi.mocked(larkCliAuth.larkCliHomeForTurn).mockReturnValue('/homes/ou_sender-personal-app');
+    poll.mockResolvedValue({ status: 'ready', token: 'test-user-token' });
     vi.mocked(cliIdentity.refreshSessionIdentity).mockReturnValue(false);
     expect((await post('auth-status', { requestId })).status).toBe(409);
     vi.mocked(cliIdentity.refreshSessionIdentity).mockClear();
     session.workerGeneration++;
-    expect((await post('auth-status', { requestId })).status).toBe(409);
-    expect(cliIdentity.refreshSessionIdentity).not.toHaveBeenCalled();
+    const response = await post('auth-status', { requestId });
+    // Still refused: the live turn file does not line up, so refresh fails
+    // closed and the fresh token is never published to a queued identity.
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({ ok: false, error: 'auth_turn_changed' });
   });
 });
 
@@ -230,7 +306,7 @@ describe.skipIf(process.platform !== 'linux')('agent authorization over a manage
   const SECRET = 'auth-request-host-secret';
   let ipc: IpcServerHandle;
   let session: any;
-  let completeLogin: ReturnType<typeof vi.fn>;
+  let poll: ReturnType<typeof vi.fn>;
   let unrelatedProcess: ChildProcess | undefined;
 
   function hostSession(): any {
@@ -257,18 +333,17 @@ describe.skipIf(process.platform !== 'linux')('agent authorization over a manage
     vi.spyOn(botRegistry, 'getBot').mockReturnValue({ config: { larkAppId: 'cli_test', larkAppSecret: 'test-secret', triggerUserAuth: { enabled: true, tools: ['lark-cli'], fallback: 'none' } } } as any);
     vi.spyOn(identities, 'getIdentity').mockReturnValue({ openId: 'ou_host', type: 'user', source: 'sender', updatedAt: 0 });
     vi.spyOn(identities, 'resolveVerifiedUserIdentity').mockResolvedValue(undefined);
-    completeLogin = vi.fn().mockResolvedValue({ state: 'pending' });
-    vi.spyOn(larkCliAuth, 'beginLarkCliLogin').mockImplementation(async (_openId, scopes) => ({
-      authUrl: AUTH_URL, stage: 'user-login', scopes: larkCliAuth.larkCliLoginScopes(scopes),
-    }));
-    vi.spyOn(larkCliAuth, 'completeLarkCliLogin').mockImplementation((...args) => completeLogin(...args));
-    vi.spyOn(larkCliAuth, 'larkCliHomeForTurn').mockReturnValue(null);
+    poll = vi.fn().mockResolvedValue({ status: 'pending' });
+    vi.spyOn(tokens, 'requestUserAuthorization').mockResolvedValue({
+      authUrl: AUTH_URL, scopes: ['offline_access', 'im:chat:read'], expiresIn: 600, poll,
+    });
     vi.spyOn(cliIdentity, 'refreshSessionIdentity').mockReturnValue(true);
     setIpcAuthSecret(SECRET);
     ipc = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
   });
 
   afterEach(async () => {
+    clearLarkToolDelegations(config.session.dataDir, 'host-session');
     unrelatedProcess?.kill();
     unrelatedProcess = undefined;
     await ipc.close();
@@ -289,7 +364,27 @@ describe.skipIf(process.platform !== 'linux')('agent authorization over a manage
     const response = await hostPost('auth-request');
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({ ok: true, authUrl: AUTH_URL, autoCallback: true });
-    expect(larkCliAuth.beginLarkCliLogin).toHaveBeenCalledWith('ou_host', ['im:chat:read']);
+    expect(tokens.requestUserAuthorization).toHaveBeenCalledWith(
+      'cli_test', 'test-secret', 'feishu', ['im:chat:read'], 'ou_host', expect.any(Function),
+    );
+  });
+
+  it('authorizes a delegated human through the managed host process proof', async () => {
+    session.managedTurnOrigin.callerOpenId = 'ou_dispatch_bot';
+    rememberLarkToolDelegation(config.session.dataDir, 'host-session', 'om_host', {
+      credentialOpenId: 'ou_source_human', targetOpenId: 'ou_target_human',
+      tools: ['lark-cli'], dispatchRoot: 'om_dispatch_root',
+    });
+    const request = await (await hostPost('auth-request')).json();
+    expect(request).toMatchObject({ ok: true, authUrl: AUTH_URL });
+    expect(tokens.requestUserAuthorization).toHaveBeenCalledWith(
+      'cli_test', 'test-secret', 'feishu', ['im:chat:read'], 'ou_target_human', expect.any(Function),
+    );
+    poll.mockResolvedValue({ status: 'ready', token: 'target-app-grant' });
+    expect(await (await hostPost('auth-status', { requestId: request.requestId })).json()).toEqual({ ok: true, status: 'ready' });
+    expect(cliIdentity.refreshSessionIdentity).toHaveBeenCalledWith(expect.any(String), 'host-session', {
+      tool: 'lark-cli', appId: 'cli_test', userAccessToken: 'target-app-grant', turnId: 'om_host', openId: 'ou_target_human',
+    });
   });
 
   it('authorizes an RPC client through the independently attested engine root', async () => {
@@ -320,7 +415,7 @@ describe.skipIf(process.platform !== 'linux')('agent authorization over a manage
     const response = await hostPost('auth-request');
     expect(response.status).toBe(403);
     expect(await response.json()).toEqual({ ok: false, error: 'current_actor_unverified' });
-    expect(larkCliAuth.beginLarkCliLogin).not.toHaveBeenCalled();
+    expect(tokens.requestUserAuthorization).not.toHaveBeenCalled();
   });
 
   it('refuses when the live turn lineage no longer contains the calling process', async () => {
@@ -329,17 +424,17 @@ describe.skipIf(process.platform !== 'linux')('agent authorization over a manage
     const response = await hostPost('auth-request');
     expect(response.status).toBe(403);
     expect(await response.json()).toEqual({ ok: false, error: 'current_actor_unverified' });
-    expect(larkCliAuth.beginLarkCliLogin).not.toHaveBeenCalled();
+    expect(tokens.requestUserAuthorization).not.toHaveBeenCalled();
   });
 
   it('refreshes the current turn identity after the host device grant completes', async () => {
     const requestId = (await (await hostPost('auth-request')).json()).requestId;
-    completeLogin.mockResolvedValue({ state: 'authorized' });
-    vi.mocked(larkCliAuth.larkCliHomeForTurn).mockReturnValue('/homes/ou_host-personal-app');
+    poll.mockResolvedValue({ status: 'ready', token: 'host-user-token' });
     const ready = await hostPost('auth-status', { requestId });
     expect(await ready.json()).toEqual({ ok: true, status: 'ready' });
     expect(cliIdentity.refreshSessionIdentity).toHaveBeenCalledWith(expect.any(String), 'host-session', {
-      tool: 'lark-cli', mode: 'user-home', home: '/homes/ou_host-personal-app', turnId: 'om_host',
+      tool: 'lark-cli', appId: 'cli_test', userAccessToken: 'host-user-token', turnId: 'om_host',
+      openId: 'ou_host',
     });
   });
 });

@@ -335,10 +335,13 @@ export interface BytedcliJwts {
   codeJwt?: string;
 }
 
-const allSiteMinting = new Map<
-  string,
-  Promise<Partial<Record<ByteCloudUserSite, string>> | null>
->();
+/** Per-site ByteCloud JWTs plus the best-effort CN-minted Codebase JWT the
+ *  `codebase` companion derives from. */
+export type ByteCloudUserGrant = Partial<Record<ByteCloudUserSite, string>> & {
+  codeJwt?: string;
+};
+
+const allSiteMinting = new Map<string, Promise<ByteCloudUserGrant | null>>();
 
 /**
  * Mint the current sender's ByteCloud JWT for every control plane their login
@@ -347,7 +350,7 @@ const allSiteMinting = new Map<
  */
 export async function mintByteCloudUserJwts(
   openId: string,
-): Promise<Partial<Record<ByteCloudUserSite, string>> | null> {
+): Promise<ByteCloudUserGrant | null> {
   const existing = allSiteMinting.get(openId);
   if (existing) return existing;
   const work = mintAllSiteUserJwts(openId);
@@ -357,13 +360,16 @@ export async function mintByteCloudUserJwts(
 
 async function mintAllSiteUserJwts(
   openId: string,
-): Promise<Partial<Record<ByteCloudUserSite, string>> | null> {
+): Promise<ByteCloudUserGrant | null> {
   // Reuse the existing CN mint path so pending-login completion, provider
-  // verification and in-flight de-duplication stay identical to bytedcli.
+  // verification and in-flight de-duplication stay identical to bytedcli. That
+  // call ALSO yields the best-effort Codebase JWT from the same CN login, which
+  // we carry for the derived `codebase` companion — no second mint needed.
   const primary = await mintBytedcliJwts(openId);
   if (!primary) return null;
-  const result: Partial<Record<ByteCloudUserSite, string>> = {
+  const result: ByteCloudUserGrant = {
     cn: primary.cloudJwt,
+    ...(primary.codeJwt ? { codeJwt: primary.codeJwt } : {}),
   };
   // Keep one process at a time inside the same durable HOME. ByteCloud Auth
   // may rotate and persist login state while minting; concurrent regional

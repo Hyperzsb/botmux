@@ -23,7 +23,7 @@ import {
   TriggerUserAuthConfigError,
   TRIGGER_USER_AUTH_TOOLS,
   TRIGGER_USER_AUTH_DEFAULT_TOOLS,
-  tokenStoreProtection,
+  tokenStoreProtection, credentialSourceOf,
 } from '../src/services/trigger-user-auth.js';
 
 describe('parseTriggerUserAuthConfig', () => {
@@ -35,6 +35,7 @@ describe('parseTriggerUserAuthConfig', () => {
   it('defaults to disabled when the object omits `enabled`', () => {
     expect(parseTriggerUserAuthConfig({})).toEqual({
       enabled: false,
+      credentialSource: 'auto',
       tools: [...TRIGGER_USER_AUTH_DEFAULT_TOOLS],
       fallback: 'bot-identity',
     });
@@ -211,5 +212,24 @@ describe('git attribution settings', () => {
     expect(() => parseTriggerUserAuthConfig({
       enabled: true, gitTokenExchangeUrl: 'not-a-url',
     })).toThrow(/absolute URL/);
+  });
+});
+
+describe('credentialSource', () => {
+  it('defaults to auto when absent', () => {
+    const cfg = parseTriggerUserAuthConfig({ enabled: true });
+    expect(cfg?.credentialSource).toBe('auto');
+    expect(credentialSourceOf(cfg)).toBe('auto');
+    expect(credentialSourceOf(null)).toBe('auto');
+    expect(credentialSourceOf({})).toBe('auto');
+  });
+
+  it.each(['auto', 'platform', 'local'] as const)('accepts %s', (source) => {
+    expect(parseTriggerUserAuthConfig({ enabled: true, credentialSource: source })?.credentialSource).toBe(source);
+  });
+
+  it.each(['device', 'machine', 'owner', 1, true])('rejects %s', (bad) => {
+    expect(() => parseTriggerUserAuthConfig({ enabled: true, credentialSource: bad }))
+      .toThrow(/credentialSource must be one of auto \| platform \| local/);
   });
 });

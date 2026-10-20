@@ -359,6 +359,7 @@ describe('mintLarkdevByteCloudJwts — per-plane sender identity', () => {
     ];
     expect(await mod.mintLarkdevByteCloudJwts(ALICE)).toEqual({
       cn: 'cn.jwt',
+      codeJwt: 'code.jwt',
       'i18n-tt': 'tt.jwt',
       'i18n-bd': 'bd.jwt',
       'eu-ttp': 'eu.jwt',
