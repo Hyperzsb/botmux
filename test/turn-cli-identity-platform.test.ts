@@ -19,10 +19,10 @@ vi.mock('../src/utils/user-token.js', () => ({
   resolveUserToken: vi.fn(async () => null),
   lookupAuthorizedUserName: vi.fn(() => undefined),
 }));
-const bytedcliJwts = new Map<string, { cloudJwt: string; codeJwt?: string }>();
+const byteCloudGrants = new Map<string, { cn: string; codeJwt?: string }>();
 const beginBytedcliLogin = vi.fn(async () => ({ authUrl: 'https://cloud.example.test/local-bytedcli', completeToken: 'tok' }));
 vi.mock('../src/services/bytedcli-auth.js', () => ({
-  mintBytedcliJwts: vi.fn(async (openId: string) => bytedcliJwts.get(openId) ?? null),
+  mintByteCloudUserJwts: vi.fn(async (openId: string) => byteCloudGrants.get(openId) ?? null),
   beginBytedcliLogin: (openId: string) => beginBytedcliLogin(openId),
 }));
 const larkHomes = new Map<string, string>();
@@ -52,7 +52,7 @@ let unionIds: Map<string, string | null>;
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'botmux-turn-identity-platform-'));
-  bytedcliJwts.clear();
+  byteCloudGrants.clear();
   larkHomes.clear();
   resolveLarkCliHomeForTurn.mockClear();
   beginLarkCliLogin.mockClear();
@@ -104,11 +104,11 @@ describe('policy off', () => {
 
 describe('credentialSource = local', () => {
   it('bytedcli in local mode mints from the per-person login on this machine', async () => {
-    bytedcliJwts.set(ALICE, { cloudJwt: 'local-cloud', codeJwt: 'local-code' });
+    byteCloudGrants.set(ALICE, { cn: 'local-cloud', codeJwt: 'local-code' });
     const out = await publish(botConfig({ enabled: true, tools: ['bytedcli'], credentialSource: 'local' }), ALICE);
     expect(out.find(o => o.tool === 'bytedcli')?.state).toBe('user');
     expect(grantCalls).toHaveLength(0);
-    expect(read('bytedcli')).toContain("BYTEDCLI_USER_CLOUD_JWT='local-cloud'");
+    expect(read('bytedcli')).toContain("BYTECLOUD_CLI_API_JWT_TOKEN_CN='local-cloud'");
   });
 
   it('never consults the platform even when bound', async () => {
@@ -153,8 +153,11 @@ describe('credentialSource = auto, machine bound', () => {
     const out = await publish(botConfig({ enabled: true, tools: ['bytedcli'] }), ALICE);
     expect(out.find(o => o.tool === 'bytedcli')?.state).toBe('user');
     const body = read('bytedcli');
-    expect(body).toContain("BYTEDCLI_USER_CLOUD_JWT='cloud-jwt'");
-    expect(body).toContain("BYTEDCLI_USER_CODE_JWT='code-jwt'");
+    expect(body).toContain("BYTECLOUD_CLI_API_JWT_TOKEN_CN='cloud-jwt'");
+    // The Codebase JWT is not exported to the bytedcli wrapper; it is mirrored
+    // into the derived codebase companion file instead.
+    expect(body).not.toContain('BYTEDCLI_USER_CODE_JWT');
+    expect(read('codebase')).toContain("CODEBASE_CLI_USER_JWT='code-jwt'");
   });
 
   it('honours an existing local HOME when the platform has nothing for the person', async () => {

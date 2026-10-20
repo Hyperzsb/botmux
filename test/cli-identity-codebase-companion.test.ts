@@ -32,7 +32,7 @@ const read = (tool: 'bytedcli' | 'codebase') => readFileSync(sessionIdentityPath
 
 describe('companion publication', () => {
   it('a bytedcli grant with a Codebase JWT publishes codebase as the same person and turn', () => {
-    writeSessionIdentity(dir, SESSION, { tool: 'bytedcli', cloudJwt: 'cloud', codeJwt: 'code-jwt', turnId: 'om_1', openId: 'ou_a' });
+    writeSessionIdentity(dir, SESSION, { tool: 'bytedcli', cloudJwts: { cn: 'cloud' }, codeJwt: 'code-jwt', turnId: 'om_1', openId: 'ou_a' });
     const body = read('codebase');
     expect(body).toContain("BOTMUX_IDENTITY_MODE='user'");
     expect(body).toContain("CODEBASE_CLI_USER_JWT='code-jwt'");
@@ -42,8 +42,8 @@ describe('companion publication', () => {
   });
 
   it('a bytedcli grant WITHOUT a Codebase JWT refuses codebase instead of letting it use the machine login', () => {
-    writeSessionIdentity(dir, SESSION, { tool: 'bytedcli', cloudJwt: 'cloud', turnId: 'om_1' });
-    expect(read('bytedcli')).toContain("BYTEDCLI_USER_CLOUD_JWT='cloud'");
+    writeSessionIdentity(dir, SESSION, { tool: 'bytedcli', cloudJwts: { cn: 'cloud' }, turnId: 'om_1' });
+    expect(read('bytedcli')).toContain("BYTECLOUD_CLI_API_JWT_TOKEN_CN='cloud'");
     const body = read('codebase');
     expect(body).toContain("BOTMUX_IDENTITY_MODE='denied'");
     expect(body).toContain('Codebase');
@@ -58,7 +58,7 @@ describe('companion publication', () => {
   });
 
   it('clearing bytedcli clears the companion too; lark-cli does not touch it', () => {
-    writeSessionIdentity(dir, SESSION, { tool: 'bytedcli', cloudJwt: 'c', codeJwt: 'k' });
+    writeSessionIdentity(dir, SESSION, { tool: 'bytedcli', cloudJwts: { cn: 'c' }, codeJwt: 'k' });
     writeSessionIdentity(dir, SESSION, { tool: 'lark-cli', appId: 'a', userAccessToken: 't' });
     clearSessionIdentity(dir, SESSION, 'lark-cli');
     expect(existsSync(sessionIdentityPath(dir, SESSION, 'codebase'))).toBe(true);
@@ -76,7 +76,7 @@ describe('companion publication', () => {
     expect(identityToolsFor(['lark-cli'])).toEqual(['lark-cli']);
     expect(identityToolsFor(['bytedcli'])).toEqual(['bytedcli', 'codebase']);
     expect(identityToolsFor(['lark-cli', 'bytedcli'])).toEqual(['lark-cli', 'bytedcli', 'codebase']);
-    expect(codebaseCompanionOf({ tool: 'bytedcli', cloudJwt: 'c', codeJwt: 'k', openId: 'ou' })).toEqual({ tool: 'codebase', codeJwt: 'k', openId: 'ou' });
+    expect(codebaseCompanionOf({ tool: 'bytedcli', cloudJwts: { cn: 'c' }, codeJwt: 'k', openId: 'ou' })).toEqual({ tool: 'codebase', codeJwt: 'k', openId: 'ou' });
   });
 });
 
@@ -87,7 +87,7 @@ describe('companion wrapper', () => {
     chmodSync(real, 0o755);
     const wrapper = join(dir, 'codebase');
     writeFileSync(wrapper, renderIdentityWrapper('codebase', real));
-    writeSessionIdentity(dir, SESSION, { tool: 'bytedcli', cloudJwt: 'cloud', codeJwt: 'code-jwt' });
+    writeSessionIdentity(dir, SESSION, { tool: 'bytedcli', cloudJwts: { cn: 'cloud' }, codeJwt: 'code-jwt' });
     const out = execFileSync('/bin/sh', [wrapper, 'mr', 'list'], {
       encoding: 'utf8', env: { PATH: '/usr/bin:/bin', SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION },
     });
@@ -111,7 +111,7 @@ describe('companion wrapper', () => {
     expect(stderr).toContain('需要授权 bytedcli');
     expect(stdout).not.toContain('RAN_AS_MACHINE');
     // Same when bytedcli was granted but no Codebase JWT came with it.
-    writeSessionIdentity(dir, SESSION, { tool: 'bytedcli', cloudJwt: 'cloud' });
+    writeSessionIdentity(dir, SESSION, { tool: 'bytedcli', cloudJwts: { cn: 'cloud' } });
     let status2 = 0;
     try { execFileSync('/bin/sh', [wrapper], { encoding: 'utf8', env: { PATH: '/usr/bin:/bin', SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION }, stdio: ['ignore', 'pipe', 'pipe'] }); }
     catch (e: any) { status2 = e.status; }
