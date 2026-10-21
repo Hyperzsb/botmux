@@ -391,6 +391,56 @@ describe('agent authorization', () => {
     } finally { vi.useRealTimers(); }
   });
 
+  it('reuses a pending personal-app link across turns without minting a second one', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      // Ordinary (non-delegated, non-bound) trigger-user session: personal app.
+      const first = await (await post()).json();
+      vi.setSystemTime(Date.now() + 30_000);
+      session.managedTurnOrigin.turnId = 'om_next';
+      const next = await (await post('auth-request', { originTurnId: 'om_next' })).json();
+      expect(next).toMatchObject({ requestId: first.requestId, authUrl: first.authUrl, expiresIn: 510 });
+      // No second begin — the existing pending personal grant is reused.
+      expect(larkCliAuth.beginLarkCliLogin).toHaveBeenCalledOnce();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('refuses to reuse a pending grant for a caller who can no longer be verified', async () => {
+    const first = await (await post()).json();
+    expect(first.ok).toBe(true);
+    // The stored/live identity can no longer resolve to a human (or resolves to
+    // a bot). Reusing the pending link must be refused BEFORE the reuse loop —
+    // identity verification precedes any pending-grant reuse.
+    vi.mocked(identities.getIdentity).mockReturnValue(undefined);
+    vi.mocked(identities.resolveVerifiedUserIdentity).mockResolvedValue(undefined);
+    const res = await post();
+    expect(res.status).toBe(403);
+    const body = await res.json();
+    expect(body).toEqual({ ok: false, error: 'current_actor_unverified' });
+    // No requestId/link handed to the unverified caller; no new begin either.
+    expect(body).not.toHaveProperty('requestId');
+    expect(larkCliAuth.beginLarkCliLogin).toHaveBeenCalledTimes(1); // only the first, valid call
+  });
+
+  it('keeps background-polling a personal grant through a transient failure while the challenge survives', async () => {
+    // The personal poll keeps the grant alive on a transient failure (the
+    // challenge survives, autoPollAfter=0): track's background tick must call
+    // completeLarkCliLogin again rather than stopping after the first 'failed'.
+    vi.spyOn(larkCliAuth, 'pendingLarkCliChallenge').mockImplementation((openId?: string) =>
+      openId === 'ou_sender'
+        ? { deviceCode: 'dc', authUrl: 'https://v', scopes: [], createdAt: 0, autoPollAfter: 0 }
+        : null);
+    const complete = vi.mocked(larkCliAuth.completeLarkCliLogin);
+    complete
+      .mockResolvedValueOnce({ state: 'failed', detail: 'connect ETIMEDOUT' } as any)
+      .mockResolvedValueOnce({ state: 'pending' } as any);
+    const created = await (await post()).json();
+    expect(created.ok).toBe(true);
+    // Background ticks keep polling past the transient failure (>=2 calls); the
+    // old behaviour stopped after the first non-pending result.
+    await vi.waitFor(() => expect(complete.mock.calls.length).toBeGreaterThanOrEqual(2), { timeout: 6_000 });
+  });
+
   it('does not expose another speaker or application grant to the current turn', async () => {
     // Ordinary personal-app grant: the tracked request is frozen to ou_sender.
     requestId = (await (await post()).json()).requestId;

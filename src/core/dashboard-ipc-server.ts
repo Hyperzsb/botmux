@@ -463,6 +463,7 @@ import { tokenStoreProtection, triggerUserAuthApplies, credentialSourceOf, type 
 import {
   beginLarkCliLogin,
   completeLarkCliLogin,
+  pendingLarkCliChallenge,
   resolveLarkCliHomeForTurn as larkCliHomeForTurn,
   larkCliLoginScopes,
   materializeLarkCliHomeForSession,
@@ -3380,6 +3381,23 @@ for (const action of ['auth-request', 'auth-status']) {
     };
     const requestId = randomBytes(32).toString('hex');
 
+    // Verify the human turn sender BEFORE considering a pending-request reuse or
+    // minting anything. Origin/turn attestation above proves process lineage but
+    // not human-ness; an unverifiable caller or another bot must not receive a
+    // pending grant's link/requestId. A cross-app delegation already pins the
+    // target human via the verified delegation record, so it skips the token-store
+    // lookup (it intentionally authorizes a human who may have no Bot-app token).
+    if (!delegated) {
+      const cachedHuman = getIdentity(appId, callerOpenId);
+      const verifiedHuman = cachedHuman?.type === 'user'
+        && ['sender', 'message_api', 'contact_api'].includes(cachedHuman.source)
+        ? cachedHuman
+        : await resolveVerifiedUserIdentity(appId, callerOpenId);
+      if (!verifiedHuman || verifiedHuman.type !== 'user' || verifiedHuman.openId !== callerOpenId || !isCurrent()) {
+        return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
+      }
+    }
+
     // Reuse an existing pending grant for the same session/app/human when its
     // scopes already cover this request and it is still live (#1823): preserve
     // an unexpired in-flight request instead of minting a competing link.
@@ -3419,16 +3437,6 @@ for (const action of ['auth-request', 'auth-status']) {
         return { status: 'ready', mode: 'app-token', token: r.token };
       };
     } else {
-      // The caller must be a verified human turn sender; origin/turn attestation
-      // proves lineage but not human-ness.
-      const cachedHuman = getIdentity(appId, callerOpenId);
-      const verifiedHuman = cachedHuman?.type === 'user'
-        && ['sender', 'message_api', 'contact_api'].includes(cachedHuman.source)
-        ? cachedHuman
-        : await resolveVerifiedUserIdentity(appId, callerOpenId);
-      if (!verifiedHuman || verifiedHuman.type !== 'user' || verifiedHuman.openId !== callerOpenId || !isCurrent()) {
-        return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
-      }
       let personal: Awaited<ReturnType<typeof beginLarkCliLogin>>;
       try {
         personal = await (brand === 'lark'
@@ -3447,9 +3455,22 @@ for (const action of ['auth-request', 'auth-status']) {
       authUrl = personal.authUrl;
       grantedScopes = personal.scopes ?? larkCliLoginScopes(scopes);
       poll = async () => {
+        // Respect the #1823 bounded cooldown: a transient provider/transport
+        // failure keeps the challenge but defers the next automatic poll. The
+        // daemon-side tick must keep running through this window, so report
+        // pending (not failed) while cooling down.
+        const challenge = pendingLarkCliChallenge(callerOpenId);
+        if (challenge && (challenge.autoPollAfter ?? 0) > Date.now()) {
+          return { status: 'pending' };
+        }
         const completed = await completeLarkCliLogin(callerOpenId);
         if (completed.state === 'pending') return { status: 'pending' };
         if (completed.state === 'failed') {
+          // A transient failure preserves the challenge (completeLarkCliLogin
+          // only clears it on a terminal outcome). That is retryable: keep the
+          // grant alive and let the next tick re-poll after the cooldown, so a
+          // single network hiccup does not kill an otherwise valid link.
+          if (pendingLarkCliChallenge(callerOpenId)) return { status: 'pending' };
           return { status: 'failed', error: completed.detail ?? 'authorization_failed' };
         }
         const sandbox = ds.session.sandbox;
