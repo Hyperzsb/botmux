@@ -51,6 +51,7 @@ import { closeResidualClause, parseCloseResidual, type ParsedCloseResidual } fro
 import {
   advanceAncestorSessionTurn,
   findAncestorSessionMarkerContext as findLiveAncestorSessionContext,
+  findAuthenticatedAncestorSessionContext,
   resolveSessionContext,
 } from './core/session-marker.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
@@ -201,8 +202,26 @@ import { markGroupContextCardPurpose } from './im/lark/group-context-card.js';
 import { TurnSendLedger, type TurnSendKind } from './services/turn-send-ledger.js';
 import { buildTurnReplyCard, replyCardPresentation } from './im/lark/turn-reply-card.js';
 import { CardRuntimeStatusBridge } from './services/card-runtime-status-bridge.js';
-import { dispatchDeferredTopicSend, reusableDeferredTopicRoot, type DeferredScheduleRunData } from './cli/deferred-topic-send.js';
-import { readDeferredTopicBinding } from './core/deferred-topic-binding.js';
+import {
+  dispatchDeferredTopicSend,
+  localDeferredTopicBindingStore,
+  reusableDeferredTopicRoot,
+  type DeferredScheduleRunData,
+  type DeferredTopicBindingStore,
+  type DeferredTopicSendSession,
+} from './cli/deferred-topic-send.js';
+import {
+  peekRemoteDeferredTopicBinding,
+  remoteDeferredTopicBindingStore,
+  resolveDeferredTopicIpcPort,
+  type DeferredTopicClaimPost,
+} from './cli/deferred-topic-remote-store.js';
+import {
+  probeDeferredTopicBindingWritable,
+  readDeferredTopicBinding,
+  type DeferredTopicBinding,
+} from './core/deferred-topic-binding.js';
+import { DEFERRED_TOPIC_CLAIM_ROUTE, type DeferredTopicClaimResponse } from './core/deferred-topic-claim.js';
 import { callDashboard, type DashboardEndpoint, type DashboardResult } from './cli/dashboard-endpoint.js';
 import { ensureDevboxDashboardExport } from './platform/devbox-dashboard-export.js';
 import { platformMachineBaseUrl, publicReverseProxyBaseUrl } from './platform/binding.js';
@@ -3893,13 +3912,15 @@ async function cmdDashboard(args: string[]): Promise<void> {
 // ─── Session helpers ──────────────────────────────────────────────────────────
 
 interface AdoptedFromData {
-  source?: 'tmux' | 'herdr' | 'zellij';
+  source?: 'tmux' | 'herdr' | 'zellij' | 'orca';
   tmuxTarget?: string;
   zellijSession?: string;
   zellijPaneId?: string;
   herdrSessionName?: string;
   herdrTarget?: string;
   herdrPaneId?: string;
+  orcaTerminalHandle?: string;
+  orcaTerminalTitle?: string;
   originalCliPid?: number;
   sessionId?: string;
   cwd?: string;
@@ -4663,6 +4684,9 @@ function adoptedCliPid(s: SessionData): number | undefined {
 function adoptTargetLabel(s: SessionData): string {
   if (!isAdoptedSession(s)) return '';
   const a = s.adoptedFrom;
+  if (a.source === 'orca' || a.orcaTerminalHandle) {
+    return `adopt: orca ${a.orcaTerminalTitle || a.orcaTerminalHandle || '?'}`;
+  }
   if (a.source === 'zellij' || a.zellijPaneId) {
     const target = a.zellijSession && a.zellijPaneId
       ? `${a.zellijSession}/${a.zellijPaneId}`
@@ -4765,8 +4789,8 @@ function sessionBackingInfo(s: SessionData, snapshot?: BackingProbeSnapshot): {
   if (s.backendType === 'pty') {
     return { backendType: 'pty', probe: 'missing', label: 'pty' };
   }
-  if (s.backendType === 'riff' || s.backendType === 'mojo' || s.backendType === 'remote-runner') {
-    // A remote backend runs its agent off-box, not in a local
+  if (s.backendType === 'riff' || s.backendType === 'mojo' || s.backendType === 'remote-runner' || s.backendType === 'orca') {
+    // A remote backend or adopted Orca terminal runs outside a Botmux-owned local
     // multiplexer pane: there is nothing to probe, attach to, or name as a
     // PersistentBackendTarget (sessionPersistentTarget returns undefined for it, by
     // design). Surface a stable label and report the nonexistent local backing as
@@ -4777,7 +4801,11 @@ function sessionBackingInfo(s: SessionData, snapshot?: BackingProbeSnapshot): {
     // narrow the union, and the exhaustiveness guard at the end of this function
     // depends on that narrowing. Adding a remote backend therefore fails to
     // compile here until it is listed — which is how mojo was caught.
-    return { backendType: s.backendType, probe: 'missing', label: s.backendType };
+    return {
+      backendType: s.backendType,
+      probe: 'missing',
+      label: s.backendType === 'orca' ? adoptTargetLabel(s) : s.backendType,
+    };
   }
   if (s.backendType === undefined) {
     // Legacy rows predate backend stamping. Only tmux was externally attachable,
@@ -5785,7 +5813,7 @@ async function cmdSuspend(): Promise<void> {
 async function postSessionCliIpc(
   ipcPort: number,
   sessionId: string,
-  route: 'slash' | 'cd' | 'close' | 'preview' | 'chat-rename' | 'rename' | 'project' | 'continuation' | 'durable-send' | 'turn-delivery',
+  route: 'slash' | 'cd' | 'close' | 'preview' | 'chat-rename' | 'rename' | 'project' | 'continuation' | 'durable-send' | 'turn-delivery' | typeof DEFERRED_TOPIC_CLAIM_ROUTE | 'chat-manager',
   payload: Record<string, unknown>,
 ): Promise<Response> {
   const requestBody: Record<string, unknown> = { ...payload };
@@ -5793,7 +5821,7 @@ async function postSessionCliIpc(
   if (!process.env.BOTMUX_SEND_RELAY) {
     try { hostSecret = loadDaemonIpcSecret(); } catch { /* sandboxed/read-isolated: capability fallback below */ }
   }
-  if (!hostSecret) {
+  if (!hostSecret || route === 'chat-manager') {
     const claim = readManagedOriginCapability(
       resolveDataDir(),
       sessionId,
@@ -5805,6 +5833,14 @@ async function postSessionCliIpc(
       if (claim.turnId) requestBody.originTurnId = claim.turnId;
       if (claim.dispatchAttempt !== undefined) requestBody.originDispatchAttempt = claim.dispatchAttempt;
     }
+    if (!claim && route === 'chat-manager' && !process.env.BOTMUX_SEND_RELAY && !process.env.BOTMUX_ORIGIN_CHANNEL_ID) {
+      const marker = findAuthenticatedAncestorSessionContext(resolveDataDir());
+      if (marker?.sessionId === sessionId && marker.capability) {
+        requestBody.originCapability = marker.capability;
+        requestBody.originTurnId = marker.turnId;
+        requestBody.originDispatchAttempt = marker.dispatchAttempt;
+      }
+    }
   }
   const path = `/api/sessions/${encodeURIComponent(sessionId)}/${route}`;
   const init = {
@@ -5815,6 +5851,60 @@ async function postSessionCliIpc(
   return hostSecret
     ? fetchDaemonIpc(ipcPort, path, init, hostSecret)
     : loopbackFetch(`http://127.0.0.1:${ipcPort}${path}`, init);
+}
+
+let deferredTopicSidecarWritable: boolean | undefined;
+
+/** The daemon's deferred-topic claim route, or undefined when no daemon port is
+ * known. Used only when this process cannot write the host binding sidecar. */
+function deferredTopicClaimPost(sessionId: string): DeferredTopicClaimPost | undefined {
+  const claim = readManagedOriginCapability(
+    resolveDataDir(),
+    sessionId,
+    process.env.BOTMUX_SEND_RELAY,
+    process.env.BOTMUX_ORIGIN_CHANNEL_ID,
+  );
+  const ipcPort = resolveDeferredTopicIpcPort(claim?.ipcPort, process.env.BOTMUX_DAEMON_IPC_PORT);
+  if (!ipcPort) return undefined;
+  return async (request) => {
+    const res = await postSessionCliIpc(ipcPort, sessionId, DEFERRED_TOPIC_CLAIM_ROUTE, { ...request });
+    const parsed = await res.json().catch(() => undefined) as DeferredTopicClaimResponse | { ok?: false; error?: string } | undefined;
+    if (res.ok && parsed && parsed.ok === true) return parsed as DeferredTopicClaimResponse;
+    return {
+      ok: false,
+      status: (res.status === 400 || res.status === 404 || res.status === 409 || res.status === 502 ? res.status : 409),
+      error: (parsed && 'error' in parsed && typeof parsed.error === 'string') ? parsed.error : `HTTP ${res.status}`,
+    };
+  };
+}
+
+function deferredTopicUsesDaemon(dataDir: string): boolean {
+  deferredTopicSidecarWritable ??= probeDeferredTopicBindingWritable(dataDir);
+  return !deferredTopicSidecarWritable;
+}
+
+/** Binding store for a silent fresh-topic schedule run. A sandboxed /
+ * read-isolated CLI cannot create `<dataDir>/deferred-topics` (EPERM), so the
+ * first-message claim goes through the daemon, which keeps the binding
+ * host-owned. Every other process keeps the local sidecar unchanged. */
+function resolveDeferredTopicStore(dataDir: string, session: DeferredTopicSendSession): DeferredTopicBindingStore {
+  if (deferredTopicUsesDaemon(dataDir)) {
+    const post = deferredTopicClaimPost(session.sessionId);
+    if (post) return remoteDeferredTopicBindingStore(session, post);
+  }
+  return localDeferredTopicBindingStore(dataDir, session.sessionId);
+}
+
+/** Read-only binding lookup for advisory routing checks. Falls back to the
+ * daemon only for a deferred run whose sidecar this process cannot use. */
+async function readDeferredTopicBindingForSend(
+  dataDir: string,
+  session: DeferredTopicSendSession,
+): Promise<DeferredTopicBinding | undefined> {
+  const local = readDeferredTopicBinding(dataDir, session.sessionId);
+  if (local || !session.deferredScheduleRun || !deferredTopicUsesDaemon(dataDir)) return local;
+  const post = deferredTopicClaimPost(session.sessionId);
+  return post ? peekRemoteDeferredTopicBinding(session, post) : undefined;
 }
 
 async function cmdContinuation(argv: string[]): Promise<void> {
@@ -5998,6 +6088,27 @@ async function cmdChat(argv: string[]): Promise<void> {
   }
   console.error(out);
   process.exitCode = 1;
+}
+
+async function cmdChatManager(argv: string[]): Promise<void> {
+  const action = argv[0];
+  if (argv.length !== 1 || !['set', 'clear', 'status'].includes(action)) {
+    console.error('用法: botmux manager set|clear|status');
+    process.exitCode = 2;
+    return;
+  }
+  const sid = findAncestorSessionContext()?.sessionId;
+  const session = sid ? [...loadSessions().values()].find(item => item.sessionId === sid) : undefined;
+  const daemon = session && findDaemon(session.larkAppId);
+  if (!session || !daemon) {
+    console.error(JSON.stringify({ ok: false, error: session ? 'daemon_offline' : 'missing_session_context' }));
+    process.exitCode = 1;
+    return;
+  }
+  const response = await postSessionCliIpc(daemon.ipcPort, session.sessionId, 'chat-manager', { action });
+  const body: any = await response.json().catch(() => ({ ok: false, error: `HTTP ${response.status}` }));
+  if (response.ok && body?.ok) console.log(JSON.stringify(body));
+  else { console.error(JSON.stringify(body)); process.exitCode = 1; }
 }
 
 const SESSION_RENAME_USAGE = '用法: botmux session rename "<标题>"（只改当前会话；会话自动识别，不接受 --session-id 等参数指定其他会话）';
@@ -7090,6 +7201,7 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
 
 飞书消息（在 CLI 会话内自动推断 session）:
   chat rename <新群名称>               修改当前会话所在群的名称
+  manager set|clear|status             设置、取消或查看当前群负责人（会话内使用）
        --proactive                    标记为 AI 主动改名（应用 10 分钟防抖）
 ${SEND_HELP_BODY}
   card patch --message-id <om_xxx> (--card-file <path> | --card-json <json>)
@@ -11045,7 +11157,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     if (getBot(sourceAppId).config.topicUnavailablePolicy === 'stop') {
       const scheduledRoot = reusableDeferredTopicRoot({
         session: { ...topicSourceSession, larkAppId: sourceAppId },
-        binding: readDeferredTopicBinding(dataDir, topicSourceSession.sessionId),
+        binding: await readDeferredTopicBindingForSend(dataDir, { ...topicSourceSession, larkAppId: sourceAppId }),
         explicitTopLevel: false,
       });
       await assertSendTopicsAvailable(sourceAppId, [scheduledRoot],
@@ -11157,6 +11269,7 @@ async function cmdSend(rest: string[]): Promise<void> {
             : !sendInto && (!overrideChatId || overrideChatId === s.chatId)
             ? await dispatchDeferredTopicSend({
                 dataDir: resolveDataDir(),
+                store: () => resolveDeferredTopicStore(resolveDataDir(), s as SessionData & { larkAppId: string }),
                 session: s as SessionData & { larkAppId: string },
                 currentTurnId,
                 explicitTopLevel: sendTopLevel,
@@ -11697,7 +11810,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     }
   }
   const deferredBinding = !sendInto && (!overrideChatId || overrideChatId === s.chatId)
-    ? readDeferredTopicBinding(dataDir, s.sessionId)
+    ? await readDeferredTopicBindingForSend(dataDir, s as SessionData & { larkAppId: string })
     : undefined;
   const deferredRoot = reusableDeferredTopicRoot({
     session: s as SessionData & { larkAppId: string },
@@ -11808,6 +11921,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     if (!sendInto && (!overrideChatId || overrideChatId === s.chatId)) {
       const deferred = await dispatchDeferredTopicSend({
         dataDir: resolveDataDir(),
+        store: () => resolveDeferredTopicStore(resolveDataDir(), s as SessionData & { larkAppId: string }),
         session: s as SessionData & { larkAppId: string },
         currentTurnId,
         explicitTopLevel: sendTopLevel,
@@ -17062,6 +17176,22 @@ function getVersion(): string {
 
 const command = process.argv[2];
 
+if (command === '__orca-relay-local') {
+  const { callLocalOrcaRelay } = await import('./services/orca-local-relay.js');
+  const input = JSON.parse(readFileSync(0, 'utf-8'));
+  if (!Array.isArray(input?.args) || !input.args.every((arg: unknown) => typeof arg === 'string')) throw new Error('Invalid Orca relay arguments');
+  if (!Number.isInteger(input.timeoutMs) || input.timeoutMs <= 0) throw new Error('Invalid Orca relay timeout');
+  if (input.expected && (!['terminalHandle', 'worktreeId', 'agentIdentity'].every(key => typeof input.expected[key] === 'string')
+    || !['ptyId', 'incarnationId', 'executionHostId'].every(key => input.expected[key] === undefined || typeof input.expected[key] === 'string'))) {
+    throw new Error('Invalid Orca relay terminal identity');
+  }
+  const result = await callLocalOrcaRelay(input.args, input.timeoutMs, input.expected);
+  await writeAndFlush(process.stdout, JSON.stringify(result.ok
+    ? { ok: true, result: result.value }
+    : { ok: false, error: { message: result.message } }));
+  process.exit(0);
+}
+
 // Single-file-executable self-hosting: when botmux is a `bun build --compile`
 // binary, it cannot spawn `node dist/index-*.js` (no dist/ on disk). Instead the
 // daemon/core-only/worker/supervisor/dashboard spawners re-exec THIS binary with
@@ -18580,6 +18710,7 @@ switch (command) {
   case 'top-notice': await cmdTopNotice(process.argv.slice(3)); break;
   case 'card':     await cmdCard(process.argv.slice(3)); break;
   case 'chat':     await cmdChat(process.argv.slice(3)); break;
+  case 'manager':  await cmdChatManager(process.argv.slice(3)); break;
   case 'project':  await cmdProject(process.argv.slice(3)); break;
   case 'dispatch': await cmdDispatch(process.argv.slice(3)); break;
   case 'report': await cmdReport(process.argv.slice(3)); break;

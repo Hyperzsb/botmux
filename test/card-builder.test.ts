@@ -119,8 +119,69 @@ describe('buildAdoptSelectCard (V2 picker)', () => {
     const texts = cardTexts(card);
     expect(texts.length).toBe(1);
     expect(texts[0]).toContain('Pi');          // CLI name
+    expect(texts[0]).toContain('Source: 🟢 Running');
     expect(texts[0]).toContain('collie:w3:p1'); // live target label
     expect(texts[0]).not.toContain('Session ID:');
+  });
+
+  it('uses an Orca session title as the heading while keeping its handle internal', () => {
+    const card = parse(buildAdoptSelectCard([{
+      source: 'orca',
+      orcaInstance: 'server',
+      orcaTerminalHandle: 'term_ea5b26db-18f8-4f88-a7f9-4af1fbe9c02f',
+      orcaPtyId: 'serve-1',
+      orcaIncarnationId: 'inc_1',
+      orcaExecutionHostId: 'local',
+      orcaWorktreeId: 'repo::/work',
+      orcaAgentIdentity: 'claude',
+      orcaTerminalTitle: '修复登录问题',
+      cliId: 'claude-code',
+      cwd: '/Users/test/botmux-adopt-orca',
+      paneCols: 100,
+      paneRows: 40,
+      paneSizeVerified: true,
+    }], 'om_root', 'zh'));
+    const [text] = cardTexts(card);
+    expect(text).toContain('**修复登录问题**');
+    expect(text).toContain('来源: 🟢 运行中 · Orca（实验性）');
+    expect(text).not.toContain('位置:');
+    expect(text).not.toContain('term_ea5b26db');
+    const container = card.body.elements.find((e: any) => e.tag === 'interactive_container');
+    expect(container.behaviors[0].value.entry_key)
+      .toBe('live:orca:term_ea5b26db-18f8-4f88-a7f9-4af1fbe9c02f');
+  });
+
+  it('keeps underscores literal inside path and target code spans', () => {
+    const cwd = '/data00/home/test/governance_group_perception_faas-feat-aime-proxy';
+    const card = parse(buildAdoptSelectCard([{
+      source: 'tmux', tmuxTarget: 'a_b:0.0', cliPid: 42, cliId: 'traex', cwd,
+      paneCols: 100, paneRows: 40,
+    }], 'om_root', 'zh'));
+    const [text] = cardTexts(card);
+    expect(text).toContain(`路径: \`${cwd}\``);
+    expect(text).toContain('位置: `a_b:0.0`');
+    expect(text.split('\n').find(line => line.startsWith('路径:'))).not.toContain('\\_');
+    expect(text.split('\n').find(line => line.startsWith('位置:'))).not.toContain('\\_');
+  });
+
+  it('does not expose an Orca handle when the terminal has no readable title', () => {
+    const card = parse(buildAdoptSelectCard([{
+      source: 'orca',
+      orcaInstance: 'relay',
+      orcaTerminalHandle: 'term_internal_uuid',
+      orcaPtyId: 'ssh:h@@pty:1',
+      orcaIncarnationId: 'inc_1',
+      orcaWorktreeId: 'repo::/work',
+      orcaAgentIdentity: 'claude',
+      cliId: 'claude-code',
+      cwd: '/Users/test/botmux-adopt-orca',
+      paneCols: 100,
+      paneRows: 40,
+      paneSizeVerified: true,
+    }], 'om_root', 'zh'));
+    const [text] = cardTexts(card);
+    expect(text).not.toContain('位置:');
+    expect(text).not.toContain('term_internal_uuid');
   });
 
   it('renders a native title for a live TraeX session instead of the project directory', () => {
@@ -151,6 +212,7 @@ describe('buildAdoptSelectCard (V2 picker)', () => {
     ));
     const texts = cardTexts(card);
     expect(texts.length).toBe(1);
+    expect(texts[0]).toContain('Source: 🕘 History');
     expect(texts[0]).not.toContain('codex-rollout-abc123');
     // The selectable container carries a resume: entry_key.
     const container = card.body.elements.find((e: any) => e.tag === 'interactive_container');
@@ -307,7 +369,7 @@ describe('buildAdoptSelectCard (V2 picker)', () => {
     const texts = cardTexts(parse(buildAdoptSelectCard([tmux, zellij], 'om_root', 'en')));
     expect(texts).toEqual([
       ['**alpha**', 'Source: 🟢 Running', 'CLI: Codex', 'Path: `/work/alpha`', 'Location: `dev:0.0`', 'Uptime: unknown'].join('\n'),
-      ['**beta**', 'Source: 🟢 Running', 'CLI: Codex', 'Path: `/work/beta`', 'Location: `mywork/terminal\\_1`', 'Uptime: unknown'].join('\n'),
+      ['**beta**', 'Source: 🟢 Running', 'CLI: Codex', 'Path: `/work/beta`', 'Location: `mywork/terminal_1`', 'Uptime: unknown'].join('\n'),
     ]);
   });
 

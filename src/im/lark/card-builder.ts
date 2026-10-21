@@ -5,6 +5,7 @@ import type { CliId, ResumableSession } from '../../adapters/cli/types.js';
 import { CLI_DISPLAY_NAMES } from '../../adapters/cli/display-names.js';
 import { adoptTargetKey, adoptTargetLabel, type AdoptableSession } from '../../core/session-discovery.js';
 import type { ZellijAdoptableSession } from '../../core/zellij-adopt-discovery.js';
+import type { OrcaAdoptableSession } from '../../core/orca-adopt-discovery.js';
 import type { CodexAppThreadSummary } from '../../services/codex-app-threads.js';
 import type { DisplayMode, StreamStatus } from '../../types.js';
 import type { CliUsageLimitState } from '../../utils/cli-usage-limit.js';
@@ -369,6 +370,11 @@ export function getCliDisplayName(cliId: CliId): string {
  *  `<at id=…></at>` tag and spoof a mention in a `lark_md` body. */
 function escapeMd(s: string): string {
   return s.replace(/[*_~`\[\]\\<>]/g, c => `\\${c}`);
+}
+
+/** Inline code is literal: markdown escaping would surface visible backslashes. */
+function inlineCode(s: string): string {
+  return `\`${s.replace(/[`\r\n]+/g, '')}\``;
 }
 
 /** Sanitize a user-derived string for a `plain_text` HEADER title. Unlike
@@ -2793,13 +2799,15 @@ export interface AdoptPickerEntry {
    *  Deterministic so a re-render (which re-discovers) reproduces the same key. */
   key: string;
   kind: AdoptEntryKind;
+  /** Live backend shown in the source field. Resume rows have no live backend. */
+  liveBackend?: 'tmux' | 'Zellij' | 'Herdr' | 'Orca';
   cliId?: CliId;
   cliDisplayName?: string;
   /** resume: the CLI's native title when the transcript has one, else the
    *  first real user prompt (see ResumableSession.title); live: backend /
    *  CLI display name (herdr pane label / Claude terminal title / TraeX native
-   *  title, see AdoptableSession.title and ZellijAdoptableSession.title), else
-   *  project (cwd basename). */
+   *  title, see AdoptableSession.title and ZellijAdoptableSession.title) or the
+   *  Orca terminal title, else project (cwd basename). */
   title: string;
   /** cwd basename, shown compactly. */
   project: string;
@@ -2828,7 +2836,14 @@ export interface AdoptPickerEntry {
  *  匹配"): (zellijSession, zellijPaneId) already uniquely identifies the pane.
  *  tmux/herdr keep adoptTargetKey (tmux includes pid, herdr does not) — tmux's
  *  confirm fast-path parses the trailing pid, and that path is unchanged. */
-export function adoptLiveKey(s: AdoptableSession | ZellijAdoptableSession): string {
+function isOrcaAdoptCandidate(
+  s: AdoptableSession | ZellijAdoptableSession | OrcaAdoptableSession,
+): s is OrcaAdoptableSession {
+  return 'source' in s && s.source === 'orca';
+}
+
+export function adoptLiveKey(s: AdoptableSession | ZellijAdoptableSession | OrcaAdoptableSession): string {
+  if (isOrcaAdoptCandidate(s)) return `live:orca:${s.orcaTerminalHandle}`;
   if ('zellijPaneId' in s) return `live:zellij:${s.zellijSession}/${s.zellijPaneId}`;
   return `live:${adoptTargetKey(s)}`;
 }
@@ -2842,7 +2857,7 @@ export function adoptLiveKey(s: AdoptableSession | ZellijAdoptableSession): stri
  *  CLI, so the caller knows it), and the user wants to see "Codex" on each
  *  history row rather than a blank. */
 export function buildAdoptEntries(
-  sessions: Array<AdoptableSession | ZellijAdoptableSession>,
+  sessions: Array<AdoptableSession | ZellijAdoptableSession | OrcaAdoptableSession>,
   resumable: ResumableSession[],
   resumeCliId?: CliId,
   runtimeDisplayName?: string,
@@ -2851,13 +2866,22 @@ export function buildAdoptEntries(
   const live: AdoptPickerEntry[] = sessions.map((s) => {
     const zellij = 'zellijPaneId' in s;
     const project = s.cwd.split('/').pop() || s.cwd;
-    const target = zellij ? `${s.zellijSession}/${s.zellijPaneId}` : adoptTargetLabel(s);
+    const title = isOrcaAdoptCandidate(s)
+      ? s.orcaTerminalTitle || project
+      : s.title || project;
+    let target: string | undefined;
+    if (isOrcaAdoptCandidate(s)) target = undefined;
+    else if ('zellijPaneId' in s) target = `${s.zellijSession}/${s.zellijPaneId}`;
+    else target = adoptTargetLabel(s);
     return {
       key: adoptLiveKey(s),
       kind: 'live' as const,
+      liveBackend: isOrcaAdoptCandidate(s)
+        ? 'Orca'
+        : zellij ? 'Zellij' : s.source === 'herdr' ? 'Herdr' : 'tmux',
       cliId: s.cliId,
       ...(customName && s.cliId === resumeCliId ? { cliDisplayName: customName } : {}),
-      title: s.title || project,
+      title,
       project,
       cwd: s.cwd,
       sessionId: s.sessionId,
@@ -2917,7 +2941,7 @@ function adoptPickerFilter(entries: AdoptPickerEntry[], query: string | undefine
  * knows to narrow via search instead of assuming they saw everything.
  */
 export function buildAdoptSelectCard(
-  sessions: Array<AdoptableSession | ZellijAdoptableSession>,
+  sessions: Array<AdoptableSession | ZellijAdoptableSession | OrcaAdoptableSession>,
   rootMessageId?: string,
   locale?: Locale,
   resumable?: ResumableSession[],
@@ -3006,8 +3030,12 @@ export function buildAdoptSelectCard(
   // ─── Session cards (current page) ───────────────────────────────────
   visible.forEach((e) => {
     const isSelected = e.key === selectedKey;
+    // 既有后端（tmux/Zellij/Herdr）的「来源」行保持原样，避免改变老用户卡片形态；
+    // 仅 Orca 作为实验能力追加后端名与实验性标记（后端身份仍可从「位置」行看出）。
     const kindTag = e.kind === 'live'
-      ? t('card.adopt.kind_live', undefined, locale)
+      ? (e.liveBackend === 'Orca'
+        ? `${t('card.adopt.kind_live', undefined, locale)} · Orca${t('card.adopt.orca_experimental_suffix', undefined, locale)}`
+        : t('card.adopt.kind_live', undefined, locale))
       : t('card.adopt.kind_resume', undefined, locale);
     const cliName = e.cliDisplayName ?? (e.cliId ? getCliDisplayName(e.cliId) : '—');
     const timeLabel = e.kind === 'live'
@@ -3023,10 +3051,10 @@ export function buildAdoptSelectCard(
       titleLine,
       `${labelKind}: ${kindTag}`,
       `${labelCli}: ${escapeMd(cliName)}`,
-      `${labelDir}: \`${escapeMd(e.cwd)}\``,
+      `${labelDir}: ${inlineCode(e.cwd)}`,
     ];
     if (e.kind === 'resume' && e.candidateNumber) lines.push(`${labelCandidate}: #${e.candidateNumber}`);
-    if (e.kind === 'live' && e.target) lines.push(`${labelTarget}: \`${escapeMd(e.target)}\``);
+    if (e.kind === 'live' && e.target) lines.push(`${labelTarget}: ${inlineCode(e.target)}`);
     lines.push(`${timeLabel}: ${timeVal}`);
     elements.push({
       tag: 'interactive_container',
