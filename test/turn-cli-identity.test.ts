@@ -22,6 +22,7 @@ import { join } from 'node:path';
 
 vi.mock('../src/utils/user-token.js', () => ({
   lookupAuthorizedUserName: vi.fn(() => undefined),
+  resolveUserToken: vi.fn(async () => null),
 }));
 
 // bytedcli shells out to the real CLI; here we control who is authorized.
