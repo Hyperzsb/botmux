@@ -845,6 +845,9 @@ describe('resolveRedirectedAdapterAuthPaths (redirect authPath suppression)', ()
     expect(src).toMatch(/relative\(canonicalManagedSessionsRoot,\s*canonicalManagedSessionDir\)/);
   });
 
+  // 源码结构护栏(K3)：worker 必须无条件 seal 整个 session-tmp 根（跨会话快照
+  // 凭据隔离的唯一闸门）并让 larkdev 在宿主 host-only deny 路径收口；没有纯
+  // 函数 seam 可断言这两条装配，回归代价是跨发送人可读他人凭据，故保留读源码。
   it('WIRING GUARD: worker always seals shared session-tmp and wires larkdev host auth denies', () => {
     const src = readFileSync(resolve('src/worker.ts'), 'utf8');
     expect(src).toContain('mandatoryDenyPaths.push(canonical(sessionTempRoot()))');
