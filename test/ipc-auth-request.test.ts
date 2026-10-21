@@ -253,7 +253,7 @@ describe('agent authorization', () => {
     expect(await response.json()).toEqual({ ok: true, status: 'ready' });
     expect(cliIdentity.refreshSessionIdentity).toHaveBeenCalledWith(expect.any(String), 'auth-session', {
       tool: 'lark-cli', mode: 'user-home', home: '/homes/ou_sender',
-      turnId: 'om_next',
+      turnId: 'om_next', openId: 'ou_sender',
     });
   });
 
@@ -266,6 +266,55 @@ describe('agent authorization', () => {
     expect(response.status).toBe(409);
     expect(await response.json()).toEqual({ ok: false, error: 'auth_turn_changed' });
     expect(cliIdentity.refreshSessionIdentity).not.toHaveBeenCalled();
+  });
+
+  // REAL refreshSessionIdentity (not the stubbed spy): a scope top-up for an
+  // ALREADY authorized sender is the main on_missing_scope path. The existing
+  // identity file is stamped with that sender's openId; the refresh must carry
+  // the SAME openId or the principal-consistency check rejects it (409). This
+  // guards against regressing the user-home openId argument (a stubbed
+  // refreshSessionIdentity returning true would hide it).
+  it('top-up refreshes an already granted personal HOME through the real identity write', async () => {
+    const refreshSpy = vi.mocked(cliIdentity.refreshSessionIdentity);
+    refreshSpy.mockRestore(); // use the real implementation for this test
+    const dataDir = config.session.dataDir;
+    const larkHome = '/homes/ou_sender-real';
+    vi.mocked(larkCliAuth.larkCliHomeForTurn).mockResolvedValue(larkHome as any);
+    // Pre-existing GRANTED personal identity for THIS turn + sender (stamped).
+    cliIdentity.publishActiveTurn(dataDir, 'auth-session', 'om_turn');
+    cliIdentity.writeSessionIdentity(dataDir, 'auth-session', {
+      tool: 'lark-cli', mode: 'user-home', home: '/old-home', turnId: 'om_turn', openId: 'ou_sender',
+    });
+    requestId = (await (await post()).json()).requestId;
+    personalComplete.mockResolvedValue({ state: 'authorized' });
+    const response = await post('auth-status', { requestId });
+    expect(response.status, await response.text()).toBe(200);
+    // The real write replaced the home while keeping the same principal stamp.
+    const body = (await import('node:fs')).readFileSync(
+      cliIdentity.sessionIdentityPath(dataDir, 'auth-session', 'lark-cli'), 'utf8');
+    expect(body).toContain("BOTMUX_IDENTITY_HOME='" + larkHome + "'");
+    expect(body).toContain("BOTMUX_IDENTITY_OPEN_ID='ou_sender'");
+  });
+
+  it('real refresh refuses a top-up whose stamped principal differs from the live sender', async () => {
+    const refreshSpy = vi.mocked(cliIdentity.refreshSessionIdentity);
+    refreshSpy.mockRestore();
+    const dataDir = config.session.dataDir;
+    vi.mocked(larkCliAuth.larkCliHomeForTurn).mockResolvedValue('/homes/ou_sender-real' as any);
+    // Existing file stamped for a DIFFERENT human.
+    cliIdentity.publishActiveTurn(dataDir, 'auth-session', 'om_turn');
+    cliIdentity.writeSessionIdentity(dataDir, 'auth-session', {
+      tool: 'lark-cli', mode: 'user-home', home: '/old-home', turnId: 'om_turn', openId: 'ou_someone_else',
+    });
+    requestId = (await (await post()).json()).requestId;
+    personalComplete.mockResolvedValue({ state: 'authorized' });
+    const response = await post('auth-status', { requestId });
+    expect(response.status).toBe(409);
+    // The mismatched file must not have been overwritten with the new home.
+    const body = (await import('node:fs')).readFileSync(
+      cliIdentity.sessionIdentityPath(dataDir, 'auth-session', 'lark-cli'), 'utf8');
+    expect(body).toContain("BOTMUX_IDENTITY_HOME='/old-home'");
+    expect(body).not.toContain('ou_sender-real');
   });
 
   it('rejects a caller change during identity resolution', async () => {
@@ -288,6 +337,7 @@ describe('agent authorization', () => {
     expect(await ready.json()).toEqual({ ok: true, status: 'ready' });
     expect(cliIdentity.refreshSessionIdentity).toHaveBeenCalledWith(expect.any(String), 'auth-session', {
       tool: 'lark-cli', mode: 'user-home', home: '/homes/ou_sender', turnId: 'om_turn',
+      openId: 'ou_sender',
     });
   });
 
@@ -454,6 +504,7 @@ describe.skipIf(process.platform !== 'linux')('agent authorization over a manage
     expect(await ready.json()).toEqual({ ok: true, status: 'ready' });
     expect(cliIdentity.refreshSessionIdentity).toHaveBeenCalledWith(expect.any(String), 'host-session', {
       tool: 'lark-cli', mode: 'user-home', home: '/homes/ou_host', turnId: 'om_host',
+      openId: 'ou_host',
     });
   });
 });

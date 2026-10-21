@@ -3001,7 +3001,8 @@ for (const action of ['auth-request', 'auth-status']) {
           });
         }
         return refreshSessionIdentity(config.session.dataDir, params.sessionId, {
-          tool: 'lark-cli', mode: 'user-home', home: result.home, turnId: publishTurnId,
+          tool: 'lark-cli', mode: 'user-home', home: result.home,
+          turnId: publishTurnId, openId: publishOpenId,
         });
       };
       if (isCurrent() && request.isCurrent()) {
