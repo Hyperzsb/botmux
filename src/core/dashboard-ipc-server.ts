@@ -48,6 +48,7 @@ import { validateCodexServiceTier } from '../services/codex-service-tier-catalog
 import { botInjectedEnv, buildSessionChildEnv } from './env-policy.js';
 import * as asyncTriggerStore from '../services/async-trigger-store.js';
 import { resolveAsyncTriggerState, decideAsyncOwnership } from '../services/async-trigger-state.js';
+import { isLoopbackPeer } from '../utils/loopback-peers.js';
 import * as scheduleStore from '../services/schedule-store.js';
 import type { ScheduleReasoningEffort } from '../services/schedule-store.js';
 import { queryScheduleRunLogs } from '../services/schedule-run-log-store.js';
@@ -144,6 +145,14 @@ import { findConfigField, applyConfigField, applyPerBotEnvChange, coerceConfigVa
 import { defaultReplyDeliveryFor, effectiveReplyDelivery, supportsTranscriptReplyDelivery } from './reply-delivery.js';
 import { resolveFeedbackTeamId, traceFeedbackPolicyForDelivery } from '../services/feedback-policy-resolver.js';
 import { recordRelayedTurnDelivery, RELAYED_TURN_DELIVERY_MAX_BYTES, RELAYED_TURN_DELIVERY_ROUTE } from './relayed-turn-delivery.js';
+import {
+  emptyLinkRefExtractionStats,
+  LINK_REF_REGISTER_MAX_BODY_BYTES,
+  LINK_REF_RESOLVE_MAX_BODY_BYTES,
+  parseLinkRefRegistrationBody,
+  parseLinkRefResolveBody,
+} from './link-ref-ipc.js';
+import { getLinkRefRuntime } from '../services/link-ref-runtime.js';
 import { globalBuiltinSkillInjectionDefault, resolveSkillInjectionSupport } from '../skills/injection-mode.js';
 import { summaryRangeFromBotConfig, updateDashboardSummaryRange } from '../services/summary-range-store.js';
 import { config } from '../config.js';
@@ -232,6 +241,10 @@ import { buildScopeDeepLink } from '../setup/verify-permissions.js';
 import { sessionConfiguredRuntimeDisplayName } from './cli-runtime-display.js';
 import { locateLimiter } from './dashboard-locate.js';
 import { DEFAULT_SESSION_OWNER_REMINDER } from './session-owner-reminder.js';
+import {
+  selectIdleSuspendCandidates,
+  sweepIdleWorkersByAgeAfterTurnDrain,
+} from './idle-worker-sweeper.js';
 import { updateSessionOwnerReminderConfig } from '../services/session-owner-reminder-config-store.js';
 import { sendSessionOwnerThreadNotification } from '../services/session-owner-notification.js';
 import { matchesExpectedSessionLocateScope, type SessionLocateExpectedScope } from './session-locate-guard.js';
@@ -450,7 +463,7 @@ import { tokenStoreProtection, triggerUserAuthApplies, credentialSourceOf, type 
 import {
   beginLarkCliLogin,
   completeLarkCliLogin,
-  larkCliHomeForTurn,
+  resolveLarkCliHomeForTurn as larkCliHomeForTurn,
   larkCliLoginScopes,
   materializeLarkCliHomeForSession,
 } from '../services/lark-cli-auth.js';
@@ -1102,7 +1115,7 @@ export function routeHasNarrowUntrustedAuth(method: string, pathname: string): b
   // 该会话的 rotating per-turn
   // capability 并绑定到 URL 里的 sessionId（同 /api/asks 姿势）——capability 只
   // 证明「我是这个会话当前这一轮的 CLI」，选不了别的会话。
-  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|preview|chat-rename|chat-manager|rename|project|project-dispatch-policy|continuation|durable-send|turn-delivery|deferred-topic|auth-request|auth-status)$/.test(pathname)) return true;
+  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|preview|chat-rename|chat-manager|rename|project|project-dispatch-policy|continuation|durable-send|turn-delivery|deferred-topic|link-refs\/register|link-refs\/resolve|auth-request|auth-status)$/.test(pathname)) return true;
   // UserPromptSubmit hook 的 envelope claim：沙箱内 hook 读不到 host secret，
   // 走 body 里的 per-turn capability；handler 内 sessionCliIpcAuth 绑定到 URL 的
   // sessionId + 按 managedTurnOrigin.turnId 权威取（同 /close 姿势）。
@@ -1347,6 +1360,7 @@ async function handleManagedOriginAttestation(
         ...(origin.dispatchAttempt !== undefined
           ? { dispatchAttempt: origin.dispatchAttempt }
           : {}),
+        ...(origin.linkRefMode ? { linkRefMode: origin.linkRefMode } : {}),
         requiresCodexAppLedger: codexDecision.requiresLedger,
         issuedAtMs: Date.now(),
       },
@@ -1817,6 +1831,115 @@ ipcRoute('POST', '/api/sessions/:sessionId/durable-send', async (req, res, param
       ok: false,
       error: error instanceof Error ? error.message : String(error),
     });
+  }
+});
+
+/** Register model-visible history/quoted result URLs against the exact live
+ * turn. Identity and mode are daemon-owned; the body carries source data only. */
+ipcRoute('POST', '/api/sessions/:sessionId/link-refs/register', async (req, res, params) => {
+  let body: unknown;
+  try {
+    body = await readJsonBody(req, LINK_REF_REGISTER_MAX_BODY_BYTES);
+  } catch (error) {
+    return jsonRes(
+      res,
+      error instanceof JsonBodyTooLargeError ? 413 : 400,
+      { ok: false, error: error instanceof JsonBodyTooLargeError ? 'body_too_large' : 'bad_json' },
+    );
+  }
+  const record = body && typeof body === 'object' && !Array.isArray(body)
+    ? body as Record<string, unknown>
+    : undefined;
+  const ds = findActiveBySessionId(params.sessionId);
+  const auth = sessionCliIpcAuth(req, ds, params.sessionId, record);
+  if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
+  if (!ds || ds.session.status === 'closed') {
+    return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  }
+  const parsed = parseLinkRefRegistrationBody(body);
+  if (!parsed.ok) return jsonRes(res, 400, { ok: false, error: 'invalid_link_ref_source' });
+
+  const origin = ds.managedTurnOrigin;
+  if (!origin?.turnId) {
+    return jsonRes(res, 409, { ok: false, error: 'no_active_turn' });
+  }
+  const mode = origin.linkRefMode;
+  if (mode !== 'observe' && mode !== 'enabled') {
+    return jsonRes(res, 200, { ok: true, stats: emptyLinkRefExtractionStats() });
+  }
+
+  try {
+    const result = getLinkRefRuntime()?.registerSources({
+      key: {
+        appId: ds.larkAppId,
+        sessionId: params.sessionId,
+        turnId: origin.turnId,
+        ...(origin.dispatchAttempt !== undefined
+          ? { dispatchAttempt: origin.dispatchAttempt }
+          : {}),
+      },
+      mode,
+      sources: [parsed.source],
+    });
+    return jsonRes(res, 200, {
+      ok: true,
+      ...(result?.companion ? { companion: result.companion } : {}),
+      stats: result?.stats ?? emptyLinkRefExtractionStats(),
+    });
+  } catch {
+    return jsonRes(res, 200, { ok: true, stats: emptyLinkRefExtractionStats() });
+  }
+});
+
+/** Expand outbound LinkRefs against the daemon-owned exact live turn. The
+ * caller supplies presentation data only; identity, mode and ledger access are
+ * derived from the authenticated session. */
+ipcRoute('POST', '/api/sessions/:sessionId/link-refs/resolve', async (req, res, params) => {
+  let body: unknown;
+  try {
+    body = await readJsonBody(req, LINK_REF_RESOLVE_MAX_BODY_BYTES);
+  } catch (error) {
+    return jsonRes(
+      res,
+      error instanceof JsonBodyTooLargeError ? 413 : 400,
+      { ok: false, error: error instanceof JsonBodyTooLargeError ? 'link_ref_limit_exceeded' : 'bad_json' },
+    );
+  }
+  const record = body && typeof body === 'object' && !Array.isArray(body)
+    ? body as Record<string, unknown>
+    : undefined;
+  const ds = findActiveBySessionId(params.sessionId);
+  const auth = sessionCliIpcAuth(req, ds, params.sessionId, record);
+  if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
+  if (!ds || ds.session.status === 'closed') {
+    return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  }
+  const parsed = parseLinkRefResolveBody(body);
+  if (!parsed.ok) return jsonRes(res, 400, { ok: false, error: 'invalid_link_ref_payload' });
+  const origin = ds.managedTurnOrigin;
+  if (!origin?.turnId || origin.linkRefMode !== 'enabled') {
+    return jsonRes(res, 409, { ok: false, error: 'link_ref_turn_not_open' });
+  }
+  const runtime = getLinkRefRuntime();
+  if (!runtime) return jsonRes(res, 503, { ok: false, error: 'link_ref_ledger_unavailable' });
+  try {
+    const payload = runtime.resolveForDaemon({
+      appId: ds.larkAppId,
+      sessionId: params.sessionId,
+      turnId: origin.turnId,
+      ...(origin.dispatchAttempt !== undefined
+        ? { dispatchAttempt: origin.dispatchAttempt }
+        : {}),
+    }, 'enabled', parsed.payload);
+    return jsonRes(res, 200, { ok: true, payload });
+  } catch (error) {
+    const code = error && typeof error === 'object' && 'code' in error
+      ? String((error as { code: unknown }).code)
+      : 'link_ref_ledger_unavailable';
+    const stable = code.startsWith('link_ref_') || code === 'expected_link_invalid_after_link_ref'
+      ? code
+      : 'link_ref_ledger_unavailable';
+    return jsonRes(res, 409, { ok: false, error: stable });
   }
 });
 
@@ -2534,12 +2657,105 @@ ipcRoute('POST', '/api/sessions/:sessionId/suspend', async (_req, res, params) =
       ok: true, sessionId: params.sessionId, suspended: false, reason: 'deferred',
     });
   }
-  if (!suspendWorker(ds, 'manual_suspend')) {
-    // Live worker but a non-suspendable (pty) backend: killing it would drop the
-    // in-memory conversation with no persistent pane to resume from lazily.
+  if (!isSuspendableBackendType(ds.initConfig?.backendType)) {
     return jsonRes(res, 409, { ok: false, error: 'backend_not_suspendable' });
   }
+  if (!suspendWorker(ds, 'manual_suspend')) {
+    // The backend is nominally suspendable, so false means the exact backing
+    // teardown could not be positively verified (or a last-moment ownership
+    // guard refused). Never report dormant success in that state.
+    return jsonRes(res, 409, { ok: false, error: 'suspend_failed' });
+  }
   jsonRes(res, 200, { ok: true, sessionId: params.sessionId, suspended: true });
+  });
+});
+
+/**
+ * Preview or execute age-based idle suspension for THIS daemon. This operator
+ * route is host-only even in tests/dev servers: loopback alone is not identity.
+ * Preview is read-only; execution re-evaluates the strict candidate set after
+ * every already-admitted turn has drained.
+ */
+ipcRoute('POST', '/api/maintenance/suspend-idle', async (req, res) => {
+  if (!isTrustedHostIpcRequest(req)) {
+    return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
+  }
+  if (coordinationModeIsPrimary()) {
+    return jsonRes(res, 409, { ok: false, error: 'durable_primary_unsupported' });
+  }
+
+  let body: { execute?: unknown; olderThanMs?: unknown };
+  try { body = await readJsonBody(req, 4_096); }
+  catch (error) {
+    return jsonRes(
+      res,
+      error instanceof JsonBodyTooLargeError ? 413 : 400,
+      { ok: false, error: error instanceof JsonBodyTooLargeError ? 'body_too_large' : 'bad_json' },
+    );
+  }
+  if (typeof body.execute !== 'boolean') {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_execute' });
+  }
+  if (typeof body.olderThanMs !== 'number'
+    || !Number.isSafeInteger(body.olderThanMs) || body.olderThanMs <= 0) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_older_than_ms' });
+  }
+
+  const registry = getActiveSessionsRegistry();
+  if (!registry) return jsonRes(res, 503, { ok: false, error: 'session_registry_unavailable' });
+  const runtimeAppIds = new Set(
+    [...registry.values()].map(ds => ds.larkAppId).filter(Boolean),
+  );
+  if (runtimeAppIds.size > 1
+    || (cachedLarkAppId && runtimeAppIds.size === 1 && !runtimeAppIds.has(cachedLarkAppId))) {
+    return jsonRes(res, 409, { ok: false, error: 'ambiguous_daemon_scope' });
+  }
+  const larkAppId = cachedLarkAppId || [...runtimeAppIds][0];
+  if (!larkAppId) return jsonRes(res, 503, { ok: false, error: 'daemon_scope_unavailable' });
+
+  const options = { olderThanMs: body.olderThanMs };
+  if (!body.execute) {
+    const candidates = selectIdleSuspendCandidates(registry, options);
+    return jsonRes(res, 200, {
+      ok: true,
+      execute: false,
+      larkAppId,
+      olderThanMs: body.olderThanMs,
+      candidates,
+      suspended: [],
+      failures: [],
+      affected: 0,
+    });
+  }
+
+  const result = await sweepIdleWorkersByAgeAfterTurnDrain(larkAppId, registry, options);
+  if (result === null) {
+    return jsonRes(res, 409, { ok: false, error: 'mutation_gate_busy' });
+  }
+  for (const candidate of result.suspended) {
+    logger.info(
+      `[idle-suspend] reason=idle_timeout session=${candidate.sessionId} bot=${larkAppId} `
+      + `lastActivity=${new Date(candidate.lastActivityAt).toISOString()} `
+      + `releaseRequested=${candidate.processTypes.join(',')} `
+      + `backingReleased=${candidate.backingReleased === true} `
+      + `workerRetirementRequested=${candidate.workerRetirementRequested === true}`,
+    );
+  }
+  for (const failure of result.failures) {
+    logger.warn(
+      `[idle-suspend] reason=idle_timeout session=${failure.candidate.sessionId} bot=${larkAppId} `
+      + `result=${failure.error}`,
+    );
+  }
+  return jsonRes(res, 200, {
+    ok: result.failures.length === 0,
+    execute: true,
+    larkAppId,
+    olderThanMs: body.olderThanMs,
+    candidates: result.candidates,
+    suspended: result.suspended,
+    failures: result.failures,
+    affected: result.suspended.length,
   });
 });
 
@@ -2907,15 +3123,66 @@ type SessionAuthPollResult =
 
 const sessionAuthRequests = new Map<string, {
   sessionId: string;
+  appId: string;
   /** Human who approved this grant, frozen at request creation. The live origin
    *  of a later auth-status call may already belong to another turn or another
    *  person; this frozen id is the only safe same-principal reference. */
   callerOpenId: string;
+  /** Link + granted scopes to return for a reused pending request. */
+  authUrl: string;
+  grantedScopes: string[];
+  /** Creating-turn closure: true only while the exact originating turn is live. */
   isCurrent: () => boolean;
-  /** boundTool (#1606 standard session) → Bot-application user token;
-   *  trigger-user personal mode → per-sender personal-app HOME. */
+  /** Session/app liveness used to keep or retire the daemon-side background poll. */
+  isValid: () => boolean;
+  status: 'pending' | 'ready' | 'failed';
+  expiresAt: number;
+  /** Poll for either a Bot-app user token or a personal-app HOME grant. */
   poll: () => Promise<SessionAuthPollResult>;
+  dispose: () => void;
 }>();
+
+// The daemon owns device-grant completion. Ending an Agent turn must not abandon
+// a link already sent to its verified user. This never dispatches a new turn or
+// injects credentials: those actions still require a fresh current-actor proof.
+function trackSessionAuthorization(
+  requestId: string,
+  entry: Omit<NonNullable<ReturnType<typeof sessionAuthRequests.get>>, 'status' | 'expiresAt' | 'poll' | 'dispose'> & {
+    expiresIn: number;
+    poll: () => Promise<SessionAuthPollResult>;
+  },
+): void {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let disposed = false;
+  const request = {
+    ...entry,
+    status: 'pending' as 'pending' | 'ready' | 'failed',
+    expiresAt: Date.now() + entry.expiresIn * 1_000,
+    poll: async () => {
+      const result = await entry.poll();
+      request.status = result.status === 'failed' ? 'failed' : result.status;
+      return result;
+    },
+    dispose: () => { disposed = true; clearTimeout(timer); clearTimeout(expiry); },
+  };
+  const tick = async () => {
+    if (disposed) return;
+    if (!entry.isValid()) {
+      request.dispose();
+      sessionAuthRequests.delete(requestId);
+      return;
+    }
+    try { await request.poll(); }
+    catch { request.status = 'failed'; }
+    if (!disposed && request.status === 'pending') timer = setTimeout(tick, 2_000).unref();
+  };
+  const expiry = setTimeout(() => {
+    request.dispose();
+    sessionAuthRequests.delete(requestId);
+  }, entry.expiresIn * 1_000).unref();
+  sessionAuthRequests.set(requestId, request);
+  timer = setTimeout(tick, 2_000).unref();
+}
 
 for (const action of ['auth-request', 'auth-status']) {
   ipcRoute('POST', `/api/sessions/:sessionId/${action}`, async (req, res, params) => {
@@ -2993,16 +3260,11 @@ for (const action of ['auth-request', 'auth-status']) {
       && ds.managedTurnOrigin?.turnId === turnId && ds.managedTurnOrigin?.capability === capability
       && ds.managedTurnOrigin?.dispatchAttempt === attempt && requestingUser() === callerOpenId
       && JSON.stringify(getLarkToolDelegation(config.session.dataDir, params.sessionId, turnId)) === JSON.stringify(delegated);
-    // The authorization may outlive the turn that started it: the same human's
-    // follow-up message rotates the turn while they are tapping the approval
-    // link. Keep polling (and accept the granted token) as long as the session's
-    // live caller is still THAT human. A different caller stays a hard failure.
-    const samePrincipalActive = (): boolean => {
-      const live = findActiveBySessionId(params.sessionId);
-      return live === ds && ds.session.status === 'active' && !!ds.worker && !ds.worker.killed
-        && requestingUser() === callerOpenId;
-    };
-    const authorizationCurrent = (): boolean => isCurrent() || samePrincipalActive();
+    // An accepted grant outlives its originating turn: the daemon-side poll
+    // keeps completing it while the session/app stay valid (isAuthorizationValid),
+    // and auth-status publishes the identity only to a live turn whose caller is
+    // the same human (frozen on the request). A different caller stays refused.
+    //
     // Identity model for this scope grant:
     //  - A #1606 standard session binding, OR a cross-app delegation, is issued
     //    by a (target) Bot application and served live / as a target-app token.
@@ -3017,13 +3279,16 @@ for (const action of ['auth-request', 'auth-status']) {
 
     if (action === 'auth-status') {
       const request = typeof body.requestId === 'string' ? sessionAuthRequests.get(body.requestId) : undefined;
-      if (!request || request.sessionId !== params.sessionId) {
+      if (!request || request.sessionId !== params.sessionId || request.appId !== ds.larkAppId) {
         return jsonRes(res, 409, { ok: false, error: 'auth_request_expired' });
       }
       // A different human (including a different human behind the same bot)
       // must not poll or publish the previous person's grant.
       if (request.callerOpenId !== callerOpenId) {
         return jsonRes(res, 409, { ok: false, error: 'auth_turn_changed' });
+      }
+      if (!request.isValid()) {
+        return jsonRes(res, 409, { ok: false, error: 'auth_request_expired' });
       }
       const result = await request.poll();
       if (result.status === 'pending') return jsonRes(res, 200, { ok: true, status: 'pending' });
@@ -3087,81 +3352,101 @@ for (const action of ['auth-request', 'auth-status']) {
     const scopes = [...new Set(body.scopes as string[])];
     const unknownScopes = scopes.filter(scope => !isKnownLarkUserScope(scope, body.allowUnknown === true ? { allowUnknown: true } : undefined));
     if (unknownScopes.length) return jsonRes(res, 400, { ok: false, error: 'unknown_scopes', scopes: unknownScopes });
+    // Issuance is turn-bound; an accepted grant belongs to this app/user and
+    // session until its own deadline. A different speaker cannot claim it.
+    const appId = cfg.larkAppId;
+    const brand = normalizeBrand(cfg.brand);
+    const appSecret = cfg.larkAppSecret;
+    let accepted = false;
+    const isAuthorizationValid = () => {
+      // During issuance the originating turn must still be the live one.
+      if (!accepted) return isCurrent();
+      const tracked = sessionAuthRequests.get(requestId);
+      if (!tracked || tracked.expiresAt <= Date.now()) return false;
+      const live = findActiveBySessionId(params.sessionId);
+      if (live !== ds || ds.session.status !== 'active' || !ds.worker || ds.worker.killed
+        || ds.larkAppId !== appId || sessionTransportDisabled(ds)) return false;
+      // While no turn is live (the gap after the Agent ended the originating
+      // turn), the daemon may keep completing the grant server-side. Once a new
+      // turn has an effective user it must be the same human frozen on this
+      // request; a dispatch bot or another human retires the grant.
+      const liveCaller = requestingUser();
+      if (liveCaller !== undefined && liveCaller !== callerOpenId) return false;
+      try {
+        const currentConfig = getBot(ds.larkAppId).config;
+        return currentConfig.larkAppSecret === appSecret && normalizeBrand(currentConfig.brand) === brand
+          && (!!boundTool || triggerUserAuthApplies(currentConfig.triggerUserAuth, 'lark-cli'));
+      } catch { return false; }
+    };
     const requestId = randomBytes(32).toString('hex');
 
-    if (useBotAppIdentity) {
-      // A #1606 standard session binding or a cross-app delegation: the scope
-      // top-up is issued by the (target) Bot application. The narrow
-      // lark-tool-identity route serves the resulting user_access_token live;
-      // no trigger-user identity file is published from here.
-      const cached = delegated ? undefined : getIdentity(ds.larkAppId, callerOpenId);
-      const verified = delegated ? { type: 'user' as const, openId: callerOpenId }
-        : cached?.type === 'user' && ['sender', 'message_api', 'contact_api'].includes(cached.source)
-        ? cached
-        : await resolveVerifiedUserIdentity(ds.larkAppId, callerOpenId);
-      if (!verified || verified.type !== 'user' || verified.openId !== callerOpenId || !isCurrent()) {
-        return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
+    // Reuse an existing pending grant for the same session/app/human when its
+    // scopes already cover this request and it is still live (#1823): preserve
+    // an unexpired in-flight request instead of minting a competing link.
+    for (const [existingId, request] of sessionAuthRequests) {
+      if (request.sessionId === params.sessionId && request.appId === appId
+        && request.callerOpenId === callerOpenId && request.status === 'pending' && request.isValid()
+        && request.expiresAt > Date.now()
+        && scopes.every(scope => request.grantedScopes.includes(scope))) {
+        return jsonRes(res, 200, { ok: true, requestId: existingId, authUrl: request.authUrl,
+          scopes: request.grantedScopes,
+          expiresIn: Math.max(1, Math.ceil((request.expiresAt - Date.now()) / 1_000)), autoCallback: true });
       }
+    }
+
+    // Build the per-mode authorization: a poll function plus the link/scopes/
+    // TTL to hand the CLI. Bot-app mode (bound #1606 session or cross-app
+    // delegation) uses the (target) Bot application. Personal trigger-user mode
+    // uses the sender's OWN selected app via the two-step device flow.
+    const expiresIn = useBotAppIdentity ? 600 : 9 * 60;
+    let authUrl: string;
+    let grantedScopes: string[];
+    let poll: () => Promise<SessionAuthPollResult>;
+
+    if (useBotAppIdentity) {
       let authorization: Awaited<ReturnType<typeof requestUserAuthorization>>;
       try {
-        authorization = await requestUserAuthorization(
-          cfg.larkAppId, cfg.larkAppSecret, normalizeBrand(cfg.brand), scopes, callerOpenId, authorizationCurrent,
-        );
+        authorization = await requestUserAuthorization(appId, appSecret, brand, scopes, callerOpenId, isAuthorizationValid);
       } catch {
         return jsonRes(res, 502, { ok: false, error: 'authorization_request_failed' });
       }
       if (!isCurrent()) return jsonRes(res, 409, { ok: false, error: 'auth_turn_changed' });
-      sessionAuthRequests.set(requestId, {
-        sessionId: params.sessionId, callerOpenId, isCurrent,
-        poll: async () => {
-          const r = await authorization.poll();
-          if (r.status !== 'ready') return r;
-          return { status: 'ready', mode: 'app-token', token: r.token };
-        },
-      });
-      setTimeout(() => sessionAuthRequests.delete(requestId), authorization.expiresIn * 1_000).unref();
-      return jsonRes(res, 200, {
-        ok: true, authUrl: authorization.authUrl, requestId,
-        scopes: authorization.scopes, expiresIn: authorization.expiresIn, autoCallback: true,
-      });
-    }
-
-    // Trigger-user personal mode (no #1606 binding): scope top-up uses the
-    // sender's OWN selected application via the two-step device flow, never the
-    // receiving Bot's application. The acting identity is a per-sender HOME.
-    // The caller must still be a verified human turn sender (not another bot or
-    // an unverifiable id); the origin/turn attestation above proves lineage but
-    // not human-ness.
-    {
-      const cachedHuman = getIdentity(ds.larkAppId, callerOpenId);
+      authUrl = authorization.authUrl;
+      grantedScopes = authorization.scopes;
+      poll = async () => {
+        const r = await authorization.poll();
+        if (r.status !== 'ready') return r;
+        return { status: 'ready', mode: 'app-token', token: r.token };
+      };
+    } else {
+      // The caller must be a verified human turn sender; origin/turn attestation
+      // proves lineage but not human-ness.
+      const cachedHuman = getIdentity(appId, callerOpenId);
       const verifiedHuman = cachedHuman?.type === 'user'
         && ['sender', 'message_api', 'contact_api'].includes(cachedHuman.source)
         ? cachedHuman
-        : await resolveVerifiedUserIdentity(ds.larkAppId, callerOpenId);
+        : await resolveVerifiedUserIdentity(appId, callerOpenId);
       if (!verifiedHuman || verifiedHuman.type !== 'user' || verifiedHuman.openId !== callerOpenId || !isCurrent()) {
         return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
       }
-    }
-    let personal: Awaited<ReturnType<typeof beginLarkCliLogin>>;
-    try {
-      const brand = normalizeBrand(cfg.brand);
-      personal = await (brand === 'lark'
-        ? beginLarkCliLogin(callerOpenId, scopes, brand)
-        : beginLarkCliLogin(callerOpenId, scopes));
-    } catch {
-      return jsonRes(res, 502, { ok: false, error: 'authorization_request_failed' });
-    }
-    if (!isCurrent()) return jsonRes(res, 409, { ok: false, error: 'auth_turn_changed' });
-    if (!personal) return jsonRes(res, 502, { ok: false, error: 'authorization_request_failed' });
-    if (personal.stage === 'app-setup') {
-      // Scope top-ups only make sense after the sender has a personal app.
-      // Hand the first-step URL back; never fall through to the Bot app.
-      return jsonRes(res, 409, { ok: false, error: 'personal_lark_app_required', authUrl: personal.authUrl });
-    }
-    const expiresIn = 9 * 60;
-    sessionAuthRequests.set(requestId, {
-      sessionId: params.sessionId, callerOpenId, isCurrent,
-      poll: async () => {
+      let personal: Awaited<ReturnType<typeof beginLarkCliLogin>>;
+      try {
+        personal = await (brand === 'lark'
+          ? beginLarkCliLogin(callerOpenId, scopes, brand)
+          : beginLarkCliLogin(callerOpenId, scopes));
+      } catch {
+        return jsonRes(res, 502, { ok: false, error: 'authorization_request_failed' });
+      }
+      if (!isCurrent()) return jsonRes(res, 409, { ok: false, error: 'auth_turn_changed' });
+      if (!personal) return jsonRes(res, 502, { ok: false, error: 'authorization_request_failed' });
+      if (personal.stage === 'app-setup') {
+        // Scope top-ups only make sense after the sender has a personal app.
+        // Hand the first-step URL back; never fall through to the Bot app.
+        return jsonRes(res, 409, { ok: false, error: 'personal_lark_app_required', authUrl: personal.authUrl });
+      }
+      authUrl = personal.authUrl;
+      grantedScopes = personal.scopes ?? larkCliLoginScopes(scopes);
+      poll = async () => {
         const completed = await completeLarkCliLogin(callerOpenId);
         if (completed.state === 'pending') return { status: 'pending' };
         if (completed.state === 'failed') {
@@ -3174,12 +3459,16 @@ for (const action of ['auth-request', 'auth-status']) {
         return home
           ? { status: 'ready', mode: 'user-home', home }
           : { status: 'failed', error: 'authorization_identity_unavailable' };
-      },
+      };
+    }
+
+    accepted = true;
+    trackSessionAuthorization(requestId, {
+      sessionId: params.sessionId, appId, callerOpenId, isCurrent,
+      isValid: isAuthorizationValid, expiresIn, poll, authUrl, grantedScopes,
     });
-    setTimeout(() => sessionAuthRequests.delete(requestId), expiresIn * 1_000).unref();
     return jsonRes(res, 200, {
-      ok: true, authUrl: personal.authUrl, requestId,
-      scopes: personal.scopes ?? larkCliLoginScopes(scopes), expiresIn, autoCallback: true,
+      ok: true, authUrl, requestId, scopes: grantedScopes, expiresIn, autoCallback: true,
     });
   });
 }
@@ -4992,7 +5281,9 @@ ipcRoute('POST', '/api/sessions/:sessionId/resume', async (req, res, params) => 
 ipcRoute('POST', '/api/sessions/migrate-to-chat', async (req, res) => {
   const remote = req.socket.remoteAddress;
   // node may report '127.0.0.1' or '::ffff:127.0.0.1' (IPv4 mapped) or '::1'.
-  const localish = remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1';
+  // 复用 loopback-peers：定制内核把 loopback peer 上报成 LAN IP 时，
+  // BOTMUX_LOOPBACK_PEERS 放行的地址同样适用于此跨 daemon 迁移端点。
+  const localish = remote ? isLoopbackPeer(remote) : false;
   if (!localish) return jsonRes(res, 403, { ok: false, error: 'not_local' });
 
   let body: {
@@ -8377,7 +8668,7 @@ ipcRoute('PUT', '/api/bot-agent', requireBoundBot(async (req, res) => {
   // Per-bot dsh runner turn timeout. Only the dsh adapter forwards it
   // (`--turn-timeout-ms`); the dashboard exposes the field for dsh only. The
   // field is optional in the body, so distinguish absent (preserve) from
-  // present-but-empty (clear → runner default) like reasoningEffort does.
+  // present-but-empty (clear → watchdog disabled) like reasoningEffort does.
   const supportsTurnTimeout = selected.cliId === 'dsh';
   const turnTimeoutFieldPresent = Object.prototype.hasOwnProperty.call(body, 'turnTimeoutMs');
   let nextTurnTimeoutMs: number | undefined;
@@ -10041,7 +10332,11 @@ export function startIpcServer(opts: {
     workspaceRecycleRuntime.start();
     void (opts.ready ?? Promise.resolve()).then(() => workspaceRecycleRuntime.recoverDeferred())
       .catch(error => logger.warn(`[workspace-recycle] deferred recovery failed: ${String(error)}`));
-    server.once('close', () => workspaceRecycleRuntime.stop());
+    server.once('close', () => {
+      workspaceRecycleRuntime.stop();
+      for (const request of sessionAuthRequests.values()) request.dispose();
+      sessionAuthRequests.clear();
+    });
     return {
     port,
     close: () => new Promise<void>(r => server.close(() => r())),

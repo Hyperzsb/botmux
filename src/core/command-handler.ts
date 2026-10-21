@@ -62,6 +62,7 @@ import { discoverSlashCommandsForAdapter, listMcpServerNames, supportsFilesystem
 import { validateWorkingDir } from './working-dir.js';
 import { resolveRepoSelection } from './repo-selection.js';
 import { repinSessionWorkingDir } from './session-cwd.js';
+import { publishWorkingDirRecovery } from './working-dir-recovery.js';
 import { validateAdoptTarget, adoptTargetKey, adoptTargetLabel, type AdoptableSession } from './session-discovery.js';
 import { validateZellijAdoptTarget } from './zellij-adopt-discovery.js';
 import { validateOrcaAdoptTarget } from './orca-adopt-discovery.js';
@@ -3486,6 +3487,15 @@ export async function handleCommand(
         const scanDirs = getProjectScanDirs(ds);
         const invalidDirs = invalidConfiguredWorkingDirs(ds, ds?.larkAppId ?? larkAppId);
         if (invalidDirs.length > 0) {
+          // The session's own directory is gone (typically a deleted worktree),
+          // not a bots.json problem: bring up the recovery card instead.
+          if (ds?.workingDir && !ds.pendingRepo) {
+            await publishWorkingDirRecovery(ds, getSessionWorkingDir(ds), {
+              sessionReply: (rid, content, msgType) => sessionReply(rid, content, msgType),
+              lastRepoScan,
+            }, { force: true });
+            break;
+          }
           await sessionReply(rootId, t('cmd.repo.working_dir_not_exist', { dirs: invalidDirs.map(d => `\`${d}\``).join(', ') }, loc));
           break;
         }

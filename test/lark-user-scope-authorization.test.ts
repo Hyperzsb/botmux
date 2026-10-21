@@ -4,6 +4,7 @@ import * as workerPool from '../src/core/worker-pool.js';
 import * as botRegistry from '../src/bot-registry.js';
 import * as identities from '../src/im/lark/identity-cache.js';
 import * as tokens from '../src/utils/user-token.js';
+import * as larkCliAuth from '../src/services/lark-cli-auth.js';
 import { isKnownLarkUserScope } from '../src/utils/lark-scope-catalog.js';
 
 // Regressions for valid user scopes being rejected with `unknown_scopes` before
@@ -30,6 +31,17 @@ beforeEach(async () => {
   vi.spyOn(tokens, 'requestUserAuthorization').mockResolvedValue({
     authUrl: 'https://open.feishu.cn/authorize?x', scopes: ['base:app:create'], expiresIn: 600, poll: vi.fn(),
   } as any);
+  // Ordinary trigger-user (non-bound, non-delegated) sessions mint the scope
+  // top-up through the sender's PERSONAL app via the two-step device flow.
+  vi.spyOn(larkCliAuth, 'larkCliLoginScopes').mockImplementation((sc: readonly string[]) =>
+    ['offline_access', ...sc.filter(x => x !== 'offline_access')]);
+  vi.spyOn(larkCliAuth, 'beginLarkCliLogin').mockImplementation(async (_id: string, sc: readonly string[] = []) => ({
+    authUrl: 'https://open.feishu.cn/authorize?x', stage: 'user-login' as const,
+    scopes: ['offline_access', ...sc.filter(x => x !== 'offline_access')],
+  }));
+  vi.spyOn(larkCliAuth, 'completeLarkCliLogin').mockResolvedValue({ state: 'pending' } as any);
+  vi.spyOn(larkCliAuth, 'resolveLarkCliHomeForTurn').mockResolvedValue(null as any);
+  vi.spyOn(larkCliAuth, 'materializeLarkCliHomeForSession').mockResolvedValue(null as any);
   ipc = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
 });
 
@@ -113,10 +125,9 @@ describe('auth-request handler — user scope authorization', () => {
     const body = await res.json() as any;
     expect(body.ok).toBe(true);
     expect(body.authUrl).toContain('authorize');
-    expect(tokens.requestUserAuthorization).toHaveBeenCalledTimes(1);
-    const call = vi.mocked(tokens.requestUserAuthorization).mock.calls[0];
-    expect(call[3]).toEqual(scopes);
-    expect(call[4]).toBe('ou_sender');
+    expect(larkCliAuth.beginLarkCliLogin).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(larkCliAuth.beginLarkCliLogin).mock.calls[0][1]).toEqual(scopes);
+    expect(vi.mocked(larkCliAuth.beginLarkCliLogin).mock.calls[0][0]).toBe('ou_sender');
   });
 
   it('rejects a misspelled scope with unknown_scopes naming the typo, before any authorization', async () => {
@@ -129,9 +140,8 @@ describe('auth-request handler — user scope authorization', () => {
   it('mints an authorize URL for uncataloged scope when allowUnknown=true', async () => {
     const res = await post({ scopes: ['future:new:capability'], allowUnknown: true });
     expect(res.status).toBe(200);
-    expect(tokens.requestUserAuthorization).toHaveBeenCalledTimes(1);
-    const call = vi.mocked(tokens.requestUserAuthorization).mock.calls[0];
-    expect(call[3]).toEqual(['future:new:capability']);
+    expect(larkCliAuth.beginLarkCliLogin).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(larkCliAuth.beginLarkCliLogin).mock.calls[0][1]).toEqual(['future:new:capability']);
   });
 
   it('mints an authorize URL for uncataloged scope when BOTMUX_ALLOW_UNKNOWN_SCOPES=1 in environment', async () => {
@@ -140,9 +150,8 @@ describe('auth-request handler — user scope authorization', () => {
       process.env.BOTMUX_ALLOW_UNKNOWN_SCOPES = '1';
       const res = await post({ scopes: ['future:env:capability'] });
       expect(res.status).toBe(200);
-      expect(tokens.requestUserAuthorization).toHaveBeenCalledTimes(1);
-      const call = vi.mocked(tokens.requestUserAuthorization).mock.calls[0];
-      expect(call[3]).toEqual(['future:env:capability']);
+      expect(larkCliAuth.beginLarkCliLogin).toHaveBeenCalledTimes(1);
+      expect(vi.mocked(larkCliAuth.beginLarkCliLogin).mock.calls[0][1]).toEqual(['future:env:capability']);
     } finally {
       if (prev === undefined) delete process.env.BOTMUX_ALLOW_UNKNOWN_SCOPES;
       else process.env.BOTMUX_ALLOW_UNKNOWN_SCOPES = prev;
@@ -159,10 +168,9 @@ describe('auth-request handler — user scope authorization', () => {
   it('mints an authorize URL for contact user search instead of rejecting it as unknown', async () => {
     const res = await post({ scopes: ['contact:user:search'] });
     expect(res.status).toBe(200);
-    expect(tokens.requestUserAuthorization).toHaveBeenCalledTimes(1);
-    const call = vi.mocked(tokens.requestUserAuthorization).mock.calls[0];
-    expect(call[3]).toEqual(['contact:user:search']);
-    expect(call[4]).toBe('ou_sender');
+    expect(larkCliAuth.beginLarkCliLogin).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(larkCliAuth.beginLarkCliLogin).mock.calls[0][1]).toEqual(['contact:user:search']);
+    expect(vi.mocked(larkCliAuth.beginLarkCliLogin).mock.calls[0][0]).toBe('ou_sender');
   });
 
   it('keeps user/turn binding: a legal Base scope on a stale turn is still 403, no authorization', async () => {

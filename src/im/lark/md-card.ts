@@ -1526,28 +1526,6 @@ export function buildImageCardElements(
 }
 
 /**
- * Heuristic: does `text` contain markdown syntax that renders badly as plain
- * text in Feishu (code fences, headings, lists, bold, inline code, links,
- * tables, blockquotes, hr)? Callers use this to decide between an interactive
- * card and a plain post.
- */
-export function hasMarkdown(text: string): boolean {
-  if (!text) return false;
-  return (
-    /```/.test(text) ||
-    /^#{1,6}\s/m.test(text) ||
-    /^\s{0,3}[-*+]\s+\S/m.test(text) ||
-    /^\s{0,3}\d+\.\s+\S/m.test(text) ||
-    /\*\*[^*\n]+\*\*/.test(text) ||
-    /(^|[^`])`[^`\n]+`([^`]|$)/.test(text) ||
-    /\[[^\]\n]+\]\([^)\n]+\)/.test(text) ||
-    /^\s*\|.+\|\s*$/m.test(text) ||
-    /^>\s/m.test(text) ||
-    /^(?:---|\*\*\*|___)\s*$/m.test(text)
-  );
-}
-
-/**
  * Build a complete Feishu interactive card (schema 2.0) from a markdown
  * body, with the same footer chrome `botmux send` uses: HR + small grey
  * brand segment + optional `发送给：@<owner>` mention.

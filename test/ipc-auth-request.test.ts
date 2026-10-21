@@ -46,7 +46,7 @@ beforeEach(async () => {
   }));
   personalComplete = vi.fn().mockResolvedValue({ state: 'pending' });
   vi.spyOn(larkCliAuth, 'completeLarkCliLogin').mockImplementation((...a: any[]) => personalComplete(...a));
-  vi.spyOn(larkCliAuth, 'larkCliHomeForTurn').mockResolvedValue('/homes/ou_sender' as any);
+  vi.spyOn(larkCliAuth, 'resolveLarkCliHomeForTurn').mockResolvedValue('/homes/ou_sender' as any);
   vi.spyOn(larkCliAuth, 'materializeLarkCliHomeForSession').mockResolvedValue(null as any);
   setIpcAuthSecret(SECRET);
   ipc = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
@@ -279,7 +279,7 @@ describe('agent authorization', () => {
     refreshSpy.mockRestore(); // use the real implementation for this test
     const dataDir = config.session.dataDir;
     const larkHome = '/homes/ou_sender-real';
-    vi.mocked(larkCliAuth.larkCliHomeForTurn).mockResolvedValue(larkHome as any);
+    vi.mocked(larkCliAuth.resolveLarkCliHomeForTurn).mockResolvedValue(larkHome as any);
     // Pre-existing GRANTED personal identity for THIS turn + sender (stamped).
     cliIdentity.publishActiveTurn(dataDir, 'auth-session', 'om_turn');
     cliIdentity.writeSessionIdentity(dataDir, 'auth-session', {
@@ -300,7 +300,7 @@ describe('agent authorization', () => {
     const refreshSpy = vi.mocked(cliIdentity.refreshSessionIdentity);
     refreshSpy.mockRestore();
     const dataDir = config.session.dataDir;
-    vi.mocked(larkCliAuth.larkCliHomeForTurn).mockResolvedValue('/homes/ou_sender-real' as any);
+    vi.mocked(larkCliAuth.resolveLarkCliHomeForTurn).mockResolvedValue('/homes/ou_sender-real' as any);
     // Existing file stamped for a DIFFERENT human.
     cliIdentity.publishActiveTurn(dataDir, 'auth-session', 'om_turn');
     cliIdentity.writeSessionIdentity(dataDir, 'auth-session', {
@@ -353,6 +353,82 @@ describe('agent authorization', () => {
     // closed and the fresh token is never published to a queued identity.
     expect(response.status).toBe(409);
     expect(await response.json()).toEqual({ ok: false, error: 'auth_turn_changed' });
+  });
+
+  it('daemon-side polling completes the grant after the Agent turn ends without a wait call', async () => {
+    // Delegations use the target Bot-application grant, whose daemon-side
+    // background poll + liveness closure this exercises.
+    delegate();
+    requestId = (await (await post()).json()).requestId;
+    // The originating turn is gone; the daemon keeps polling but must not
+    // publish credentials into any stale turn.
+    session.managedTurnOrigin = undefined;
+    expect(tokens.requestUserAuthorization.mock.calls[0][5]()).toBe(true);
+    poll.mockResolvedValue({ status: 'ready', token: 'test-user-token' });
+    await vi.waitFor(() => expect(poll).toHaveBeenCalled(), { timeout: 3_000 });
+    expect(cliIdentity.refreshSessionIdentity).not.toHaveBeenCalled();
+    // The same delegated human's follow-up turn claims the completed grant.
+    session.managedTurnOrigin = { capability: CAP, turnId: 'om_next', callerOpenId: 'ou_dispatch_bot' };
+    delegate('ou_target_human', 'om_next');
+    const response = await post('auth-status', { requestId, originTurnId: 'om_next' });
+    expect(await response.json()).toEqual({ ok: true, status: 'ready' });
+    expect(cliIdentity.refreshSessionIdentity).toHaveBeenCalledWith(expect.any(String), 'auth-session', {
+      tool: 'lark-cli', appId: 'cli_test', userAccessToken: 'test-user-token', turnId: 'om_next', openId: 'ou_target_human',
+    });
+  });
+
+  it('reuses a pending link across turns without extending its deadline', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      delegate();
+      const first = await (await post()).json();
+      vi.setSystemTime(Date.now() + 30_000);
+      session.managedTurnOrigin.turnId = 'om_next';
+      delegate('ou_target_human', 'om_next');
+      const next = await (await post('auth-request', { originTurnId: 'om_next' })).json();
+      expect(next).toMatchObject({ requestId: first.requestId, authUrl: first.authUrl, expiresIn: 570 });
+      expect(tokens.requestUserAuthorization).toHaveBeenCalledOnce();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('does not expose another speaker or application grant to the current turn', async () => {
+    // Ordinary personal-app grant: the tracked request is frozen to ou_sender.
+    requestId = (await (await post()).json()).requestId;
+    // A different human is a turn change; a different application means the
+    // tracked grant itself no longer applies — the two refusals must stay
+    // distinguishable so each guard call point is pinned.
+    session.managedTurnOrigin.callerOpenId = 'ou_other';
+    let response = await post('auth-status', { requestId });
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({ ok: false, error: 'auth_turn_changed' });
+    session.managedTurnOrigin.callerOpenId = 'ou_sender';
+    session.larkAppId = 'cli_other';
+    response = await post('auth-status', { requestId });
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({ ok: false, error: 'auth_request_expired' });
+    expect(personalComplete).not.toHaveBeenCalled();
+    expect(cliIdentity.refreshSessionIdentity).not.toHaveBeenCalled();
+  });
+
+  it.each(['closed', 'replaced', 'secret_changed'])('invalidates an issued grant when the session is %s', async change => {
+    delegate();
+    await post();
+    const isGrantValid = vi.mocked(tokens.requestUserAuthorization).mock.calls[0][5];
+    if (change === 'closed') session.session.status = 'closed';
+    if (change === 'replaced') session = { ...session };
+    if (change === 'secret_changed') vi.mocked(botRegistry.getBot).mockReturnValue({ config: {
+      larkAppId: 'cli_test', larkAppSecret: 'new-secret',
+    } } as any);
+    expect(isGrantValid()).toBe(false);
+  });
+
+  it('stops grant completion when the IPC server closes', async () => {
+    delegate();
+    await post();
+    const isGrantValid = vi.mocked(tokens.requestUserAuthorization).mock.calls[0][5];
+    await ipc.close();
+    expect(isGrantValid()).toBe(false);
+    expect(poll).not.toHaveBeenCalled();
   });
 });
 
@@ -407,7 +483,7 @@ describe.skipIf(process.platform !== 'linux')('agent authorization over a manage
       authUrl: AUTH_URL, stage: 'user-login' as const, scopes: ['offline_access', 'im:chat:read'],
     } as any);
     vi.spyOn(larkCliAuth, 'completeLarkCliLogin').mockImplementation((...a: any[]) => hostPersonalComplete(...a));
-    vi.spyOn(larkCliAuth, 'larkCliHomeForTurn').mockResolvedValue('/homes/ou_host' as any);
+    vi.spyOn(larkCliAuth, 'resolveLarkCliHomeForTurn').mockResolvedValue('/homes/ou_host' as any);
     vi.spyOn(larkCliAuth, 'materializeLarkCliHomeForSession').mockResolvedValue('/homes/ou_host' as any);
     vi.spyOn(cliIdentity, 'refreshSessionIdentity').mockReturnValue(true);
     setIpcAuthSecret(SECRET);

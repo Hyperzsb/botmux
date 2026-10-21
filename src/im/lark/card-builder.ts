@@ -22,7 +22,7 @@ import {
   GRANT_DURATION_OPTIONS,
   MAX_GRANT_QUOTA,
 } from '../../services/grant-policy.js';
-import { STREAM_STATUS_TEMPLATE_MAP } from './stream-status-palette.js';
+import { BACKGROUND_WAIT_TEMPLATE, STREAM_STATUS_TEMPLATE_MAP } from './stream-status-palette.js';
 import type { StreamingCardButtonId } from './streaming-card-buttons.js';
 import { TABLE_AUTO_ROW_STYLE } from './table-style.js';
 import { REPLY_CARD_FOOTER_ELEMENT_ID } from './reply-card-footer-signature.js';
@@ -827,11 +827,28 @@ const PRIVATE_SNAPSHOT_TEXT_MAX = 50_000;
  *  只对 idle 生效，其它状态一律忽略。 */
 export type IdleCardLabel = 'silent' | 'completed' | 'failed';
 
+/** 主回合已结束、但它派出的后台子任务（后台 agent / 后台 Bash / Monitor）仍有
+ *  `backgroundTasks` 个在运行。working 与 idle 都可能带它（是否钉住 working 由
+ *  worker 既有规则决定），卡头一律显示「⏳ 主回合已结束 · 后台子任务运行中（N）」。 */
+export interface BackgroundWaitCardLabel {
+  backgroundTasks: number;
+}
+
+/** 卡头的替代标签：idle 专用的 {@link IdleCardLabel}，或 {@link BackgroundWaitCardLabel}。 */
+export type StreamCardLabel = IdleCardLabel | BackgroundWaitCardLabel;
+
 /** 兼容旧调用：布尔 `true` 等价于 'silent'。 */
-function normalizeIdleLabel(v: boolean | IdleCardLabel | undefined): IdleCardLabel | undefined {
+function normalizeIdleLabel(v: boolean | StreamCardLabel | undefined): IdleCardLabel | undefined {
   if (v === true) return 'silent';
   if (v === 'silent' || v === 'completed' || v === 'failed') return v;
   return undefined;
+}
+
+/** 后台子任务数；仅当标签是 {@link BackgroundWaitCardLabel} 且状态为 working/idle 时有值。 */
+function backgroundWaitCount(status: StreamStatus, label: boolean | StreamCardLabel | undefined): number | undefined {
+  if (status !== 'working' && status !== 'idle') return undefined;
+  if (!label || typeof label !== 'object' || !(label.backgroundTasks > 0)) return undefined;
+  return label.backgroundTasks;
 }
 
 /** 冻结卡（FrozenCard）回读 idle 标签：新字段 `idleLabel` 优先；旧盘只有
@@ -842,7 +859,9 @@ export function frozenIdleLabel(fc: { idleLabel?: IdleCardLabel; silentIdle?: bo
 
 /** Header status label for a streaming/snapshot card. Shared by the live card
  *  and the private snapshot so the two never drift. */
-function streamStatusLabel(status: StreamStatus, usageLimit: CliUsageLimitState | undefined, locale?: Locale, idleLabel?: boolean | IdleCardLabel): string {
+function streamStatusLabel(status: StreamStatus, usageLimit: CliUsageLimitState | undefined, locale?: Locale, idleLabel?: boolean | StreamCardLabel): string {
+  const backgroundTasks = backgroundWaitCount(status, idleLabel);
+  if (backgroundTasks !== undefined) return t('card.status.background_wait', { count: backgroundTasks }, locale);
   switch (status) {
     case 'starting': return t('card.status.starting', undefined, locale);
     case 'working': return t('card.status.working', undefined, locale);
@@ -972,8 +991,8 @@ export function buildStreamingCard(
   usage?: CardUsageSnapshot,
   runtimeDisplayName?: string,
   serviceTierBadge?: string,
-  /** idle 卡头替代标签；布尔 `true` 兼容旧调用（= 'silent'）。见 {@link IdleCardLabel}。 */
-  silentIdle?: boolean | IdleCardLabel,
+  /** 卡头替代标签；布尔 `true` 兼容旧调用（= 'silent'）。见 {@link StreamCardLabel}。 */
+  silentIdle?: boolean | StreamCardLabel,
   /** Live per-bot `dshRuntime`. Only meaningful for cliId 'dsh': 'tui' means the
    *  worker spawns the PTY-driven dsh-tui adapter (a real interactive TUI that
    *  accepts a raw /compact), so the compact button must stay visible. Omitted ⇒
@@ -997,6 +1016,7 @@ export function buildStreamingCard(
     ...(cardNonce ? { card_nonce: cardNonce } : {}),
   };
   const displayStatus = status === 'limited' && usageLimit?.retryReady ? 'retry_ready' : status;
+  const backgroundWait = backgroundWaitCount(status, silentIdle) !== undefined;
 
   const elements: any[] = [];
 
@@ -1077,9 +1097,10 @@ export function buildStreamingCard(
   // 「⏹ 停止」：常驻主控制行（不再受 displayMode==='hidden' 折叠态限制——折叠态是 turn
   // 跑飞时用户唯一可见的一行，此前只能 /close 杀整个会话丢上下文）。点击走已有的
   // term_action ctrlc IPC 链路（与展开态 ^C 快捷键完全同款），中断当前 turn 但保留会话。
-  // 仅在有 turn 可停的状态显示：idle 无 turn 可停；starting CLI 未起；limited turn 已失败。
+  // 仅在有 turn 可停的状态显示：idle 无 turn 可停；starting CLI 未起；limited turn 已失败；
+  // 主回合已结束、只剩后台子任务在跑时也无 turn 可停（^C 停不了后台任务）。
   // remote CLI（riff/mojo）无终端可驱动、codex-app 无 PTY 输入通道，均隐藏。
-  if (!hidden.has('stop') && !isRemoteCliId(cliId) && effectiveCliId !== 'codex-app'
+  if (!hidden.has('stop') && !isRemoteCliId(cliId) && effectiveCliId !== 'codex-app' && !backgroundWait
     && (status === 'working' || status === 'analyzing' || status === 'stalled')) {
     headerActions.push(callbackButton(t('card.btn.stop', undefined, locale), 'default', { action: 'stop_turn', ...actionBase }));
   }
@@ -1189,7 +1210,7 @@ export function buildStreamingCard(
     extraConfig: { update_multi: true },
     header: cardHeader(
       `🖥️ ${cliName}${serviceTierBadge ? ` ${serviceTierBadge}` : ''} · ${plainTitle(title)} — ${streamStatusLabel(status, usageLimit, locale, silentIdle)}`,
-      STREAM_STATUS_TEMPLATE_MAP[displayStatus],
+      backgroundWait ? BACKGROUND_WAIT_TEMPLATE : STREAM_STATUS_TEMPLATE_MAP[displayStatus],
     ),
     elements,
   });
@@ -1347,7 +1368,17 @@ function worktreeMultiForm(worktreeOptions: Array<{ text: { tag: 'plain_text'; c
  *  multi-select form (true). `hiddenCount` > 0 means the caller dropped that
  *  many trailing projects to fit the card byte budget; the card then says so.
  *  Callers go through buildRepoSelectCard, which owns the budget. */
-function renderRepoSelectCard(projects: ProjectInfo[], currentPath: string | undefined, rootMessageId: string | undefined, locale: Locale | undefined, multiPicker: boolean | undefined, hiddenCount: number): string {
+/** Recovery form of the repo picker: the session's working directory is gone.
+ *  The top row names the missing path and, when git still knows where the
+ *  worktree came from, offers to rebuild it there; switching works as usual
+ *  but keeps the session. */
+export interface RepoSelectRecovery {
+  missingPath: string;
+  /** Branch the deleted worktree had; absent → no rebuild button. */
+  rebuildBranch?: string;
+}
+
+function renderRepoSelectCard(projects: ProjectInfo[], currentPath: string | undefined, rootMessageId: string | undefined, locale: Locale | undefined, multiPicker: boolean | undefined, hiddenCount: number, recovery?: RepoSelectRecovery): string {
   const currentMarker = t('card.repo.current_marker', undefined, locale);
   const options = projects.map((p, i) => {
     const currentTag = p.path === currentPath ? currentMarker : '';
@@ -1369,8 +1400,39 @@ function renderRepoSelectCard(projects: ProjectInfo[], currentPath: string | und
     }));
 
   const card = wideCard({
-    header: cardHeaderTemplateFirst('blue', t('card.repo.title', undefined, locale)),
+    header: recovery
+      ? cardHeaderTemplateFirst('orange', t('card.repo.recovery_title', undefined, locale))
+      : cardHeaderTemplateFirst('blue', t('card.repo.title', undefined, locale)),
     elements: [
+      // Recovery: the missing directory + 「重建 worktree」take the top row. There
+      // is no 「直接开启会话」— the directory it would start in is the one gone.
+      ...(recovery ? [{
+        tag: 'column_set',
+        flex_mode: 'flow',
+        horizontal_spacing: 'default',
+        columns: [
+          {
+            tag: 'column',
+            width: 'auto',
+            vertical_align: 'center',
+            elements: [
+              larkMdDiv(t(recovery.rebuildBranch ? 'card.repo.recovery_missing' : 'card.repo.recovery_missing_no_rebuild', { path: escapeMd(recovery.missingPath) }, locale)),
+            ],
+          },
+          ...(recovery.rebuildBranch ? [{
+            tag: 'column',
+            width: 'auto',
+            vertical_align: 'center',
+            elements: [
+              callbackButton(
+                t('card.btn.rebuild_worktree', { branch: recovery.rebuildBranch }, locale),
+                'primary',
+                { action: 'repo_rebuild_worktree', root_id: rootMessageId ?? '' },
+              ),
+            ],
+          }] : []),
+        ],
+      }] : [
       // Current working directory + 「直接开启会话」on the same row: the skip
       // button means "use this directory as-is, don't pick a repo", so it pairs
       // with the current-dir line rather than the switch dropdown below.
@@ -1405,11 +1467,13 @@ function renderRepoSelectCard(projects: ProjectInfo[], currentPath: string | und
             ],
           },
         ],
-      },
+      }]),
       {
         tag: 'hr',
       },
-      {
+      // A recovery card is published with whatever the scan finds, possibly
+      // nothing; it then offers manual entry (below) instead of an empty select.
+      ...(options.length > 0 || !recovery ? [{
         tag: 'action',
         actions: [
           {
@@ -1419,7 +1483,7 @@ function renderRepoSelectCard(projects: ProjectInfo[], currentPath: string | und
             value: { key: 'repo_switch', root_id: rootMessageId ?? '' },
           },
         ],
-      },
+      }] : []),
       // Worktree open. Two modes, persisted per-bot (worktreeMultiPicker):
       //   • single (default) — instant single-select dropdown + a short 「🔀 多仓库」
       //     button on the SAME action row (a select_static can't live in a
@@ -1546,7 +1610,7 @@ function renderRepoSelectCard(projects: ProjectInfo[], currentPath: string | und
         elements: [
           {
             tag: 'lark_md',
-            content: t('card.repo.note', undefined, locale),
+            content: t(recovery ? 'card.repo.recovery_note' : 'card.repo.note', undefined, locale),
           },
         ],
       },
@@ -1582,9 +1646,9 @@ export const REPO_SELECT_CARD_MAX_BYTES = 80_000;
  *  `/repo <N>` indexes through lastRepoScan, so a visible option means the same
  *  thing before and after a truncation. The scanner sorts repos ahead of
  *  worktrees, so in practice the tail that goes is worktrees. */
-export function buildRepoSelectCard(projects: ProjectInfo[], currentPath?: string, rootMessageId?: string, locale?: Locale, multiPicker?: boolean): string {
+export function buildRepoSelectCard(projects: ProjectInfo[], currentPath?: string, rootMessageId?: string, locale?: Locale, multiPicker?: boolean, recovery?: RepoSelectRecovery): string {
   const render = (visible: number): string =>
-    renderRepoSelectCard(projects.slice(0, visible), currentPath, rootMessageId, locale, multiPicker, projects.length - visible);
+    renderRepoSelectCard(projects.slice(0, visible), currentPath, rootMessageId, locale, multiPicker, projects.length - visible, recovery);
   const fits = (json: string): boolean => Buffer.byteLength(json, 'utf-8') <= REPO_SELECT_CARD_MAX_BYTES;
 
   const full = render(projects.length);

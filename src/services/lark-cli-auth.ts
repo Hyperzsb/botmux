@@ -65,6 +65,8 @@ const APP_SETUP_TIMEOUT_MS = 10 * 60_000;
 const APP_SETUP_URL_TIMEOUT_MS = 30_000;
 const MAX_SETUP_OUTPUT_CHARS = 64 * 1024;
 const SETUP_DIAGNOSTIC_TAIL_CHARS = 2 * 1024;
+/** Failed automatic polls must not stall every incoming turn during an outage. */
+const AUTO_POLL_COOLDOWN_MS = 60_000;
 
 /** Baseline scopes used by trigger-user lark-cli calls. */
 export const LARK_CLI_DEVICE_SCOPES = [
@@ -168,7 +170,7 @@ export function hasLarkCliHome(openId: string): boolean {
   return hasConfiguredAppToken(openId);
 }
 
-/** Forget only this person's personal app and user authorization. */
+/** Forget this person's personal app selection and user authorization. */
 export function clearLarkCliAuth(openId: string): void {
   const setup = appSetups.get(openId);
   if (setup) {
@@ -422,17 +424,21 @@ function challengePath(openId: string): string {
   return join(larkCliHomeFor(openId), '.botmux-login-challenge');
 }
 
+/** The resume token + link from an in-progress login if still usable. The
+ *  scopes are pinned for personal-app grants; autoPollAfter implements the
+ *  bounded cooldown for automatic turn-path polls (#1823). */
 export interface PendingLarkCliChallenge {
   deviceCode: string;
   authUrl?: string;
   scopes: string[];
   createdAt: number;
+  autoPollAfter?: number;
 }
 
 export function pendingLarkCliChallenge(openId: string): PendingLarkCliChallenge | null {
   try {
     const raw = JSON.parse(readFileSync(challengePath(openId), 'utf8')) as
-      { deviceCode?: unknown; authUrl?: unknown; scopes?: unknown; createdAt?: unknown };
+      { deviceCode?: unknown; authUrl?: unknown; scopes?: unknown; createdAt?: unknown; autoPollAfter?: unknown };
     if (typeof raw.deviceCode !== 'string' || typeof raw.createdAt !== 'number') return null;
     if (Date.now() - raw.createdAt > CHALLENGE_TTL_MS) return null;
     return {
@@ -442,6 +448,8 @@ export function pendingLarkCliChallenge(openId: string): PendingLarkCliChallenge
         ? raw.scopes as string[]
         : [...LARK_CLI_DEVICE_SCOPES],
       createdAt: raw.createdAt,
+      ...(typeof raw.autoPollAfter === 'number' && Number.isFinite(raw.autoPollAfter)
+        ? { autoPollAfter: raw.autoPollAfter } : {}),
     };
   } catch {
     return null;
@@ -463,6 +471,19 @@ function saveChallenge(openId: string, deviceCode: string, authUrl: string, scop
 function clearChallenge(openId: string): void {
   try { rmSync(challengePath(openId), { force: true }); }
   catch { /* already absent */ }
+}
+
+function deferAutomaticPoll(openId: string, deviceCode: string): void {
+  const challenge = pendingLarkCliChallenge(openId);
+  // Do not resurrect an expired request or change a replacement challenge.
+  if (!challenge || challenge.deviceCode !== deviceCode) return;
+  try {
+    atomicWriteFileSync(challengePath(openId), JSON.stringify({
+      ...challenge, autoPollAfter: Date.now() + AUTO_POLL_COOLDOWN_MS,
+    }), { mode: 0o600 });
+  } catch {
+    logger.debug('[lark-cli-auth] could not persist automatic poll cooldown');
+  }
 }
 
 export interface LarkCliLoginChallenge {
@@ -537,42 +558,57 @@ export async function completeLarkCliLogin(
     }
     return { state: 'pending' };
   }
+  // CLI error envelopes are written to stderr; older runners used stdout.
+  if (!parsed?.error) {
+    try { parsed = JSON.parse(stderr) as Record<string, unknown>; } catch { /* plain stderr */ }
+  }
   const raw = String((parsed?.error as Record<string, unknown> | undefined)?.message ?? stderr).trim();
   if (/pending|not yet|waiting/i.test(raw)) return { state: 'pending' };
-  clearChallenge(openId);
+  // A bounded local wait or transport failure does not invalidate the server's
+  // device code. Keep the same challenge so a later approval can still finish.
+  // Only explicit terminal authorization outcomes justify issuing a new link.
+  // lark-cli 1.0.96 reports device-flow terminal errors as subtype=unknown.
+  // That subtype alone is not evidence of expiry or rejection.
+  const denied = /access_denied|authorization_declined|authorization denied/i.test(raw);
+  const invalidCode = /device[_ ]code.*(?:invalid|unknown)|invalid.*device[_ ]code/i.test(raw);
+  const expired = /expired[_ ]token|(?:device[_ ]code|authorization).*expired/i.test(raw);
+  if (denied || invalidCode || expired) {
+    clearChallenge(openId);
+  } else {
+    deferAutomaticPoll(openId, code);
+  }
   return { state: 'failed', detail: raw || undefined };
 }
 
-/** The acting HOME for this turn, only after both personal-app and user login. */
-export function larkCliHomeForTurn(openId: string | undefined): string | null {
-  if (!openId) return null;
-  try { return hasLarkCliHome(openId) ? larkCliHomeFor(openId) : null; }
-  catch { return null; }
-}
-
-/** Poll a pending user login once, then publish the HOME only if it is usable. */
+/**
+ * Resolve the acting HOME for THIS turn, polling a pending device login once —
+ * but only after the bounded automatic-poll cooldown (#1823), so a temporary
+ * provider/transport outage does not start a fresh device poll on every turn.
+ * An explicit /login done bypasses the cooldown. A HOME already on disk is
+ * always honoured even if a poll throws.
+ */
 export async function resolveLarkCliHomeForTurn(openId: string | undefined): Promise<string | null> {
   if (!openId) return null;
   try {
-    if (!hasLarkCliHome(openId) && pendingLarkCliChallenge(openId)) {
-      await completeLarkCliLogin(openId);
+    if (!hasLarkCliHome(openId)) {
+      const challenge = pendingLarkCliChallenge(openId);
+      if (challenge && (challenge.autoPollAfter ?? 0) <= Date.now()) {
+        await completeLarkCliLogin(openId);
+      }
     }
     return hasLarkCliHome(openId) ? larkCliHomeFor(openId) : null;
   } catch {
+    // A poll failure must not deny someone whose HOME is already on disk.
     return hasLarkCliHome(openId) ? larkCliHomeFor(openId) : null;
   }
 }
 
 /**
- * Materialize the current sender's lark-cli HOME inside one session's existing
- * writable temp root.
- *
- * A sandbox cannot bind a different host directory for every turn after it has
- * started, and granting the shared `lark-cli-home/` parent would expose every
- * sender. The daemon therefore keeps the durable personal HOME outside the
- * sandbox and atomically replaces this session-local working copy before it
- * publishes the turn identity. lark-cli may refresh/write inside the copy for
- * the duration of the turn; another session never sees it.
+ * Materialize the current sender's personal lark-cli HOME inside one session's
+ * writable temp root (a session-scoped copy) for sandboxed (oncall/scratch)
+ * sessions. The sandbox cannot rebind a durable host directory per turn, so the
+ * daemon keeps the session's own scratch tree the only writable lark-cli path
+ * and atomically replaces this session copy before it publishes an identity.
  */
 export async function materializeLarkCliHomeForSession(
   openId: string,

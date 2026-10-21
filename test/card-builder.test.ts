@@ -1192,6 +1192,43 @@ describe('buildStreamingCard', () => {
       expect(card.header.title.content).not.toContain('已完成');
     });
 
+    // 主回合已结束、后台子任务仍在跑：working（钉住）与 idle 下卡头一致，且不给「停止」。
+    describe('background-wait label', () => {
+      const build = (status: 'working' | 'idle' | 'limited', label: unknown, locale?: 'en') => parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', status, 'claude-code', 'hidden',
+        undefined, undefined, false, false, locale, undefined, undefined, false,
+        undefined, undefined, undefined, label as any,
+      ));
+
+      it('replaces 工作中 / 等待输入 with the running count, in one colour', () => {
+        for (const status of ['working', 'idle'] as const) {
+          const card = build(status, { backgroundTasks: 2 });
+          expect(card.header.title.content).toContain('⏳ 主回合已结束 · 后台子任务运行中（2）');
+          expect(card.header.title.content).not.toContain('工作中');
+          expect(card.header.title.content).not.toContain('等待输入');
+          expect(card.header.template).toBe('wathet');
+        }
+        expect(build('idle', { backgroundTasks: 1 }, 'en').header.title.content)
+          .toContain('⏳ Main turn ended · background tasks running (1)');
+      });
+
+      it('offers no stop button: the turn it would interrupt is over', () => {
+        const actions = findActions(build('working', { backgroundTasks: 1 }));
+        expect(actions.some((a: any) => a.value?.action === 'stop_turn')).toBe(false);
+        expect(actions.some((a: any) => a.value?.action === 'close')).toBe(true);
+        expect(findActions(build('working', undefined)).some((a: any) => a.value?.action === 'stop_turn')).toBe(true);
+      });
+
+      it('is inert for other statuses and for a zero count', () => {
+        const limited = build('limited', { backgroundTasks: 3 });
+        expect(limited.header.title.content).not.toContain('后台子任务');
+        expect(limited.header.template).toBe('red');
+        const zero = build('working', { backgroundTasks: 0 });
+        expect(zero.header.title.content).toContain('工作中');
+        expect(zero.header.template).toBe('blue');
+      });
+    });
+
     // 冻结卡回读：新字段 idleLabel 优先；旧盘只有 silentIdle:true 仍按 silent 渲染。
     it('frozenIdleLabel: idleLabel wins, legacy silentIdle maps to silent, neither → undefined', () => {
       expect(frozenIdleLabel({ idleLabel: 'completed' })).toBe('completed');
