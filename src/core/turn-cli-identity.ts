@@ -10,6 +10,7 @@
  * here that reads another person's token — the sender's open_id is the only key
  * ever used. Missing credentials produce a denial in that turn's snapshot.
  */
+import type { ByteCloudUserSite } from '../utils/bytecloud-sites.js';
 import { logger } from '../utils/logger.js';
 import { lookupAuthorizedUserName } from '../utils/user-token.js';
 import { t } from '../i18n/index.js';
@@ -231,7 +232,7 @@ async function publishDelegated(tool: TriggerUserAuthTool, args: PublishTurnIden
     // the target app or duplicate/extend the lifetime of the user's login.
     const cloudJwts = await mintByteCloudUserJwts(user.credentialOpenId);
     if (cloudJwts) {
-      const codeJwt = (await mintBytedcliJwts(user.credentialOpenId))?.codeJwt;
+      const codeJwt = (await mintBytedcliJwts(user.credentialOpenId, Object.keys(cloudJwts)[0] as ByteCloudUserSite))?.codeJwt;
       identity = { tool, cloudJwts, ...(codeJwt ? { codeJwt } : {}) };
     }
   } else if (!identity && tool === 'lark-cli') {
@@ -559,6 +560,6 @@ async function resolveIdentityFor(
   // falling back to the machine's own SSO session.
   const cloudJwts = await mintByteCloudUserJwts(senderOpenId);
   if (!cloudJwts) return null;
-  const codeJwt = (await mintBytedcliJwts(senderOpenId))?.codeJwt;
+  const codeJwt = (await mintBytedcliJwts(senderOpenId, Object.keys(cloudJwts)[0] as ByteCloudUserSite))?.codeJwt;
   return { tool: 'bytedcli', cloudJwts, ...(codeJwt ? { codeJwt } : {}) };
 }
