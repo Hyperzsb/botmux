@@ -2,6 +2,58 @@
 
 飞书话题群 ↔ AI 编程 CLI 桥接。Daemon 监听飞书消息，每个新话题自动 spawn 一个独立 CLI 进程（Claude Code / Codex / Gemini 等 20+ 种，完整列表见 README）。
 
+本仓库是面向业务维护的 fork。本文统一记录开发、验证、部署与协作约定。
+`AGENTS.md` 是指向 `CLAUDE.md` 的符号链接，两者共享本文；更新指南时编辑正文并保留该链接。
+
+## 本 fork 的环境与分支约定
+
+### 环境清单
+
+| 环境 | ByteBox IPv6 地址 | 运行分支 | 用途 |
+|---|---|---|---|
+| online | `2605:340:cd52:700:4b1d:5870:1031:4ba0` | `feat/byte_approval/release` | 业务线上部署 |
+| preview | `2605:340:cd52:700:bf87:dee0:bd61:d0ef` | `feat/byte_approval/dev` | 日常开发与不稳定改动验证 |
+
+- **默认发布/部署分支是 `feat/byte_approval/release`**，也是本 fork 的 GitHub 默认分支。online 的 Botmux 必须始终从该分支的 checkout 构建、认领全局命令并启动。
+- **默认开发分支是 `feat/byte_approval/dev`**。不稳定的功能改动在该分支开发，日常运行与人工验证使用 preview；验证完成后再将准备上线的改动集成到 release。
+- 部署前确认目标机器、实际 checkout、当前分支、提交和工作区状态。保护已有未提交改动；不要将 online 切到 dev、临时 review 分支或即将删除的 worktree。
+- 远端名称按各机器的 `git remote -v` 确认，不能假设 `origin` 一定指向本 fork；本 fork 的业务部署分支与上游 npm 发版所用的 `master` 是不同约定。
+
+### 登录与每日访问权限
+
+两台 ByteBox 都需要通过 `jump.byted.org` 跳板机登录，且**每天都需要用户人工申请/审批访问权限**。此前登录成功不代表当天权限仍然有效。
+
+```bash
+# online
+ssh -K jump.byted.org -tt ssh -6 root@2605:340:cd52:700:4b1d:5870:1031:4ba0
+
+# preview
+ssh -K jump.byted.org -tt ssh -6 root@2605:340:cd52:700:bf87:dee0:bd61:d0ef
+```
+
+如果任一机器无法访问，明确告知用户是 online 还是 preview、给出连接错误，并提醒用户申请或续期对应机器当天的人工访问权限。不要将连接失败误判为 Botmux 故障，也不要把访问不了 preview 当成可以改在线上开发的理由。
+
+### IPv6 兼容
+
+两台机器对外只有 IPv6。涉及 Dashboard URL、跳转 URL、Web 终端、回调或服务对外地址的配置与改动，都必须支持 IPv6，不能依赖 IPv4 对外地址。
+
+- URL 中的 IPv6 字面地址必须加方括号，例如 `http://[2605:340:cd52:700:4b1d:5870:1031:4ba0]:7891/`；主机地址与端口分别处理，不能用简单的 `split(':')` 解析。
+- URL 的构造与解析复用现有工具（例如 `src/core/dashboard-url.ts` 的 `formatUrlHost`）及 `URL` API，避免重复拼接方括号或丢失端口、路径、查询参数。
+- 修改相关配置/链接逻辑时，在 preview 验证生成的 IPv6 链接可实际访问，并保留现有 IPv4/域名场景的兼容性。SSH 命令中的裸地址与 URL 的方括号格式应分别处理。
+
+### 指南维护
+
+后续新增约定按环境/分支、访问、网络、构建、架构或协作主题放入对应小节，并注明适用范围。规则变化时更新原条目及相关示例，避免在多个位置留下相互冲突的版本；新增主题再增加独立小节。
+
+## 影响范围评估（改前必做）
+
+任何改动落地前，先想清楚它波及的**其它平台、其它 CLI、其它会话类型**——本仓库是多 CLI × 多后端 × 多 IM 的横向架构，一处改动很容易踩到共用代码路径。默认「牵一发动全身」，主动排查回归面，别只测自己那条路。
+
+- **跨平台**：改了 macOS 相关逻辑要同时考虑 Linux（daemon 实际跑在 Linux）；涉及路径、shell、进程、PTY、编码的代码尤其要两边都想到
+- **跨 CLI**：改某个 CLI 适配器时，确认没动到 `adapters/cli/` 的共用基类/工具（`shared-hints`、`runner-input`、`registry` 等）或 worker 侧共用逻辑，否则可能连带影响其它 20+ 个 CLI。共用改动要在至少一个「别的 CLI」上验证仍可用
+- **跨后端 / 跨会话类型**：改动涉及 `PtyBackend` vs `TmuxBackend`、话题会话 vs 群会话 vs adopt/restore、sandbox on vs off、v3 workflow vs 普通会话时，逐一核对受影响的组合
+- **改公共层**（`core/`、`config.ts`、`bot-registry.ts`、`im/lark/`）时影响面最大——PR 描述里写清评估结论：动了什么共用路径、哪些平台/CLI/会话类型受影响、各自怎么验证的
+
 ## 构建 & 运行
 
 ```bash
@@ -10,7 +62,9 @@ bun run daemon:restart       # 重启 daemon（自动恢复 active sessions）
 bun run daemon:logs          # 查看日志
 ```
 
-- 每次修改后需要 `bun run build` 然后 `bun run daemon:restart`
+- 影响运行的代码或配置改动完成后，在目标环境执行 `bun run build`，再执行 `bun run daemon:restart`；日常开发默认在 preview/dev 验证，online 只运行 release。
+- 仅文档或开发指南变更不需要为此重启 daemon。重启后检查实际进程和日志，确认预期 Bot 与 Dashboard 在线，不能只依赖 CLI 打印成功。
+- `CI=1` 等仅用于构建/测试的临时环境变量不要带入 daemon 或交互式 CLI 的运行环境。
 
 ⚠️ **别用裸 `node` 起 daemon —— 用 `bun run daemon:*`。** 会话存储硬依赖 SQLite 引擎
 （`node:sqlite` 需 Node ≥ 22.13，或任意 bun 的 `bun:sqlite`），而裸 `node` 由 exec 时的
@@ -20,7 +74,7 @@ SQLite 库其实完好）。**supervisor 自身不需要 SQLite，所以它照�
 —— 这个失败形状是记在这里的唯一理由：报成功、孩子全灭，看日志前无从分辨。
 现在 preflight 会在**拆掉现有 fleet 之前**按引擎能力拒绝（逃生阀 `BOTMUX_INTERPRETER=<abs>`）。
 
-**包管理器是 bun**（`packageManager: bun@1.4.3`，锁文件 `bun.lock`）。装依赖用 `bun install --frozen-lockfile`。
+**包管理器是 bun**，版本以当前分支 `package.json` 的 `packageManager` 为准（当前分支为 `bun@1.4.3`，锁文件 `bun.lock`）。切换分支后先核对版本与依赖，再按下文的 worktree 约束决定安装位置；装依赖用 `bun install --frozen-lockfile`。
 
 ⚠️ `trustedDependencies: ["electron","node-pty"]` **不能删**：bun 默认**不跑依赖的生命周期脚本**，而 `node-pty` 要靠它 `node-gyp` 编出 `build/Release/pty.node` —— 少了这个，PTY 全废、编译版二进制也打不出来（`pty.node` 是被嵌进去的）。electron 的 postinstall 负责下载对应平台的二进制。
 
@@ -85,15 +139,15 @@ BOTMUX_NO_CLAIM=1 bun run use:here   # 逃生阀：本次不认领
 
 纯 `bun run build` 故意不认领——review/验证别人 PR 时不会悄悄抢走全局指向。实现见 `scripts/claim-botmux-bin.mjs`。
 
-### 改动需用户手动测试时 → 部署本 checkout 到 live daemon
+### 人工验证与部署到目标 daemon
 
-当改动需要用户在飞书里**手动验证**（而非纯单测能覆盖），改完自测绿后执行：
+当改动需要用户在飞书里**手动验证**（而非纯单测能覆盖），改完自测绿后，在 preview 的 dev checkout 执行下列命令。部署到 online 时，必须先确认其 checkout 是 release，使用已集成并验证的提交：
 
 ```bash
 bun run switch:here && bun run daemon:restart
 ```
 
-这里故意用 `bun run daemon:restart`，确保从当前 checkout 的 `dist/cli.js` 重启；不要依赖裸 `botmux restart`，它可能被 PATH 中更靠前的 npm 全局安装抢先。否则用户测的还是旧代码（典型症状：新加的命令/配置「找不到」）。⚠️ 这会让**所有 bot** 都跑本 checkout 的 build；测试/合并完成后记得切回 canonical checkout，以免 review worktree 被删后全局 shim 失效。
+这里故意用 `bun run daemon:restart`，确保从当前 checkout 的 `dist/cli.js` 重启；不要依赖裸 `botmux restart`，它可能被 PATH 中更靠前的 npm 全局安装抢先。否则用户测的还是旧代码（典型症状：新加的命令/配置「找不到」）。⚠️ 这会让**目标机器上的所有 bot** 都跑本 checkout 的 build。preview 的临时 review/worktree 验证完成后，切回 dev 的 canonical checkout 并恢复其全局指向，避免 worktree 删除后 shim 失效；online 始终保持 release 的 canonical checkout。
 
 ## 模块结构
 
@@ -132,15 +186,6 @@ daemon 两条入口（`handleNewTopicAdmitted` / `handleThreadReplyAdmitted`）�
 - `BOTMUX_OWNER_OPEN_ID` / `__OWNER_OPEN_ID` 是 daemon 认证的 session 身份。新增 backend / runner / RPC 子进程时，必须通过 `applySessionOwnerEnv` 在可配置 env 合并完成后注入并冻结，不能让 bot/backend 配置覆盖它；ownerless session 必须同时删除两个变量。
 - 回归测试必须覆盖 managed-Agent 场景（source app 的 `BOTMUX_OWNER_OPEN_ID=ou_*` 创建 target app），并验证真人 owner 在目标 Bot 下的 `canOperate`；Bot-to-Bot 消息通、权限 scope 通或参数格式合法，都不能证明 owner 身份正确。
 
-## 影响范围评估（改前必做）
-
-任何改动落地前，先想清楚它波及的**其它平台、其它 CLI、其它会话类型**——本仓库是多 CLI × 多后端 × 多 IM 的横向架构，一处改动很容易踩到共用代码路径。默认「牵一发动全身」，主动排查回归面，别只测自己那条路。
-
-- **跨平台**：改了 macOS 相关逻辑要同时考虑 Linux（daemon 实际跑在 Linux）；涉及路径、shell、进程、PTY、编码的代码尤其要两边都想到
-- **跨 CLI**：改某个 CLI 适配器时，确认没动到 `adapters/cli/` 的共用基类/工具（`shared-hints`、`runner-input`、`registry` 等）或 worker 侧共用逻辑，否则可能连带影响其它 20+ 个 CLI。共用改动要在至少一个「别的 CLI」上验证仍可用
-- **跨后端 / 跨会话类型**：改动涉及 `PtyBackend` vs `TmuxBackend`、话题会话 vs 群会话 vs adopt/restore、sandbox on vs off、v3 workflow vs 普通会话时，逐一核对受影响的组合
-- **改公共层**（`core/`、`config.ts`、`bot-registry.ts`、`im/lark/`）时影响面最大——PR 描述里写清评估结论：动了什么共用路径、哪些平台/CLI/会话类型受影响、各自怎么验证的
-
 ## 测试原则（写/改测试必读）
 
 测试要证明**行为**，不是给实现拍照。下面几类已经集中治理过，不要再新增：
@@ -155,13 +200,14 @@ daemon 两条入口（`handleNewTopicAdmitted` / `handleThreadReplyAdmitted`）�
 
 - 标题与 commit message 同格式：`type(scope): 中文描述`
 - 描述用**中文说明**：改了什么、为什么、影响面（涉及哪些模块/会话类型）
-- 附**实际测试验证**：贴出跑过的命令和关键结果（`bun run build`、`bun run test`、相关 e2e），不要只写「应该没问题」；需要 live 验证的先 `bun run switch:here && bun run daemon:restart` 在飞书里实测并注明结果
+- 附**实际测试验证**：贴出跑过的命令和关键结果（`bun run build`、`bun run test`、相关 e2e），不要只写「应该没问题」；需要 live 验证的按「人工验证与部署到目标 daemon」在 preview/dev 执行 `bun run switch:here && bun run daemon:restart`，在飞书里实测并注明环境与结果；online 的部署验证只能使用 release
 - UI 类改动（飞书卡片 / dashboard / web 终端）附**截图示意**，让 reviewer 不用跑代码就能看到效果
 - **不写飞书群内真人名字，也不写机器人协作花名/内部 review 编排**：commit message 与 PR 标题/描述进的是**公开 git 历史**，读者不需要知道群里谁参与、谁审的。① 不出现群成员真名——验证描述用中性客观表述（如「矮视口下成员/机器人行都能滚动可见」，而不是「某某/某某两行成员」）；② 不出现 `@Codex`、`Codex 复审`、`双审`、`首审`、`双审收敛` 这类多 bot 协作花名，验证只陈述**做了什么验证、结果如何**的客观事实，不写「谁审的」。（`Co-authored-by` git 署名 trailer 属正常署名规范，不在此列。）
 
-## Git 提交 & 发版规范
+## Git 提交 & npm 发版规范
 
 - commit message 格式：`type(scope): 中文描述`。`type`（feat/fix/docs/chore 等）和 `scope`（模块名）保留英文，冒号后的描述用中文；同样**不带飞书真人名字与机器人协作花名**（见上「PR 规范」）
 - 日常 `git commit` + `git push` 不会触发发版；打 `v*` annotated tag 并 push 才发版（**仅在用户明确要求时**），CI 自动从 tag 提取版本号发布 npm + 创建 GitHub Release
 - **不要**手动修改 `package.json` 的 `version` 字段；tag message 用中文撰写，CI 会用作 Release body
-- **正式版（latest）必须从 master 出**：CI 校验被打 tag 的 commit 含最新 `origin/master`。非 master 分支灰度用 `-canary.N`/`-beta.N`/`-rc.N` 后缀（CI 自动路由到对应 npm dist-tag，其它 `-` 后缀兜底到 `next`，都不污染 latest）；验证 canary：`botmux update canary`（或 `npm i -g botmux@canary`）
+- 以下 npm 发版约束沿用上游 CI；本 fork 的业务部署以 release 为准，部署分支的改变不等于修改 npm 发版流程。
+- **npm 正式版（latest）必须从 master 出**：CI 校验被打 tag 的 commit 含最新 `origin/master`。非 master 分支灰度用 `-canary.N`/`-beta.N`/`-rc.N` 后缀（CI 自动路由到对应 npm dist-tag，其它 `-` 后缀兜底到 `next`，都不污染 latest）；验证 canary：`botmux update canary`（或 `npm i -g botmux@canary`）
