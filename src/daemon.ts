@@ -22711,8 +22711,16 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
 
   const followupContent = parsed.content.trim();
   let content = composeForwardFollowupContent(forwardSeedContent, followupContent);
-  // Strip leading @<bot> mentions so "@bot /oncall bind" is recognized as a command.
-  let cmdContent = stripLeadingMentions(newTopicCommandLane, followupMentions);
+  // Strip leading @ mentions and any @ of this bot so both "@bot /oncall bind"
+  // and "/login bytedcli eu-ttp @bot" reach the command parser without treating
+  // the bot address as a command argument. Other people/bots' @ mentions stay
+  // in the command lane because they may be meaningful arguments.
+  const selfBotForCommand = getBot(larkAppId);
+  let cmdContent = stripBotMentions(
+    stripLeadingMentions(newTopicCommandLane, followupMentions),
+    followupMentions,
+    { botOpenId: selfBotForCommand.botOpenId, larkAppId },
+  );
 
   // `/t` / `/topic` — force the bot to reply in a thread, even in 普通群.
   // In 普通群 the inbound message is chat-scope by default; override to
@@ -22727,7 +22735,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // 解析出的规格在建会话时逐项落到 workingDir / title / spawnModelOverride /
   // reasoningEffort。任一项校验失败就在**改 scope 之前**回一句用法错误并返回——
   // 于是拒绝路径不开新话题、不发选仓卡、不留会话记录（fail closed，D5）。
-  const selfBotForHeader = getBot(larkAppId);
+  const selfBotForHeader = selfBotForCommand;
   const strippedTopicHeader = stripBotMentions(
     cmdContent,
     followupMentions,
@@ -24949,10 +24957,16 @@ async function handleThreadReplyAdmitted(
   };
 
   let content = parsed.content.trim();
-  // Strip leading @<bot> mentions so "@bot /restart" is recognized as a command.
+  // Strip leading @ mentions and any @ of this bot so a trailing address does
+  // not become an extra daemon-command argument. Other mentions are preserved.
   // threadCommandLane 是免@ 命令模板改写**之前**的正文；没有模板时与 content
   // 逐字相同（见上方 threadCommandPrompt 处的说明）。
-  let cmdContent = stripLeadingMentions(threadCommandLane, parsed.mentions);
+  const selfBotForCommand = getBot(larkAppId);
+  let cmdContent = stripBotMentions(
+    stripLeadingMentions(threadCommandLane, parsed.mentions),
+    parsed.mentions,
+    { botOpenId: selfBotForCommand.botOpenId, larkAppId },
+  );
   // Keep the three values consumed by the remainder of this function in lock
   // step. In particular, workflow/slash parsing reads cmdContent while worker
   // injection reads content/parsed.content; listener input is never trusted as
