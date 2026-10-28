@@ -104,6 +104,21 @@ function isByteCloudTool(tool: TriggerUserAuthTool): boolean {
   return tool === 'bytedcli' || tool === 'larkdev';
 }
 
+/** Codebase/git is an optional companion. A second provider request failing
+ * must not revoke the regional ByteCloud credentials already minted this turn. */
+async function codebaseJwtFor(
+  openId: string,
+  cloudJwts: Partial<Record<ByteCloudUserSite, string>>,
+): Promise<string | undefined> {
+  const site = Object.keys(cloudJwts)[0] as ByteCloudUserSite | undefined;
+  if (!site) return undefined;
+  try { return (await mintBytedcliJwts(openId, site))?.codeJwt; }
+  catch {
+    logger.debug('[trigger-user-auth] Codebase companion unavailable; retaining regional ByteCloud identity');
+    return undefined;
+  }
+}
+
 async function larkCliHomeForExecution(
   sandbox: BotConfig['sandbox'],
   sessionDataDir: string,
@@ -232,7 +247,7 @@ async function publishDelegated(tool: TriggerUserAuthTool, args: PublishTurnIden
     // the target app or duplicate/extend the lifetime of the user's login.
     const cloudJwts = await mintByteCloudUserJwts(user.credentialOpenId);
     if (cloudJwts) {
-      const codeJwt = (await mintBytedcliJwts(user.credentialOpenId, Object.keys(cloudJwts)[0] as ByteCloudUserSite))?.codeJwt;
+      const codeJwt = await codebaseJwtFor(user.credentialOpenId, cloudJwts);
       identity = { tool, cloudJwts, ...(codeJwt ? { codeJwt } : {}) };
     }
   } else if (!identity && tool === 'lark-cli') {
@@ -560,6 +575,6 @@ async function resolveIdentityFor(
   // falling back to the machine's own SSO session.
   const cloudJwts = await mintByteCloudUserJwts(senderOpenId);
   if (!cloudJwts) return null;
-  const codeJwt = (await mintBytedcliJwts(senderOpenId, Object.keys(cloudJwts)[0] as ByteCloudUserSite))?.codeJwt;
+  const codeJwt = await codebaseJwtFor(senderOpenId, cloudJwts);
   return { tool: 'bytedcli', cloudJwts, ...(codeJwt ? { codeJwt } : {}) };
 }

@@ -34,6 +34,7 @@ const resolveLarkCliHomeForTurn = vi.fn(async (openId: string) => larkHomes.get(
 const beginLarkCliLogin = vi.fn(async () => ({ authUrl: 'https://example.test/local-lark-device' }));
 vi.mock('../src/services/lark-cli-auth.js', () => ({
   resolveLarkCliHomeForTurn: (openId: string) => resolveLarkCliHomeForTurn(openId),
+  materializeLarkCliHomeForSession: async (openId: string) => resolveLarkCliHomeForTurn(openId),
   pendingLarkCliChallenge: vi.fn(() => null),
   beginLarkCliLogin: (openId: string) => beginLarkCliLogin(openId),
 }));

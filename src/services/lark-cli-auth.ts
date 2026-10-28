@@ -31,6 +31,7 @@
  * (`Library/Application Support/lark-cli` is also recognized on macOS.)
  */
 import { spawn } from 'node:child_process';
+import { createHash, randomUUID } from 'node:crypto';
 import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -607,9 +608,10 @@ export async function resolveLarkCliHomeForTurn(openId: string | undefined): Pro
  * A sandbox cannot bind a different host directory for every turn after it has
  * started, and granting the shared `lark-cli-home/` parent would expose every
  * sender. The daemon therefore keeps the durable personal HOME outside the
- * sandbox and atomically replaces this session-local working copy before it
- * publishes the turn identity. lark-cli may refresh/write inside the copy for
- * the duration of the turn; another session never sees it.
+ * sandbox and publishes a session-local copy keyed by the credential owner.
+ * Preparing another person's queued turn must not replace the HOME an active
+ * turn already references. The same person's copy may refresh in place; another
+ * person or session never shares that path. All copies retire with the session.
  */
 export async function materializeLarkCliHomeForSession(
   openId: string,
@@ -626,10 +628,11 @@ export async function materializeLarkCliHomeForSession(
   try { await runAsUser(openId, ['auth', 'status', '--json', '--verify']); }
   catch { /* best effort; copy the last known personal state */ }
 
-  const root = sessionTempDir(sessionDataDir, sessionId);
+  const root = join(sessionTempDir(sessionDataDir, sessionId), 'lark-cli-home');
   mkdirSync(root, { recursive: true, mode: 0o700 });
-  const target = join(root, 'lark-cli-home');
-  const staging = join(root, `.lark-cli-home.next-${process.pid}-${Date.now()}`);
+  const principal = createHash('sha256').update(openId).digest('hex').slice(0, 24);
+  const target = join(root, principal);
+  const staging = join(root, `.next-${randomUUID()}`);
   const cacheRoot = join(source, '.cache');
   const stateRoot = join(source, '.local', 'state');
   const challenge = challengePath(openId);

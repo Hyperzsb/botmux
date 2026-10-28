@@ -845,6 +845,7 @@ describe('resolveRedirectedAdapterAuthPaths (redirect authPath suppression)', ()
     expect(src).toMatch(/relative\(canonicalManagedSessionsRoot,\s*canonicalManagedSessionDir\)/);
   });
 
+  // 源码结构护栏(K2)：worker 的私有 spawn 闭包没有可调用 seam；约束跨会话凭据目录的 mandatory deny 接线，避免遗漏后暴露其它会话凭据。
   it('WIRING GUARD: worker always seals shared session-tmp and wires larkdev host auth denies', () => {
     const src = readFileSync(resolve('src/worker.ts'), 'utf8');
     expect(src).toContain('mandatoryDenyPaths.push(canonical(sessionTempRootDir()))');

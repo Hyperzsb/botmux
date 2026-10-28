@@ -160,7 +160,7 @@ describe('lark-cli per-person HOME layout', () => {
     expect(runner).not.toHaveBeenCalled();
   });
 
-  it('atomically replaces a sandbox session copy when the sender changes', async () => {
+  it('keeps active and queued senders on distinct sandbox HOME copies', async () => {
     simulateUserToken(ALICE, { personalOpenId: PERSONAL_OPEN });
     writeFileSync(join(larkCliHomeFor(ALICE), '.botmux-login-challenge'), JSON.stringify({ deviceCode: 'secret' }));
     simulateUserToken(BOB, { personalOpenId: PERSONAL_OPEN_B });
@@ -171,15 +171,25 @@ describe('lark-cli per-person HOME layout', () => {
     __setLarkCliRunnerForTest(async () => ({ ok: true, stdout: '{"ok":true}', stderr: '' }));
 
     const aliceCopy = await materializeLarkCliHomeForSession(ALICE, dataDir, sessionId);
-    expect(aliceCopy).toBe(join(tempRoot, 'lark-cli-home'));
+    expect(aliceCopy).toEqual(expect.stringContaining(join(tempRoot, 'lark-cli-home') + '/'));
     expect(readFileSync(join(aliceCopy!, '.local', 'share', 'lark-cli', `${APP_ID}_${PERSONAL_OPEN}.enc`), 'utf8'))
       .toBe('their-user-token');
     expect(existsSync(join(aliceCopy!, '.botmux-login-challenge'))).toBe(false);
 
     const bobCopy = await materializeLarkCliHomeForSession(BOB, dataDir, sessionId);
-    expect(bobCopy).toBe(aliceCopy);
+    expect(bobCopy).not.toBe(aliceCopy);
+    // Publishing Bob's queued turn cannot change the files Alice's active
+    // identity still points at.
+    expect(readFileSync(join(aliceCopy!, '.local', 'share', 'lark-cli', `${APP_ID}_${PERSONAL_OPEN}.enc`), 'utf8'))
+      .toBe('their-user-token');
     expect(existsSync(join(bobCopy!, '.local', 'share', 'lark-cli', `${APP_ID}_${PERSONAL_OPEN}.enc`)))
       .toBe(false);
+    expect(readFileSync(join(bobCopy!, '.local', 'share', 'lark-cli', `${APP_ID}_${PERSONAL_OPEN_B}.enc`), 'utf8'))
+      .toBe('their-user-token');
+    writeFileSync(join(larkCliHomeFor(ALICE), '.local', 'share', 'lark-cli', `${APP_ID}_${PERSONAL_OPEN}.enc`), 'refreshed-alice');
+    expect(await materializeLarkCliHomeForSession(ALICE, dataDir, sessionId)).toBe(aliceCopy);
+    expect(readFileSync(join(aliceCopy!, '.local', 'share', 'lark-cli', `${APP_ID}_${PERSONAL_OPEN}.enc`), 'utf8'))
+      .toBe('refreshed-alice');
     expect(readFileSync(join(bobCopy!, '.local', 'share', 'lark-cli', `${APP_ID}_${PERSONAL_OPEN_B}.enc`), 'utf8'))
       .toBe('their-user-token');
     // Durable per-person homes remain independent and are never merged back

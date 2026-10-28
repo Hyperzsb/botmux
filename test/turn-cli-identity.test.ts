@@ -22,6 +22,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 vi.mock('../src/utils/user-token.js', () => ({
+  resolveUserToken: vi.fn(async () => null),
   lookupAuthorizedUserName: vi.fn(() => undefined),
 }));
 
@@ -1014,4 +1015,17 @@ it('does not begin another login when the bytedcli provider fails', async () => 
   const written = identityBody('bytedcli', 'turn-unavailable');
   expect(written).toContain('停止自动重试');
   expect(written).not.toContain('old-sender-credential');
+});
+
+
+it('keeps valid regional ByteCloud credentials when optional Codebase minting fails', async () => {
+  const provider = await import('../src/services/bytedcli-auth.js');
+  byteCloudJwts.set(ALICE, { 'i18n-bd': 'alice-bd' });
+  vi.mocked(provider.mintBytedcliJwts).mockRejectedValueOnce(new Error('temporary provider failure'));
+  const result = await publish(botConfig({ enabled: true, tools: ['bytedcli'] }), ALICE);
+  expect(result).toContainEqual({ tool: 'bytedcli', state: 'user' });
+  expect(identityBody('bytedcli')).toContain("BYTECLOUD_CLI_API_JWT_TOKEN_I18N_BD='alice-bd'");
+  const companion = recallProvenIdentityContent(dir, SESSION, 'turn-default', 'codebase');
+  expect(companion).toContain("BOTMUX_IDENTITY_MODE='denied'");
+  expect(provider.mintBytedcliJwts).toHaveBeenLastCalledWith(ALICE, 'i18n-bd');
 });
