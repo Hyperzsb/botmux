@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync, chmodSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { larkToolBindingPath, larkToolChildEnv, larkToolPromptFromEnv, parseLarkToolInvocation as parseInvocation, prepareLarkToolEnv, readLarkToolBinding, usesLarkToolBinding, hasLarkToolBinding, cleanupLarkToolBinding } from '../src/core/lark-tool-binding.js';
+import { larkToolBindingPath, larkToolChildEnv, larkToolPromptFromEnv, parseLarkToolInvocation as parseInvocation, prepareLarkToolEnv, readLarkToolBinding, usesLarkToolBinding, hasLarkToolBinding, cleanupLarkToolBinding, isLarkToolBound, identityBindingAllowsProven } from '../src/core/lark-tool-binding.js';
 import { sessionIdentityBinDir, sessionIdentityDataDir } from '../src/core/cli-identity.js';
 import { readLarkToolHelp, fakeLarkHelpScript } from './helpers/lark-tool-help.js';
 import { nodeTsRunnerPrefix, spawnSyncTsScript } from './helpers/ts-runner.js';
@@ -33,6 +33,31 @@ describe('managed lark-cli binding', () => {
     expect(usesLarkToolBinding({ ...config, backendType: 'riff' }, dir)).toBe(false);
     expect(usesLarkToolBinding({ ...config, apiOnly: true }, dir)).toBe(false);
     expect(usesLarkToolBinding(config, dir, true)).toBe(false);
+  });
+
+  it('gives the release personal-app policy precedence over the default bot binding', () => {
+    const config = { sessionId: 'personal-session', larkAppId: 'cli_current', chatId: 'oc_chat', backendType: 'pty' as const };
+    const policy = { enabled: true, tools: ['lark-cli'] as const, fallback: 'none' as const };
+    const governed = { ...config, triggerUserAuth: { ...policy, tools: [...policy.tools] } };
+    expect(usesLarkToolBinding(governed, dir)).toBe(false);
+    // Explicit opt-in still provides the upstream bot-app mode.
+    expect(usesLarkToolBinding({ ...governed, larkToolBinding: true }, dir)).toBe(true);
+    expect(usesLarkToolBinding({ ...governed, triggerUserAuth: { ...governed.triggerUserAuth, enabled: false } }, dir)).toBe(true);
+    expect(usesLarkToolBinding({ ...governed, triggerUserAuth: { ...governed.triggerUserAuth, tools: ['bytedcli'] } }, dir)).toBe(true);
+    // Proof of the executing process remains available independently of which
+    // application supplies Lark credentials.
+    expect(identityBindingAllowsProven({ ...config, platform: 'linux', larkToolBinding: true })).toBe(true);
+    prepareLarkToolEnv({ env: { PATH: '/usr/bin:/bin' }, dataDir: dir, sessionId: config.sessionId, appId: config.larkAppId });
+    expect(isLarkToolBound(governed, dir, config.sessionId)).toBe(false);
+  });
+
+  it('preserves authenticated delegations when replacing a bot binding with personal wrappers', async () => {
+    const { rememberLarkToolDelegation, getLarkToolDelegation } = await import('../src/core/lark-tool-delegation.js');
+    prepareLarkToolEnv({ env: { PATH: '/usr/bin:/bin' }, dataDir: dir, sessionId: 'personal-session', appId: defaults.appId });
+    rememberLarkToolDelegation(dir, 'personal-session', 'turn-a', { tools: ['lark-cli'], credentialOpenId: 'ou_source' });
+    cleanupLarkToolBinding(dir, 'personal-session', { preserveDelegations: true });
+    expect(hasLarkToolBinding(dir, 'personal-session')).toBe(false);
+    expect(getLarkToolDelegation(dir, 'personal-session', 'turn-a')?.credentialOpenId).toBe('ou_source');
   });
 
   it('cleans up binding files and managed wrapper when turned off, leaving trigger-user wrappers intact', () => {

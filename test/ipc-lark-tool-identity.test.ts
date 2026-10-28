@@ -370,7 +370,7 @@ describe('platform-issued user credentials in a bound session', () => {
   // Nobody but the bot owner can grant the bot's own application (its
   // availability range excludes them), so their --as user comes from the platform.
   const PLATFORM = { platformUrl: 'https://platform.example.test', machineToken: 'mt', machineId: 'm-1' };
-  const platformBot = (credentialSource?: string) => ({ larkAppId: 'cli_bound', larkAppSecret: 'bound-secret',
+  const platformBot = (credentialSource?: string) => ({ larkAppId: 'cli_bound', larkAppSecret: 'bound-secret', larkToolBinding: true,
     triggerUserAuth: { enabled: true, tools: ['lark-cli'], fallback: 'none', ...(credentialSource ? { credentialSource } : {}) } });
   let grants: any[];
   beforeEach(() => {

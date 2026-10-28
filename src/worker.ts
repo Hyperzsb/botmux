@@ -29,7 +29,7 @@ import { join, basename, dirname, delimiter, relative, extname } from 'node:path
 import { resolveBotmuxWrapperBinDir, prependBotmuxBin } from './core/botmux-wrapper.js';
 import { sessionIdentityBinDir, publishActiveTurn, GIT_ASKPASS_BASENAME, prepareTurnGitConfigEnv } from './core/cli-identity.js';
 import { prepareLarkToolEnv, usesLarkToolBinding, cleanupLarkToolBinding, larkToolBindingPath, resolveLarkToolDataDir, resolveIdentityStorageModel } from './core/lark-tool-binding.js';
-import { tokenStoreProtection } from './services/trigger-user-auth.js';
+import { tokenStoreProtection, triggerUserAuthApplies } from './services/trigger-user-auth.js';
 import { installAidenCodexShim, writeAidenCodexShellConfigs } from './services/aiden-codex-shim.js';
 import { scanCredentialBearingMcpServers, credentialBearingMcpAdvisory } from './services/credential-bearing-mcp.js';
 import { homedir, tmpdir, userInfo } from 'node:os';
@@ -1497,7 +1497,9 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
     // RPC shell tools execute here, before the viewer CLI is even spawned.
     const boundLark = !!process.env.SESSION_DATA_DIR && usesLarkToolBinding(cfg, process.env.SESSION_DATA_DIR, isWorkflowWorker());
     if (!boundLark && process.env.SESSION_DATA_DIR) {
-      cleanupLarkToolBinding(process.env.SESSION_DATA_DIR, cfg.sessionId);
+      cleanupLarkToolBinding(process.env.SESSION_DATA_DIR, cfg.sessionId, {
+        preserveDelegations: triggerUserAuthApplies(cfg.triggerUserAuth, 'lark-cli'),
+      });
       delete engineEnv.BOTMUX_LARK_TOOL_BINDING;
     }
     const identityPolicy = boundLark && cfg.triggerUserAuth
@@ -1508,7 +1510,7 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
     // This decision is the single source the daemon publishes identity from;
     // it is re-sent on every engagement.
     const engineIdentityBinding = !!process.env.SESSION_DATA_DIR
-      && usesLarkToolBinding({ ...cfg, larkToolBinding: true }, process.env.SESSION_DATA_DIR, isWorkflowWorker());
+      && usesLarkToolBinding({ ...cfg, larkToolBinding: true, triggerUserAuth: undefined }, process.env.SESSION_DATA_DIR, isWorkflowWorker());
     const engineIdentityModel = resolveIdentityStorageModel({
       platform: process.platform, binding: engineIdentityBinding,
       sandboxEngaged: false, loopbackShared: true,
@@ -22021,7 +22023,9 @@ async function spawnCli(
   const perBotInjectEnv = botInjectedEnv(cfg.env, cfg.envPolicy);
   const boundLark = !!process.env.SESSION_DATA_DIR && usesLarkToolBinding(cfg, process.env.SESSION_DATA_DIR, isWorkflowWorker());
   if (!boundLark && process.env.SESSION_DATA_DIR) {
-    cleanupLarkToolBinding(process.env.SESSION_DATA_DIR, cfg.sessionId);
+    cleanupLarkToolBinding(process.env.SESSION_DATA_DIR, cfg.sessionId, {
+        preserveDelegations: triggerUserAuthApplies(cfg.triggerUserAuth, 'lark-cli'),
+      });
   }
   const identityDataDir = boundLark ? resolveLarkToolDataDir(process.env.SESSION_DATA_DIR!) : process.env.SESSION_DATA_DIR;
   if (cfg.promptInjection === 'none') clearBotmuxPromptEnv(perBotInjectEnv);
@@ -22250,7 +22254,7 @@ async function spawnCli(
   // daemon publishes identity material per this single source — the daemon
   // never derives sandbox/network facts itself.
   const childIdentityBinding = !!process.env.SESSION_DATA_DIR
-    && usesLarkToolBinding({ ...cfg, larkToolBinding: true }, process.env.SESSION_DATA_DIR, isWorkflowWorker());
+    && usesLarkToolBinding({ ...cfg, larkToolBinding: true, triggerUserAuth: undefined }, process.env.SESSION_DATA_DIR, isWorkflowWorker());
   const childIdentityModel = resolveIdentityStorageModel({
     platform: process.platform,
     binding: childIdentityBinding,

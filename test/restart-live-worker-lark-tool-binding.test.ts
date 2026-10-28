@@ -52,6 +52,8 @@ describe('requestSessionRestart live-worker branch carries larkToolBinding', () 
     [{ larkToolBinding: false }, null],
     [{ larkToolBinding: true }, true],
     [{}, true],
+    [{ triggerUserAuth: { enabled: true, tools: ['lark-cli'], fallback: 'none' } }, null],
+    [{ larkToolBinding: true, triggerUserAuth: { enabled: true, tools: ['lark-cli'], fallback: 'none' } }, true],
   ] as const)('bot config %o → restart IPC larkToolBinding %s', (botConfig, expected) => {
     __testOnly_resetRestartCoordinator();
     vi.spyOn(botRegistry, 'getBot').mockReturnValue({ config: { larkAppId: 'cli_test', ...botConfig } } as any);

@@ -608,6 +608,15 @@ describe('dashboard bot payload helpers', () => {
     expect(empty.get('cli_anything')).toBeUndefined();
   });
 
+  it('shows the release personal-app default consistently online and offline', () => {
+    const triggerUserAuth = { enabled: true, tools: ['lark-cli'], fallback: 'none' };
+    const raw = { triggerUserAuth };
+    expect(botDefaultsPayload({ larkAppId: 'cli_test' }, raw).larkToolBinding).toBe(false);
+    expect(botDefaultsPayload({ larkAppId: 'cli_test' }, sparseOverridesFromRawBotConfig(raw)).larkToolBinding).toBe(false);
+    expect(botDefaultsPayload({ larkAppId: 'cli_test' }, { ...raw, larkToolBinding: true }).larkToolBinding).toBe(true);
+    expect(botDefaultsPayload({ larkAppId: 'cli_test' }, { triggerUserAuth: { enabled: true, tools: ['bytedcli'] } }).larkToolBinding).toBe(true);
+  });
+
   it('offline recovery rows keep a disabled larkToolBinding from raw bots.json', () => {
     // daemon 离线行由 sparseOverridesFromRawBotConfig 从 bots.json 摘字段喂给
     // botDefaultsPayload；该字段缺省即开，显式 false 丢掉就会在离线时回显成开。

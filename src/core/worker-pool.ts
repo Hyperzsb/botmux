@@ -1,3 +1,4 @@
+import { larkToolBindingEnabled } from '../services/trigger-user-auth.js';
 import { CliProgressNotifier, cliProgressNoticeCard } from '../services/cli-progress-notice.js';
 import { listPendingAsks } from './ask-broker.js';
 import { captureCodexCleanupRelease, type CodexCleanupReleaseTicket } from '../services/codex-cleanup-release.js';
@@ -6984,12 +6985,11 @@ function latestCodexRpcInputForRespawn(ds: DaemonSession): boolean | undefined {
 
 /**
  * Live-worker /restart 或崩溃恢复携带的最新 larkToolBinding 开关。
- * 三分态返回：true = 开启/默认（未配置视为开启）；null = 明确关闭；undefined = 异常保持快照不动。
+ * 三分态返回：true = 显式开启或未受管工具的默认开启；null = 显式关闭或按人授权默认优先；undefined = 异常保持快照不动。
  */
 export function latestLarkToolBindingForRespawn(ds: DaemonSession): boolean | null | undefined {
   try {
-    const binding = getBot(ds.larkAppId).config.larkToolBinding;
-    return binding === false ? null : true;
+    return larkToolBindingEnabled(getBot(ds.larkAppId).config) ? true : null;
   } catch {
     return undefined;
   }
@@ -14965,7 +14965,7 @@ export function forkWorker(
     // Trigger-user CLI auth: the worker needs the policy to know which tools to
     // wrap at spawn. Absent → the worker installs nothing and PATH is untouched.
     ...(botCfg.triggerUserAuth ? { triggerUserAuth: botCfg.triggerUserAuth } : {}),
-    larkToolBinding: botCfg.larkToolBinding !== false,
+    larkToolBinding: larkToolBindingEnabled(botCfg),
     // Startup commands run on every fresh spawn (incl. resume) so session-only
     // settings like `/effort ultracode` are re-established. Adopt sessions are
     // observed, not driven — forkAdoptWorker intentionally omits this.
@@ -22053,7 +22053,7 @@ export function forkAdoptWorker(
     ownerOpenId: ds.ownerOpenId,
     webPort: ds.session.webPort,
     larkAppId: botCfg.larkAppId,
-    larkToolBinding: botCfg.larkToolBinding !== false,
+    larkToolBinding: larkToolBindingEnabled(botCfg),
     // Freeze on the session transport capability: a no-transport session
     // (apiOnly bot OR HTTP virtual chat) must not even RECEIVE the real secret —
     // withholding it removes the capability rather than gating a tamperable flag

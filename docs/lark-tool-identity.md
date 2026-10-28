@@ -1,8 +1,8 @@
 # 新会话的飞书工具身份
 
-Botmux 支持将会话内的 `lark-cli` 绑定到当前 bot 配置中的 App ID 和品牌。该功能为**可配置项且默认开启**。可以通过 Dashboard（Bot Defaults → 隔离与权限 → lark-cli 应用绑定）或斜杠命令 `/config set larkToolBinding off` 关闭（需新建会话或 `/restart` 生效）。
+Botmux 支持将会话内的 `lark-cli` 绑定到当前 bot 配置中的 App ID 和品牌。该功能为可配置项。未配置时，已有的 `triggerUserAuth` 若启用且包含 `lark-cli`，继续使用按人授权；其它配置默认开启机器人应用绑定。可以通过 Dashboard（Bot Defaults → 隔离与权限 → lark-cli 应用绑定）或斜杠命令 `/config set larkToolBinding off` 关闭（需新建会话或 `/restart` 生效）。
 
-- **开启/未配置（默认）**：会话内 `lark-cli` 默认以当前 Bot 的应用凭证以 bot 身份调用，支持 `--as user` 使用当前用户对同一应用的授权；若显式指定 `--profile <profile>`，自动透传按宿主机原生环境及对应 profile 执行，不拦截切换。
+- **显式开启（`larkToolBinding: true`），或未配置且未启用 lark-cli 按人授权**：会话内 `lark-cli` 默认以当前 Bot 的应用凭证以 bot 身份调用，支持 `--as user` 使用当前用户对同一应用的授权；若显式指定 `--profile <profile>`，自动透传按宿主机原生环境及对应 profile 执行，不拦截切换。
 - **显式关闭（`larkToolBinding: false`）**：不安装托管绑定包装器，完全回落为宿主机原生环境；若同时开启了 `triggerUserAuth`，则遵循按触发人鉴权规则。
 
 该绑定依赖支持 `LARKSUITE_CLI_TENANT_ACCESS_TOKEN` 的较新 lark-cli；请使用
@@ -15,7 +15,9 @@ Botmux 提供的短期 bot token。
 
 | `larkToolBinding` | `triggerUserAuth` | `lark-cli` 行为 |
 |---|---|---|
-| 开启（默认） | 任意 | 默认使用当前 Bot 身份；`--as user` 使用当轮触发人授权；`--profile <other>` 透传宿主对应 profile |
+| 显式开启 | 任意 | 默认使用当前 Bot 身份；`--as user` 使用当轮触发人授权；`--profile <other>` 透传宿主对应 profile |
+| 未配置 | 开启（含 `lark-cli`） | 保持业务分支的个人应用 HOME / 平台按人凭据，不默认切换到 Bot 身份 |
+| 未配置 | 关闭或不含 `lark-cli` | 默认使用当前 Bot 应用绑定 |
 | 关闭 | 关闭（默认） | 沿用宿主机默认凭证及用户 profile 切换 |
 | 关闭 | 开启（含 `lark-cli`） | 遵循按触发人鉴权（以当轮触发人身份运行，未授权直接拒绝并提示授权，不降级为机器账号） |
 

@@ -9,6 +9,7 @@ import { isRemoteBackendId } from './remote-cli-ids.js';
 import { normalizeBrand, type Brand } from '../im/lark/lark-hosts.js';
 import { findRealToolBinary, installLoginShellPathShim, sessionIdentityDataDir, sessionIdentityBinDir } from './cli-identity.js';
 import { resolveEntrySpawn } from './self-spawn.js';
+import { larkToolBindingEnabled, type TriggerUserAuthConfig } from '../services/trigger-user-auth.js';
 import { clearLarkToolDelegations } from './lark-tool-delegation.js';
 
 export const LARK_TOOL_BINDING_FILE = 'lark-tool-binding.json';
@@ -53,7 +54,8 @@ export function readLarkToolBinding(path: string): LarkToolBinding {
   return value;
 }
 
-/** Sessions adopt the lark-cli binding unless explicitly disabled (larkToolBinding === false).
+/** An unconfigured binding preserves existing trigger-user lark-cli policies.
+ * Explicit on/off settings select the operator's requested mode.
  * Old/adopt/remote/workflow sessions do not use it.
  * Note: _dataDir, resume, forkSession are preserved for caller signature compatibility. */
 export function usesLarkToolBinding(config: {
@@ -61,10 +63,11 @@ export function usesLarkToolBinding(config: {
   resume?: boolean; forkSession?: boolean; adoptMode?: boolean; existingAppServerEndpoint?: string;
   backendType: import('../adapters/backend/types.js').BackendType;
   larkToolBinding?: boolean;
+  triggerUserAuth?: TriggerUserAuthConfig;
 }, _dataDir?: string, workflow = false): boolean {
   if (workflow || config.adoptMode || config.existingAppServerEndpoint
     || isRemoteBackendId(config.backendType) || !larkTransportEnabled(config)) return false;
-  return config.larkToolBinding !== false;
+  return larkToolBindingEnabled(config);
 }
 
 /**
@@ -128,13 +131,15 @@ export function identityBindingAllowsProven(input: {
 }
 
 /** Clean up managed lark-cli binding files and wrappers when binding is disabled. */
-export function cleanupLarkToolBinding(dataDir: string, sessionId: string): void {
+export function cleanupLarkToolBinding(dataDir: string, sessionId: string, options: { preserveDelegations?: boolean } = {}): void {
   try {
     const rootDir = resolveLarkToolDataDir(dataDir);
     rmSync(larkToolBindingPath(rootDir, sessionId), { force: true });
     rmSync(join(sessionIdentityDataDir(rootDir, sessionId), 'lark-config'), { recursive: true, force: true });
-    clearLarkToolDelegations(dataDir, sessionId);
-    clearLarkToolDelegations(rootDir, sessionId);
+    if (!options.preserveDelegations) {
+      clearLarkToolDelegations(dataDir, sessionId);
+      clearLarkToolDelegations(rootDir, sessionId);
+    }
     const binDir = sessionIdentityBinDir(rootDir, sessionId);
     const wrapperPath = join(binDir, 'lark-cli');
     try {
@@ -150,13 +155,14 @@ export function cleanupLarkToolBinding(dataDir: string, sessionId: string): void
   }
 }
 
-/** Returns whether a session has larkToolBinding enabled (default true) and its binding file is present. */
+/** Whether effective bot-app binding is enabled and its session file exists. */
 export function isLarkToolBound(
-  botConfig: { larkToolBinding?: boolean } | undefined,
+  botConfig: { larkToolBinding?: boolean; triggerUserAuth?: TriggerUserAuthConfig } | undefined,
   dataDir: string,
   sessionId: string,
 ): boolean {
-  return botConfig?.larkToolBinding !== false && hasLarkToolBinding(dataDir, sessionId);
+  return larkToolBindingEnabled(botConfig)
+    && hasLarkToolBinding(dataDir, sessionId);
 }
 
 /** Bind only this session's tool. No global profile, account or user token is read. */

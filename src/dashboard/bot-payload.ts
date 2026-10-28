@@ -8,7 +8,7 @@ import type { CliLaunchMode } from '../core/cli-launch-mode.js';
 import { GRANT_DURATION_OPTIONS } from '../services/grant-policy.js';
 import { normalizeSparseReplyStyleConfig } from './reply-style.js';
 import { normalizeAskOptionLayout } from '../im/lark/ask-option-layout.js';
-import { parseTriggerUserAuthConfig, type TriggerUserAuthConfig } from '../services/trigger-user-auth.js';
+import { parseTriggerUserAuthConfig, larkToolBindingEnabled, type TriggerUserAuthConfig } from '../services/trigger-user-auth.js';
 import type { NativeSubagentRuntimePolicy } from '../services/native-subagent-runtime-policy.js';
 import type { CodexServiceTier } from '../services/codex-service-tier.js';
 import { normalizeQuotaFallbackBotConfig } from '../services/quota-fallback.js';
@@ -267,7 +267,10 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     // malformed hand edit degrades to null (feature off) instead of reaching
     // form state as a half-shaped policy the toggle would misrender.
     triggerUserAuth: normalizeTriggerUserAuthForClient(j?.triggerUserAuth),
-    larkToolBinding: j?.larkToolBinding !== false,
+    larkToolBinding: larkToolBindingEnabled({
+      larkToolBinding: typeof j?.larkToolBinding === 'boolean' ? j.larkToolBinding : undefined,
+      triggerUserAuth: normalizeTriggerUserAuthForClient(j?.triggerUserAuth) ?? undefined,
+    }),
     skillInjection: (j?.skillInjection === 'global' || j?.skillInjection === 'prompt' || j?.skillInjection === 'off') ? j.skillInjection : null,
     skillInjectionDefault: (j?.skillInjectionDefault === 'global' || j?.skillInjectionDefault === 'off') ? j.skillInjectionDefault : 'prompt',
     skillInjectionSupport: (j?.skillInjectionSupport === 'dynamic' || j?.skillInjectionSupport === 'global') ? j.skillInjectionSupport : 'none',
@@ -317,7 +320,8 @@ export function sparseOverridesFromRawBotConfig(rawEntry: any): {
   return {
     quotaFallbackBot: rawEntry?.quotaFallbackBot,
     autoInviteOwnerOnGroupAdd: rawEntry?.autoInviteOwnerOnGroupAdd,
-    larkToolBinding: typeof rawEntry?.larkToolBinding === 'boolean' ? rawEntry.larkToolBinding : undefined,
+    larkToolBinding: typeof rawEntry?.larkToolBinding === 'boolean' ? rawEntry.larkToolBinding
+      : larkToolBindingEnabled({ triggerUserAuth: normalizeTriggerUserAuthForClient(rawEntry?.triggerUserAuth) ?? undefined }) ? undefined : false,
     askOptionLayout: rawEntry?.askOptionLayout,
     // 默认开：显式 false 不从这里带回，离线行会把已关闭的同机信任显示成开启。
     trustSameOwnerBots: typeof rawEntry?.trustSameOwnerBots === 'boolean' ? rawEntry.trustSameOwnerBots : undefined,

@@ -311,3 +311,12 @@ export function delegatesOnMention(
 ): boolean {
   return !!config?.enabled && config.tools.length > 0 && config.delegateOnMention !== false;
 }
+
+/** Preserve existing personal-app policies when the new bot-app binding is
+ * unconfigured. An explicit binding setting remains an operator override. */
+export function larkToolBindingEnabled(config: {
+  larkToolBinding?: boolean;
+  triggerUserAuth?: TriggerUserAuthConfig;
+} | undefined): boolean {
+  return config?.larkToolBinding ?? !triggerUserAuthApplies(config?.triggerUserAuth, 'lark-cli');
+}

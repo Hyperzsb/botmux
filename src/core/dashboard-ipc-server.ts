@@ -481,7 +481,7 @@ import {
 } from './dashboard-rows.js';
 import { getBotBrand, getBot, getBotClient, getBotOpenId, getOwnerOpenId, loadBotConfigs, readBotSkillPolicy, getBotTuiSlashAllow, updateBotNativeSubagentRuntime, MAX_TURN_TIMEOUT_MS, normalizeDshProfile, type BotConfig, type NativeSubagentRuntimeConfigState, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
 import { generateAuthUrl, tryHandleCallbackUrl, getFeedGroupAuthStatus, listAuthorizedUsers, FEED_GROUP_OAUTH_SCOPES, requestUserAuthorization } from '../utils/user-token.js';
-import { tokenStoreProtection, triggerUserAuthApplies, credentialSourceOf, type TriggerUserAuthConfig } from '../services/trigger-user-auth.js';
+import { tokenStoreProtection, triggerUserAuthApplies, credentialSourceOf, larkToolBindingEnabled, type TriggerUserAuthConfig } from '../services/trigger-user-auth.js';
 import { platformCredentialsUrl } from '../platform/credential-grant-client.js';
 import { scanCredentialBearingMcpServers, credentialBearingMcpAdvisory } from '../services/credential-bearing-mcp.js';
 import { clampSessionTagName, defaultSessionTagName } from '../services/feed-group-tagger.js';
@@ -3134,9 +3134,9 @@ ipcRoute('GET', '/api/sessions/:sessionId/preview', (req, res, params) => {
 
 /** Session-local access key, installed with the tool entry at standard launch.
  * This selects the configured app; it is not a process/turn attestation API. */
-function boundLarkToolRequest(req: IncomingMessage, sessionId: string, appId?: string, botConfig?: { larkToolBinding?: boolean }): boolean {
+function boundLarkToolRequest(req: IncomingMessage, sessionId: string, appId?: string, botConfig?: { larkToolBinding?: boolean; triggerUserAuth?: TriggerUserAuthConfig }): boolean {
   const cfg = botConfig ?? (appId ? (() => { try { return getBot(appId).config; } catch { return undefined; } })() : undefined);
-  if (cfg?.larkToolBinding === false) return false;
+  if (!larkToolBindingEnabled(cfg)) return false;
   try {
     const binding = readLarkToolBinding(larkToolBindingPath(config.session.dataDir, sessionId));
     return binding.appId === appId && binding.sessionId === sessionId
@@ -3149,7 +3149,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
   try { body = await readBoundedJsonBody(req, 4096, 1000); }
   catch { return jsonRes(res, 400, { ok: false, error: 'invalid_lark_tool_request' }); }
   const ds = findActiveBySessionId(params.sessionId);
-  let botConfig: { larkToolBinding?: boolean } | undefined;
+  let botConfig: { larkToolBinding?: boolean; triggerUserAuth?: TriggerUserAuthConfig } | undefined;
   try { botConfig = ds ? getBot(ds.larkAppId).config : undefined; } catch { /* bot missing */ }
   if (!ds || ds.session.status !== 'active' || sessionTransportDisabled(ds)
     || !boundLarkToolRequest(req, params.sessionId, ds.larkAppId, botConfig)) {
