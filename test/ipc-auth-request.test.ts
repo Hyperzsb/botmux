@@ -455,7 +455,6 @@ describe.skipIf(process.platform !== 'linux')('agent authorization over a manage
 
 
 
-  let poll: ReturnType<typeof vi.fn>;
   let unrelatedProcess: ChildProcess | undefined;
 
   function hostSession(): any {
