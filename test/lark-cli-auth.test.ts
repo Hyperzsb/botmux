@@ -484,3 +484,160 @@ describe('clear', () => {
     expect(hasLarkCliHome(BOB)).toBe(true); // B untouched
   });
 });
+
+describe('resolveLarkCliHomeForTurn — the turn-path poll (F-A)', () => {
+  async function startChallenge(openId = ALICE) {
+    provisionPersonalApp(openId);
+    __setLarkCliRunnerForTest(async () => ({
+      ok: true, stdout: JSON.stringify({ verification_url: 'https://v/stable', device_code: 'dc-' + openId }), stderr: '',
+    }));
+    await beginLarkCliLogin(openId);
+  }
+
+  it('skips automatic polls for 60 seconds after failure without extending the challenge TTL', async () => {
+    const started = 1_800_000_000_000;
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(started);
+    await startChallenge();
+    const runner = vi.fn(async () => ({ ok: false, stdout: '', stderr: '[lark-cli-auth] timed out' }));
+    __setLarkCliRunnerForTest(runner);
+    expect(await resolveLarkCliHomeForTurn(ALICE)).toBeNull();
+    const saved = JSON.parse(readFileSync(join(larkCliHomeFor(ALICE), '.botmux-login-challenge'), 'utf8'));
+    expect(saved).toMatchObject({ createdAt: started, autoPollAfter: started + 60_000 });
+    clock.mockReturnValue(started + 59_999);
+    expect(await resolveLarkCliHomeForTurn(ALICE)).toBeNull();
+    expect((await beginLarkCliLogin(ALICE))?.authUrl).toBe('https://v/stable');
+    expect(runner).toHaveBeenCalledTimes(1);
+    clock.mockReturnValue(started + 60_000);
+    expect(await resolveLarkCliHomeForTurn(ALICE)).toBeNull();
+    expect(runner).toHaveBeenCalledTimes(2);
+    expect(pendingLarkCliChallenge(ALICE)?.createdAt).toBe(started);
+    clock.mockReturnValue(started + 9 * 60_000 + 1);
+    expect(await resolveLarkCliHomeForTurn(ALICE)).toBeNull();
+    expect(pendingLarkCliChallenge(ALICE)).toBeNull();
+    expect(runner).toHaveBeenCalledTimes(2);
+  });
+
+  it('allows explicit login completion during cooldown and clears the challenge on success', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(1_800_000_000_000);
+    await startChallenge();
+    __setLarkCliRunnerForTest(async () => ({ ok: false, stdout: '', stderr: 'connect ETIMEDOUT' }));
+    await resolveLarkCliHomeForTurn(ALICE);
+    const runner = vi.fn(async () => {
+      simulateUserToken(ALICE);
+      return { ok: true, stdout: '{}', stderr: '' };
+    });
+    __setLarkCliRunnerForTest(runner);
+    expect((await completeLarkCliLogin(ALICE)).state).toBe('authorized');
+    expect(pendingLarkCliChallenge(ALICE)).toBeNull();
+    expect(await resolveLarkCliHomeForTurn(ALICE)).toBe(larkCliHomeFor(ALICE));
+    expect(runner).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not apply one person’s cooldown to another person', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(1_800_000_000_000);
+    await startChallenge(ALICE);
+    await startChallenge(BOB);
+    const runner = vi.fn(async (_args: string[], _home: string) => ({ ok: false, stdout: '', stderr: 'connect ETIMEDOUT' }));
+    __setLarkCliRunnerForTest(runner);
+    expect(await resolveLarkCliHomeForTurn(ALICE)).toBeNull();
+    expect(await resolveLarkCliHomeForTurn(ALICE)).toBeNull();
+    expect(await resolveLarkCliHomeForTurn(BOB)).toBeNull();
+    expect(runner).toHaveBeenCalledTimes(2);
+    expect(runner.mock.calls.map(call => call[1])).toEqual([larkCliHomeFor(ALICE), larkCliHomeFor(BOB)]);
+  });
+
+  it('does not put a replacement challenge into cooldown for a stale poll', async () => {
+    await startChallenge();
+    __setLarkCliRunnerForTest(async () => ({ ok: false, stdout: '', stderr: 'connect ETIMEDOUT' }));
+    expect((await completeLarkCliLogin(ALICE, 'older-device-code')).state).toBe('failed');
+    expect(pendingLarkCliChallenge(ALICE)?.deviceCode).toBe('dc-' + ALICE);
+    expect(pendingLarkCliChallenge(ALICE)?.autoPollAfter).toBeUndefined();
+  });
+
+  it('does not delay a normal pending approval or an already available user token', async () => {
+    await startChallenge();
+    const runner = vi.fn(async () => ({ ok: false, stdout: '', stderr: 'authorization_pending' }));
+    __setLarkCliRunnerForTest(runner);
+    expect(await resolveLarkCliHomeForTurn(ALICE)).toBeNull();
+    expect(pendingLarkCliChallenge(ALICE)?.autoPollAfter).toBeUndefined();
+    expect(await resolveLarkCliHomeForTurn(ALICE)).toBeNull();
+    expect(runner).toHaveBeenCalledTimes(2);
+    __setLarkCliRunnerForTest(async () => ({ ok: false, stdout: '', stderr: 'connect ETIMEDOUT' }));
+    await resolveLarkCliHomeForTurn(ALICE);
+    simulateUserToken(ALICE);
+    __setLarkCliRunnerForTest(runner);
+    expect(await resolveLarkCliHomeForTurn(ALICE)).toBe(larkCliHomeFor(ALICE));
+    expect(runner).toHaveBeenCalledTimes(2);
+  });
+
+  it('returns an existing HOME without polling anything', async () => {
+    provisionPersonalApp(ALICE);
+    simulateUserToken(ALICE);
+    const runner = vi.fn(async () => ({ ok: true, stdout: '{}', stderr: '' }));
+    __setLarkCliRunnerForTest(runner);
+    expect(await resolveLarkCliHomeForTurn(ALICE)).toBe(larkCliHomeFor(ALICE));
+    expect(runner).not.toHaveBeenCalled();
+  });
+
+  it('returns null for no HOME and no challenge without spawning', async () => {
+    provisionPersonalApp(ALICE);
+    const runner = vi.fn(async () => ({ ok: true, stdout: '{}', stderr: '' }));
+    __setLarkCliRunnerForTest(runner);
+    expect(await resolveLarkCliHomeForTurn(ALICE)).toBeNull();
+    expect(runner).not.toHaveBeenCalled();
+  });
+
+  it('polls a pending challenge once and resolves once the token lands', async () => {
+    provisionPersonalApp(ALICE);
+    __setLarkCliRunnerForTest(async () => ({
+      ok: true, stdout: JSON.stringify({ verification_url: 'u', device_code: 'dc-turn' }), stderr: '',
+    }));
+    await beginLarkCliLogin(ALICE);
+    expect(pendingLarkCliChallenge(ALICE)?.deviceCode).toBe('dc-turn');
+
+    // The person approved in the browser; the poll is what lands the token —
+    // model that by having the runner itself write the per-person token file.
+    expect(hasLarkCliHome(ALICE)).toBe(false);
+    const runner = vi.fn(async () => {
+      simulateUserToken(ALICE);
+      return { ok: true, stdout: JSON.stringify({ status: 'ok' }), stderr: '' };
+    });
+    __setLarkCliRunnerForTest(runner);
+    expect(await resolveLarkCliHomeForTurn(ALICE)).toBe(larkCliHomeFor(ALICE));
+    expect(runner).toHaveBeenCalledTimes(1);
+    expect(pendingLarkCliChallenge(ALICE)).toBeNull();
+  });
+
+  it('stays null (refusal) when the poll still says pending', async () => {
+    provisionPersonalApp(ALICE);
+    __setLarkCliRunnerForTest(async () => ({
+      ok: true, stdout: JSON.stringify({ verification_url: 'u', device_code: 'dc-wait' }), stderr: '',
+    }));
+    await beginLarkCliLogin(ALICE);
+    __setLarkCliRunnerForTest(async () => ({ ok: true, stdout: JSON.stringify({ status: 'pending' }), stderr: '' }));
+    expect(await resolveLarkCliHomeForTurn(ALICE)).toBeNull();
+    // Challenge survives a pending poll so the shown link stays usable.
+    expect(pendingLarkCliChallenge(ALICE)?.deviceCode).toBe('dc-wait');
+  });
+
+  it('stays null after a terminal failure and clears the dead challenge', async () => {
+    provisionPersonalApp(ALICE);
+    __setLarkCliRunnerForTest(async () => ({
+      ok: true, stdout: JSON.stringify({ verification_url: 'u', device_code: 'dc-dead' }), stderr: '',
+    }));
+    await beginLarkCliLogin(ALICE);
+    __setLarkCliRunnerForTest(async () => ({
+      ok: false, stdout: JSON.stringify({ error: { message: 'expired token' } }), stderr: '',
+    }));
+    expect(await resolveLarkCliHomeForTurn(ALICE)).toBeNull();
+    expect(pendingLarkCliChallenge(ALICE)).toBeNull();
+  });
+
+  it('returns null for an absent sender without spawning', async () => {
+    provisionPersonalApp(ALICE);
+    const runner = vi.fn(async () => ({ ok: true, stdout: '{}', stderr: '' }));
+    __setLarkCliRunnerForTest(runner);
+    expect(await resolveLarkCliHomeForTurn(undefined)).toBeNull();
+    expect(runner).not.toHaveBeenCalled();
+  });
+});

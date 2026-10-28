@@ -3851,10 +3851,12 @@ export async function handleCommand(
         // 也只给平台链接；auto 模式下显式的 /login lark|bytedcli 仍可走本机扫码。
         const credSource = credentialSourceOf(botCfg2.triggerUserAuth);
         const larkGoverned = triggerUserAuthApplies(botCfg2.triggerUserAuth, 'lark-cli');
-        const bytedcliGoverned = triggerUserAuthApplies(botCfg2.triggerUserAuth, 'bytedcli');
+        const bytedcliGoverned = triggerUserAuthApplies(botCfg2.triggerUserAuth, 'bytedcli')
+          || triggerUserAuthApplies(botCfg2.triggerUserAuth, 'larkdev');
+        const loginProvider = subCmd.split(/\s+/, 1)[0];
         const platformCredsUrl = credSource !== 'local' && (larkGoverned || bytedcliGoverned)
           ? platformCredentialsUrl() : null;
-        const explicitGoverned = (subCmd === 'lark' && larkGoverned) || (subCmd === 'bytedcli' && bytedcliGoverned);
+        const explicitGoverned = (loginProvider === 'lark' && larkGoverned) || (loginProvider === 'bytedcli' && bytedcliGoverned);
         // platform 模式 + 本机未绑定：按矩阵一律拒绝，绝不落到本机扫码——否则扫完也不会被采信。
         if (credSource === 'platform' && !platformCredsUrl && (larkGoverned || bytedcliGoverned)
           && (subCmd === '' || explicitGoverned)) {
@@ -3862,9 +3864,9 @@ export async function handleCommand(
           break;
         }
         if (platformCredsUrl && (subCmd === '' || (credSource === 'platform' && explicitGoverned))) {
-          const which = subCmd === 'bytedcli' ? 'bytedcli' : subCmd === 'lark' ? 'lark-cli'
+          const which = loginProvider === 'bytedcli' ? 'bytedcli' : loginProvider === 'lark' ? 'lark-cli'
             : [larkGoverned ? 'lark-cli' : '', bytedcliGoverned ? 'bytedcli' : ''].filter(Boolean).join(' / ');
-          const provider = subCmd === 'bytedcli' ? 'ByteCloud' : subCmd === 'lark'
+          const provider = loginProvider === 'bytedcli' ? 'ByteCloud' : loginProvider === 'lark'
             ? t('trigger_user_auth.provider_lark', undefined, loc)
             : [larkGoverned ? t('trigger_user_auth.provider_lark', undefined, loc) : '', bytedcliGoverned ? 'ByteCloud' : ''].filter(Boolean).join(' / ');
           const lines = [

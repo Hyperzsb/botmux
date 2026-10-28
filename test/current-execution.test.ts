@@ -105,3 +105,18 @@ describe('current execution proof', () => {
     }
   });
 });
+
+describe('regional identity protocol compatibility', () => {
+  it('accepts a proven larkdev identity and preserves its site-scoped payload', async () => {
+    const { resolveCurrentExecutionIdentity, CURRENT_EXECUTION_IDENTITY_SCHEMA } = await import('../src/cli/current-execution.js');
+    const identity = {
+      schema: CURRENT_EXECUTION_IDENTITY_SCHEMA, status: 'verified',
+      larkAppId: 'cli_a', sessionId: 'session-a', tool: 'larkdev', identityTurnId: 'turn-a',
+      env: "BOTMUX_IDENTITY_MODE='larkdev-user'\nBYTECLOUD_CLI_API_JWT_TOKEN_I18N_BD='alice-bd'\n",
+    };
+    expect(await resolveCurrentExecutionIdentity({
+      ipcPort: 12345, sessionId: 'session-a', larkAppId: 'cli_a', tool: 'larkdev',
+      fetchImpl: async () => new Response(JSON.stringify(identity), { status: 200 }),
+    })).toEqual(identity);
+  });
+});

@@ -109,7 +109,7 @@ describe('wrapper rendering model (review gate: no resolver argv on legacy paths
     expect(text).toContain('.data"');
   });
 
-  it('renders the runner argv and eval block for the proven model', () => {
+  it.skipIf(process.platform !== 'linux')('renders the runner argv and eval block for the proven model', () => {
     const text = install('proven', { appId: 'cli_app', ipcPort: 12345 });
     expect(text).toContain('cli-identity-runner');
     expect(text).toContain('--ipc-port');

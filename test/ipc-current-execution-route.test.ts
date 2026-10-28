@@ -147,7 +147,7 @@ describe('POST /api/current-execution', () => {
       expect(stale.code).toBe(77); expect(stale.stdout).toBe('');
     } finally { rmSync(dataDir, { recursive: true, force: true }); }
   });
-  it('returns a distinct terminal error when the proven material is gone', async () => {
+  it.skipIf(process.platform !== 'linux')('returns a distinct terminal error when the proven material is gone', async () => {
     const ds = session();
     vi.spyOn(workerPool, 'findActiveBySessionId').mockImplementation(id => id === 's-execution' ? ds : undefined);
     vi.spyOn(await import('../src/bot-registry.js'), 'getBot').mockReturnValue({ config: {

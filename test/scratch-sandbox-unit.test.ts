@@ -122,19 +122,15 @@ describe('persistedScratchMappings (cross-process meta)', () => {
 
 describe('scratchViewPath canonicalises symlink-aliased input (mac /tmp → /private/tmp)', () => {
   it('maps a path given via a symlink alias when it exists on disk', () => {
-    // /tmp is a symlink to /private/tmp on macOS (and often Linux too). Build
-    // a mapping from the REAL path; the caller hands in the alias.
-    const maps: ScratchPathMapping[] = [
-      { from: '/private/tmp/work', to: '/clone/work' },
-    ];
-    // Only assert when this host actually has the /tmp → /private/tmp alias.
-    let realTmp: string;
-    try { realTmp = realpathSync('/tmp'); } catch { realTmp = '/tmp'; }
-    if (realTmp !== '/tmp') {
-      const aliasWork = join('/tmp', 'work', 'x');
-      const got = scratchViewPath(maps, aliasWork);
+    const root = mkdtempSync(join(tmpdir(), 'scratch-alias-'));
+    try {
+      const child = join(root, 'work', 'x');
+      mkdirSync(child, { recursive: true });
+      const canonical = realpathSync(join(root, 'work'));
+      const maps: ScratchPathMapping[] = [{ from: canonical, to: '/clone/work' }];
+      const got = scratchViewPath(maps, child);
       expect(got).toBe(join('/clone/work', 'x'));
-    }
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
   it('falls back to the original path when canonicalisation cannot resolve', () => {

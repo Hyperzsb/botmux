@@ -373,6 +373,9 @@ export const IDENTITY_ENV_KEYS: Record<IdentityTool, readonly string[]> = {
   // a command selects another site bytedcli skips the mismatched JWT and may
   // fall back to the operator's on-disk login. Publish every site explicitly.
   bytedcli: [
+    // Legacy platform grants retain their native JWT site validation inside an empty HOME.
+    'BYTEDCLI_USER_CLOUD_JWT',
+    'BYTEDCLI_USER_CODE_JWT',
     ...Object.values(BYTECLOUD_USER_JWT_ENV_BY_SITE),
     'BYTECLOUD_AUTH_AS',
   ],
@@ -429,9 +432,11 @@ export interface LarkCliHomeIdentity extends TurnBound {
 }
 
 export interface BytedCliIdentity extends TurnBound {
+  /** Unscoped JWT supplied only by the platform; never inferred to be CN. */
+  cloudJwt?: string;
   tool: 'bytedcli';
   /** Site keys use bytedcli spelling; BOE intentionally reuses `cn`. */
-  cloudJwts: Partial<Record<ByteCloudUserSite, string>>;
+  cloudJwts?: Partial<Record<ByteCloudUserSite, string>>;
   codeJwt?: string;
   openId?: string;
 }
@@ -552,10 +557,14 @@ export function renderIdentityEnv(identity: CliIdentity): string {
       MODE_VAR,
       identity.tool === 'bytedcli' ? 'bytedcli-user' : 'larkdev-user',
     ], ['BYTECLOUD_AUTH_AS', 'user']);
+    if (identity.tool === 'bytedcli') {
+      if (identity.cloudJwt) pairs.push(['BYTEDCLI_USER_CLOUD_JWT', identity.cloudJwt]);
+      if (identity.codeJwt) pairs.push(['BYTEDCLI_USER_CODE_JWT', identity.codeJwt]);
+    }
     for (const [site, key] of Object.entries(BYTECLOUD_USER_JWT_ENV_BY_SITE) as Array<
       [ByteCloudUserSite, typeof BYTECLOUD_USER_JWT_ENV_BY_SITE[ByteCloudUserSite]]
     >) {
-      const jwt = identity.cloudJwts[site];
+      const jwt = identity.cloudJwts?.[site];
       if (jwt) pairs.push([key, jwt]);
     }
   }
@@ -1105,7 +1114,13 @@ export function renderIdentityWrapper(
     '      esac',
     '    done',
     '    unset __botmux_arg',
+    // Site-labelled local grants require an explicit token for the selected
+    // partition. A legacy platform JWT keeps the SDK's own site validation;
+    // the fresh HOME below still prevents any machine-login fallback.
+    '    if [ -z "$BYTEDCLI_USER_CLOUD_JWT" ]; then',
+    '      :',
     ...bytedcliSiteGuard,
+    '    fi',
     // A single BYTEDCLI_USER_CLOUD_JWT is valid but bound to one region; when a
     // command selects another site bytedcli deliberately skips it. The SDK's
     // site-specific variables avoid that ambiguity. Run in a fresh HOME so an

@@ -6966,6 +6966,16 @@ describe('handleCommand', () => {
       expect(beginBytedcliLogin).not.toHaveBeenCalled();
     });
 
+    it.each([
+      { tool: 'bytedcli', bound: true }, { tool: 'bytedcli', bound: false },
+      { tool: 'larkdev', bound: true }, { tool: 'larkdev', bound: false },
+    ])('platform-only regional login keeps $tool on the platform (bound=$bound)', async ({ tool, bound }) => {
+      const deps = withPolicy({ enabled: true, tools: [tool], credentialSource: 'platform' }, bound);
+      await handleCommand('/login', ROOT_ID, makeLarkMessage('/login bytedcli i18n-bd'), deps, LARK_APP_ID);
+      expect(beginBytedcliLogin).not.toHaveBeenCalled();
+      expect(reply(deps)).toContain(bound ? PAGE : t('cmd.login.platform_unbound', undefined, 'zh'));
+    });
+
     it('platform + bound: /login lark for an ungoverned tool is not hijacked to the platform', async () => {
       const deps = withPolicy({ enabled: true, tools: ['bytedcli'], credentialSource: 'platform' }, true);
       await handleCommand('/login', ROOT_ID, makeLarkMessage('/login lark'), deps, LARK_APP_ID);

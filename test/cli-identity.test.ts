@@ -201,9 +201,9 @@ describe('clearSessionIdentity', () => {
   });
 
   it('clears a failed preparation without deleting the active or queued proven snapshots', () => {
-    writeSessionIdentity(dir, SESSION, { tool: 'bytedcli', cloudJwt: 'a', turnId: 'turn-A' }, 'proven');
-    writeSessionIdentity(dir, SESSION, { tool: 'bytedcli', cloudJwt: 'b', turnId: 'turn-B' }, 'proven');
-    writeSessionIdentity(dir, SESSION, { tool: 'bytedcli', cloudJwt: 'c', turnId: 'turn-C' }, 'proven');
+    writeSessionIdentity(dir, SESSION, { tool: 'bytedcli', cloudJwts: { cn: 'a' }, turnId: 'turn-A' }, 'proven');
+    writeSessionIdentity(dir, SESSION, { tool: 'bytedcli', cloudJwts: { cn: 'b' }, turnId: 'turn-B' }, 'proven');
+    writeSessionIdentity(dir, SESSION, { tool: 'bytedcli', cloudJwts: { cn: 'c' }, turnId: 'turn-C' }, 'proven');
     clearSessionIdentity(dir, SESSION, 'bytedcli', 'turn-B', 'proven');
     expect(recallProvenIdentityContent(dir, SESSION, 'turn-A', 'bytedcli')).toContain("'a'");
     expect(recallProvenIdentityContent(dir, SESSION, 'turn-B', 'bytedcli')).toBeUndefined();
@@ -744,11 +744,11 @@ describe('renderIdentityWrapper', () => {
     writeSessionIdentity(dir, SESSION, tool === 'lark-cli' ? {
       tool, appId: 'a', userAccessToken: 'authorized-human', turnId: 'turn-A', openId: 'ou_alice_target',
     } : {
-      tool, cloudJwt: 'authorized-human', turnId: 'turn-A', openId: 'ou_alice_target',
+      tool, cloudJwts: { cn: 'authorized-human' }, turnId: 'turn-A', openId: 'ou_alice_target',
     }, 'single');
     publishActiveTurn(dir, SESSION, 'turn-A', undefined, 'ou_peer_bot');
     const output = runWrapper(wrapperPath, { SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION }, [
-      tool === 'lark-cli' ? 'LARKSUITE_CLI_USER_ACCESS_TOKEN' : 'BYTEDCLI_USER_CLOUD_JWT',
+      tool === 'lark-cli' ? 'LARKSUITE_CLI_USER_ACCESS_TOKEN' : 'BYTECLOUD_CLI_API_JWT_TOKEN_CN',
     ]);
     expect(output.trim()).toBe('authorized-human');
   });

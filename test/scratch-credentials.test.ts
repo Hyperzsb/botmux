@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { enumerateScratchSecretPaths } from '../src/adapters/backend/scratch-credentials.js';
 
 let root: string;
-beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'scratch-cred-')); });
+beforeEach(() => { root = realpathSync(mkdtempSync(join(tmpdir(), 'scratch-cred-'))); });
 afterEach(() => rmSync(root, { recursive: true, force: true }));
 
 const home = () => join(root, 'home');

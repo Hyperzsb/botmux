@@ -1481,7 +1481,7 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
     ? record.sessionId : undefined;
   // The Codebase CLI companion mirrors bytedcli's proven identity, so its
   // wrapper uses the same proof channel and tool name.
-  const identityRouteTools = ['lark-cli', 'bytedcli', 'codebase'] as const;
+  const identityRouteTools = ['lark-cli', 'bytedcli', 'larkdev', 'codebase'] as const;
   type IdentityRouteTool = typeof identityRouteTools[number];
   const toolValue = typeof record?.tool === 'string' ? record.tool : '';
   const tool: IdentityRouteTool | '' = (identityRouteTools as readonly string[]).includes(toolValue)
