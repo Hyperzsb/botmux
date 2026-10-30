@@ -5795,7 +5795,19 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-    if (await handleConnectorApi(req, res, url)) {
+    if (await handleConnectorApi(req, res, url, {
+      // Dashboard does not own a live bot registry. Resolve through the target
+      // daemon, which holds app-scoped observations and the effective policy.
+      resolveRunAsUser: async (appId, runAsOpenId) => {
+        if (runAsOpenId === undefined || runAsOpenId === null || runAsOpenId === '') return undefined;
+        const upstream = await proxyToDaemon(appId, '/api/automation-users/resolve', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ runAsOpenId }),
+        });
+        const body = await upstream.json() as { ok?: boolean; user?: import('./services/automation-identity.js').AutomationUser; error?: string };
+        if (!upstream.ok || !body.ok || !body.user) throw new Error(body.error ?? 'run_as_user_identity_unavailable');
+        return body.user;
+      },
+    })) {
       return;
     }
 
@@ -6462,6 +6474,15 @@ const server = createServer(async (req, res) => {
       if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
       const upstream = await proxyToDaemon(owner, `/api/sessions/${sid}/spawn-command`, { method: 'GET' });
       res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/automation-users') {
+      if (!canManageHost) return jsonRes(res, 403, { ok: false, error: 'forbidden' });
+      const appId = url.searchParams.get('larkAppId') ?? '';
+      const upstream = await proxyToDaemon(appId, '/api/automation-users', { method: 'GET' });
+      res.writeHead(upstream.status, { 'Content-Type': 'application/json' });
       res.end(await upstream.text());
       return;
     }

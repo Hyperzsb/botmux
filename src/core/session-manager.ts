@@ -1,3 +1,4 @@
+import { assertAutomationSession, freezeAutomationTurnUser } from '../services/automation-identity.js';
 import { isSessionGroup, touchSessionGroup } from '../services/session-groups-store.js';
 import { renderStewardHintBlock } from './decision-board/model.js';
 import { buildZeroPromptInput, zeroPromptInjectionForBot, sessionPromptInjection, type PromptInjection } from './prompt-injection.js';
@@ -4435,6 +4436,7 @@ export async function executeScheduledTask(
   // silent-output suppression, this identifies the exact shared-topic reply
   // target when a chat-scope session already has another turn queued.
   const scheduledTurnId = `schedule:${task.id}:${randomUUID()}`;
+  if (task.runAsUser) task = { ...task, ownerOpenId: task.runAsUser.openId, ownerUnionId: task.runAsUser.unionId };
   const scheduledTrustedCaller = trustedCallerForScheduledTask(task, larkAppId);
   const rawTopicTitle = task.topicTitle?.trim();
   const createsOwnTopic = executionPosition === 'new-topic' || executionPosition === 'task';
@@ -4799,7 +4801,15 @@ export async function executeScheduledTask(
         }
         // Identity preparation may reject after a concurrent pause/revocation.
         // Run it before changing the retained conversation's routing or prompt.
-        await runtime?.prepareTurnIdentity?.(existing, scheduledTurnId);
+        const rollbackIdentitySnapshot = freezeAutomationTurnUser(existing, scheduledTurnId, task.runAsUser ?? null);
+        try {
+          if (task.runAsUser) assertAutomationSession(task.runAsUser, existing);
+          await runtime?.prepareTurnIdentity?.(existing, scheduledTurnId);
+        } catch (error) {
+          rollbackIdentitySnapshot();
+          throw error;
+        }
+        sessionStore.updateSession(existing.session);
         if (activeSessions.get(key) !== existing || existing.session.status !== 'active') {
           throw new Error(`scheduled continuation lost active session ${existing.session.sessionId}`);
         }
@@ -4962,6 +4972,9 @@ export async function executeScheduledTask(
     // On rejection there is no worker or activation journal to recover: close
     // its durable row so the next fire can create a fresh candidate.
     try {
+      freezeAutomationTurnUser(ds, scheduledTurnId, task.runAsUser ?? null);
+      sessionStore.updateSession(ds.session);
+      if (task.runAsUser) assertAutomationSession(task.runAsUser, ds);
       await runtime?.prepareTurnIdentity?.(ds, scheduledTurnId);
     } catch (err) {
       sessionStore.closeSession(session.sessionId);

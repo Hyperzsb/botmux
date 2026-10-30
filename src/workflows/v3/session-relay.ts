@@ -39,6 +39,7 @@ export function isV3SessionRunMutation(value: string): value is WorkflowDaemonMu
 
 /** Live view of the claimed session, provided by the daemon's own registry. */
 export interface V3SessionRelaySessionView {
+  scheduledExecutionUser?: import('../../services/automation-identity.js').AutomationUser | null;
   receiver: boolean;
   liveOrigin?: { capability: string; turnId?: string; dispatchAttempt?: number };
   callerOpenId?: string;
@@ -184,6 +185,7 @@ export function authorizeV3SessionRunMutationRequest(input: {
     const gate = input.isScheduleOwnerAllowed ?? (() => false);
     const auth = authorizeScheduledTurn({
       turnId: liveTurnId,
+      executionUser: current.scheduledExecutionUser,
       dataDir: input.sessionDataDir,
       sessionLarkAppId: current.larkAppId,
       sessionChatId: current.chatId,

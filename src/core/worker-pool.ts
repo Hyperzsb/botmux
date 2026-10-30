@@ -2160,9 +2160,10 @@ function isOrdinaryRecoveryTurnId(turnId: string | undefined): turnId is string 
 function scheduledContinuationTrustedCaller(
   ds: DaemonSession,
   taskId: string,
+  turnId?: string,
 ): TrustedCaller | undefined {
   const task = readScheduledTaskForProvenance(config.session.dataDir, ds.larkAppId, taskId);
-  return task ? trustedCallerForScheduledTask(task, ds.larkAppId) : undefined;
+  return task ? trustedCallerForScheduledTask(task, ds.larkAppId, turnId ? ds.session.replyTargets?.[turnId]?.automationUser : undefined) : undefined;
 }
 
 function ordinaryTurnRecoveryStillOwnsSession(ds: DaemonSession): boolean {
@@ -2373,9 +2374,17 @@ export function ensureOrdinaryTurnRecoveryAttached(
     cancel: timer => clearTimeout(timer),
     persist: () => sessionStore.updateSession(ds.session),
     mintContinuationTurnId: logicalTurnId => mintScheduledContinuationTurnId(logicalTurnId),
-    prepare: dispatch => parseScheduledTurnId(dispatch.logicalTurnId)
-      ? callbacks?.prepareRawInputTurn?.(ds, dispatch.turnId)
-      : undefined,
+    prepare: dispatch => {
+      if (!parseScheduledTurnId(dispatch.logicalTurnId)) return;
+      const snapshot = ds.session.replyTargets?.[dispatch.logicalTurnId]?.automationUser;
+      if (snapshot !== undefined) {
+        ds.session.replyTargets ??= {};
+        ds.session.replyTargets[dispatch.turnId] = { ...ds.session.replyTargets[dispatch.turnId],
+          automationUser: snapshot, updatedAt: new Date().toISOString() };
+        sessionStore.updateSession(ds.session);
+      }
+      return callbacks?.prepareRawInputTurn?.(ds, dispatch.turnId);
+    },
     enqueue: (dispatch: OrdinaryTurnRecoveryDispatch) => {
       if (!ordinaryTurnRecoveryEligible(ds) || !ordinaryTurnRecoveryStillOwnsSession(ds)) return false;
       // A scheduled logical turn continues as the same scheduled turn: same
@@ -2385,7 +2394,7 @@ export function ensureOrdinaryTurnRecoveryAttached(
       // inherited reply context alone.
       const scheduledTaskId = parseScheduledTurnId(dispatch.logicalTurnId);
       const trustedCaller = scheduledTaskId
-        ? scheduledContinuationTrustedCaller(ds, scheduledTaskId)
+        ? scheduledContinuationTrustedCaller(ds, scheduledTaskId, dispatch.turnId)
         : undefined;
       // Silence comes from the frozen per-turn attribute in the persisted
       // state, not from the runtime registry (which a daemon restart empties).
@@ -12918,7 +12927,7 @@ function rememberScheduledTurnCaller(
   const task = readScheduledTaskForProvenance(
     config.session.dataDir, ds.larkAppId, taskId,
   );
-  const expected = task ? trustedCallerForScheduledTask(task, ds.larkAppId) : undefined;
+  const expected = task ? trustedCallerForScheduledTask(task, ds.larkAppId, ds.session.replyTargets?.[turnId]?.automationUser) : undefined;
   if (!expected
     || expected.requestLarkAppId !== ds.larkAppId
     || expected.requestUserOpenId !== caller.requestUserOpenId
@@ -12935,6 +12944,12 @@ function forgetScheduledTurnCaller(ds: DaemonSession, turnId: string | undefined
 }
 
 /** Reuse the daemon's normal per-turn credential publication, including scheduled authority checks. */
+/** Publish credentials before admitting a host-selected external turn. */
+export async function prepareExternalTurnIdentity(ds: DaemonSession, turnId: string): Promise<void> {
+  if (!callbacks?.prepareRawInputTurn) throw new Error('external_identity_preparation_unavailable');
+  await callbacks.prepareRawInputTurn(ds, turnId);
+}
+
 export async function prepareFailedTurnRecoveryIdentity(ds: DaemonSession, turnId: string): Promise<void> {
   if (!callbacks?.prepareRawInputTurn) throw new Error('recovery_identity_preparation_unavailable');
   await callbacks.prepareRawInputTurn(ds, turnId);

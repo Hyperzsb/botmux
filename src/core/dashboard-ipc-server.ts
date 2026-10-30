@@ -1,3 +1,5 @@
+import { listAutomationUsers, resolveAutomationUser } from '../services/automation-identity.js';
+import { getConnector } from '../services/connector-store.js';
 import { normalizeCodexProfile, scanCodexProfiles, validateCodexProfile, CodexProfileError } from '../services/codex-profiles.js';
 import { REPLY_FOOTER_KEYS, normalizeReplyFooter, type ReplyFooterPreferences } from '../services/reply-footer.js';
 import { boardErrorStatus, type BoardCliRequest, type DecisionBoardService } from './decision-board/service.js';
@@ -5780,6 +5782,7 @@ function parseSchedulePreconditionWrite(
 }
 
 export interface ScheduleRow {
+  runAsUser?: ScheduledTask['runAsUser'];
   id: string;
   calendar?: string;
   calendarDayType?: import('../services/work-calendar.js').CalendarDayType;
@@ -5980,6 +5983,7 @@ function schedulePreconditionProjection(
 
 function composeScheduleRow(t: ScheduledTask): ScheduleRow {
   return {
+    runAsUser: t.runAsUser,
     calendar: t.calendar,
     calendarDayType: t.calendar ? t.calendarDayType ?? 'workday' : undefined,
     lastCalendarCheck: t.lastCalendarCheck,
@@ -6014,6 +6018,19 @@ function composeScheduleRow(t: ScheduledTask): ScheduleRow {
     feishuChatLink: feishuChatLink(t.chatId, getBotBrand(t.larkAppId)),
   };
 }
+
+ipcRoute('POST', '/api/automation-users/resolve', requireBoundBot(async (req, res) => {
+  try {
+    const body = await readJsonBody(req) as { runAsOpenId?: unknown };
+    const user = await resolveAutomationUser(cachedLarkAppId, body?.runAsOpenId);
+    jsonRes(res, 200, { ok: true, user: user ?? null });
+  } catch (error) { jsonRes(res, 400, { ok: false, error: ipcErrorText(error) }); }
+}, NOT_BOUND_BODY.okFalse));
+
+ipcRoute('GET', '/api/automation-users', requireBoundBot((_req, res) => {
+  try { jsonRes(res, 200, { users: listAutomationUsers(cachedLarkAppId).map(({ openId, name, email }) => ({ openId, name, email })) }); }
+  catch { jsonRes(res, 503, { ok: false, error: 'automation_users_unavailable' }); }
+}, NOT_BOUND_BODY.okFalse));
 
 ipcRoute('GET', '/api/schedules/calendars', requireBoundBot((_req, res) => {
   jsonRes(res, 200, listWorkCalendars(cachedLarkAppId));
@@ -6291,6 +6308,7 @@ ipcRoute('POST', '/api/schedules', requireBoundBot(async (req, res) => {
   // a clear lastError, which is the pre-existing behavior for CLI-created
   // tasks. Adding a flaky gate here would block valid creates.
   try {
+    const runAsUser = await resolveAutomationUser(cachedLarkAppId, b.runAsOpenId);
     const ownerOpenId = getOwnerOpenId(cachedLarkAppId);
     let ownerUnionId: string | undefined;
     if (ownerOpenId) {
@@ -6325,6 +6343,7 @@ ipcRoute('POST', '/api/schedules', requireBoundBot(async (req, res) => {
       // mutation (scheduled-turn-provenance).
       ownerOpenId,
       ownerUnionId,
+      runAsUser,
       deliver,
       silent,
       followActive: followActive || undefined,
@@ -6351,6 +6370,7 @@ ipcRoute('PATCH', '/api/schedules/:id', async (req, res, p) => {
   }
   const b = body as Record<string, unknown>;
   const updates: {
+    runAsUser?: ScheduledTask['runAsUser'] | null;
     name?: string; prompt?: string; schedule?: string; calendar?: string | null;
     calendarDayType?: import('../services/work-calendar.js').CalendarDayType | null;
     deliver?: 'origin' | 'new-topic'; silent?: boolean;
@@ -6358,6 +6378,10 @@ ipcRoute('PATCH', '/api/schedules/:id', async (req, res, p) => {
     chatId?: string; chatIds?: readonly string[] | null;
     model?: string | null; reasoningEffort?: ScheduleReasoningEffort | null;
   } = {};
+  if (Object.hasOwn(b, 'runAsOpenId')) {
+    try { updates.runAsUser = await resolveAutomationUser(cachedLarkAppId, b.runAsOpenId) ?? null; }
+    catch (error) { return jsonRes(res, 400, { ok: false, error: ipcErrorText(error), field: 'runAsOpenId' }); }
+  }
   const chatTargets = parseScheduleChatTargets(b, false);
   if (chatTargets && !chatTargets.ok) {
     return jsonRes(res, 400, { ok: false, error: 'invalid_field', field: chatTargets.field });
@@ -6552,7 +6576,15 @@ ipcRoute('POST', '/api/trigger', requireBoundBot(async (req, res) => {
         error: 'active session registry unavailable',
       });
     }
-    const result = await triggerSessionTurn(valid.request, { larkAppId: cachedLarkAppId, activeSessions });
+    // Resolve only saved connector policy. Payloads and generic trigger callers
+    // cannot supply an execution user or overwrite the stored selection.
+    const connector = valid.request.source.type === 'webhook' && valid.request.source.connectorId
+      ? getConnector(valid.request.source.connectorId) : undefined;
+    if (connector?.runAsUser && connector.target.botId !== cachedLarkAppId) {
+      return jsonRes(res, 400, { ok: false, errorCode: 'bad_request', error: 'run_as_user_app_mismatch' });
+    }
+    const result = await triggerSessionTurn(valid.request, { larkAppId: cachedLarkAppId, activeSessions },
+      connector?.runAsUser ? { executionUser: connector.runAsUser } : undefined);
     const status = result.ok
       ? 200
       // An idempotent retry that resolves to a durable `failed` async state is a

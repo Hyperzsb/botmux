@@ -47,6 +47,7 @@ vi.mock('../src/services/message-queue.js', () => ({
 }));
 
 const mockForkWorker = vi.fn();
+const mockPrepareExternalTurnIdentity = vi.fn(async (..._args: any[]) => {});
 const mockQueuedTailAdmission = vi.fn();
 const activeKeyLocks = vi.hoisted(() => ({
   byMap: new WeakMap<Map<string, any>, Map<string, Promise<void>>>(),
@@ -58,6 +59,7 @@ vi.mock('../src/core/worker-pool.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/core/worker-pool.js')>();
   return {
   forkWorker: (...args: any[]) => mockForkWorker(...args),
+  prepareExternalTurnIdentity: (...args: any[]) => mockPrepareExternalTurnIdentity(...args),
   sendWorkerInput: (ds: any, payload: any, turnId?: string, opts: any = {}) => {
     if (!ds.worker || ds.worker.killed) return false;
     if (actual.hasQueuedActivationAdmissionGate(ds)) return mockQueuedTailAdmission(ds, payload, turnId, opts);
@@ -235,6 +237,35 @@ describe('triggerSessionTurn rootMessageId target', () => {
     expect(ds?.scope).toBe('thread');
     expect(ds?.session.rootMessageId).toBe(ROOT);
     expect(mockForkWorker).toHaveBeenCalledWith(ds, { content: expect.stringContaining('new:') });
+  });
+
+  it('prepares a selected user before forking and carries the same caller into the opening input', async () => {
+    const user = { larkAppId: APP, openId: 'ou_selected', unionId: 'on_selected' };
+    mockGetBot.mockReturnValue({ config: { larkAppId: APP, cliId: 'claude-code', workingDir: '/tmp',
+      triggerUserAuth: { enabled: true, tools: ['bytedcli'], fallback: 'none' } },
+      resolvedAllowedUsers: [user.openId], resolvedBlockedUsers: [], botName: 'Bot', botOpenId: 'ou_bot' });
+    const activeSessions = new Map<string, DaemonSession>();
+    const result = await triggerSessionTurn(request(), { larkAppId: APP, activeSessions }, { executionUser: user });
+    expect(result.ok).toBe(true);
+    const ds = activeSessions.get(sessionKey(ROOT, APP))!;
+    expect(ds.session.ownerOpenId).toBe(user.openId);
+    expect(mockPrepareExternalTurnIdentity).toHaveBeenCalledWith(ds, result.triggerId);
+    expect(ds.session.replyTargets?.[result.triggerId!].automationUser).toEqual(user);
+    expect(mockForkWorker.mock.calls.at(-1)?.[1].trustedCaller).toMatchObject({
+      requestUserOpenId: user.openId, requestUserUnionId: user.unionId, source: 'automation',
+    });
+    expect(mockPrepareExternalTurnIdentity.mock.invocationCallOrder.at(-1))
+      .toBeLessThan(mockForkWorker.mock.invocationCallOrder.at(-1)!);
+  });
+
+  it('does not accept an execution identity supplied in the external event data', async () => {
+    const req = request();
+    req.envelope.payload = { runAsOpenId: 'ou_payload', runAsUser: { larkAppId: APP, openId: 'ou_payload', unionId: 'on_payload' } };
+    const activeSessions = new Map<string, DaemonSession>();
+    await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
+    expect(mockPrepareExternalTurnIdentity).not.toHaveBeenCalled();
+    expect(mockForkWorker.mock.calls.at(-1)?.[1].trustedCaller).toBeUndefined();
+    expect(activeSessions.get(sessionKey(ROOT, APP))?.session.ownerOpenId).toBeUndefined();
   });
 
   it('keeps the localized topic seed by default', () => {

@@ -35,6 +35,9 @@ export interface IdentityRecord {
   type: IdentityType;
   name?: string;
   email?: string;
+  /** Positive human sender observation, independent of later contact enrichment. */
+  interactedAt?: number;
+  unionId?: string;
   /** A successful contact API lookup, including a valid "no email" result. */
   contactResolvedAt?: number;
   source: 'sender' | 'mention' | 'contact_api' | 'message_api' | 'bot_cross_ref' | 'bot_info';
@@ -127,6 +130,8 @@ export function recordIdentity(
     type?: IdentityType;
     name?: string;
     email?: string;
+    interactedAt?: number;
+    unionId?: string;
     contactResolvedAt?: number;
     source?: IdentityRecord['source'];
   },
@@ -140,6 +145,8 @@ export function recordIdentity(
     type: incomingType ?? existing?.type ?? 'unknown',
     name: rec.name ?? existing?.name,
     email: rec.email ?? existing?.email,
+    interactedAt: rec.interactedAt ?? existing?.interactedAt,
+    unionId: rec.unionId ?? existing?.unionId,
     contactResolvedAt: rec.contactResolvedAt ?? existing?.contactResolvedAt,
     source: rec.source ?? existing?.source ?? 'sender',
     updatedAt: Date.now(),
@@ -151,12 +158,28 @@ export function recordIdentity(
     && existing.type === merged.type
     && existing.name === merged.name
     && existing.email === merged.email
+    && existing.interactedAt === merged.interactedAt
+    && existing.unionId === merged.unionId
     && existing.contactResolvedAt === merged.contactResolvedAt
   ) {
     return;
   }
   store.set(rec.openId, merged);
   schedulePersist(larkAppId);
+}
+
+/** Refresh persisted observations too: the dashboard and daemon are separate processes. */
+export function listObservedIdentities(larkAppId: string): IdentityRecord[] {
+  const records = new Map<string, IdentityRecord>();
+  try {
+    const raw = JSON.parse(readFileSync(cacheFile(larkAppId), 'utf8'));
+    if (Array.isArray(raw)) for (const rec of raw) if (rec?.openId) records.set(rec.openId, rec);
+  } catch { /* absent cache; live observations and session history remain usable */ }
+  for (const rec of getStore(larkAppId).values()) {
+    const persisted = records.get(rec.openId);
+    records.set(rec.openId, persisted && persisted.updatedAt > rec.updatedAt ? persisted : rec);
+  }
+  return [...records.values()];
 }
 
 /**

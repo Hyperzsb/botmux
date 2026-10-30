@@ -1,3 +1,4 @@
+import { assertAutomationUserAllowed } from './services/automation-identity.js';
 import { shareVcMeetingSummary } from './services/vc-meeting-summary-share.js';
 import { isCurrentBotInChat, resolveUnionIdFromOpenIdStrict } from './im/lark/client.js';
 import { createBotAdminUnionsPublisher } from './services/bot-admin-unions-store.js';
@@ -4347,7 +4348,10 @@ async function prepareScheduledTurnCliIdentity(ds: DaemonSession, turnId: string
   if (!taskId) throw new Error('invalid scheduled turn');
   const authority = scheduleAuthorityStore?.getRecord(ds.larkAppId, taskId);
   if (!authority) throw new Error('schedule authority record missing');
-  const task = authority.task;
+  const snapshot = ds.session.replyTargets?.[turnId]?.automationUser;
+  if (authority.task.runAsUser && snapshot === undefined) throw new Error('schedule_execution_identity_snapshot_missing');
+  const task = snapshot !== undefined ? { ...authority.task, runAsUser: snapshot ?? undefined } : authority.task;
+  if (task.runAsUser) assertAutomationUserAllowed(task.runAsUser, ds.larkAppId, ds.chatId);
   // Read the host authority, never the CLI-writable schedules.json projection
   // or the session's last sender. A completed one-shot may still have an
   // admitted turn to restore/continue; manual disables and revocations cannot.
@@ -4417,6 +4421,10 @@ async function refreshTurnCliIdentity(ds: DaemonSession, turnId: string): Promis
   if (identityPublicationConflicted(ds)) return;
 
   const reply = pickTurnReplyTarget(ds.session, turnId);
+  if (reply?.automationUser) {
+    assertAutomationUserAllowed(reply.automationUser, ds.larkAppId, ds.chatId);
+    noteSenderUnionId(ds.larkAppId, reply.automationUser.openId, reply.automationUser.unionId);
+  }
   let delegatedIdentity: import('./core/turn-cli-identity.js').DelegatedCliIdentity | undefined;
   let delegationBlocked = false;
   let delegationRecord: Awaited<ReturnType<typeof dispatchUserForTurn>>;
@@ -8674,6 +8682,8 @@ for (const sessionRelayMutation of V3_SESSION_RUN_MUTATIONS) {
         session: ds
           ? {
               receiver: !!ds.session.vcMeetingReceiver,
+              scheduledExecutionUser: ds.managedTurnOrigin?.turnId
+                ? ds.session.replyTargets?.[ds.managedTurnOrigin.turnId]?.automationUser : undefined,
               ...(ds.managedTurnOrigin ? { liveOrigin: ds.managedTurnOrigin } : {}),
               ...(ds.session.lastCallerOpenId
                 ? { callerOpenId: ds.session.lastCallerOpenId }
@@ -32761,6 +32771,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     }
     if (authority.state !== 'active') {
       throw new Error(`schedule authority state is ${authority.state}; refusing run`);
+    }
+    if (task.runAsUser) {
+      for (const chatId of scheduleStore.effectiveScheduleChatIds(task)) {
+        assertAutomationUserAllowed(task.runAsUser, effectiveAppId, chatId);
+      }
     }
     if (authority.kind === 'delegated') {
       // Every identity entry is governed. Empty runScopes therefore publishes

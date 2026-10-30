@@ -87,6 +87,7 @@ export class IdempotencyConflictError extends Error {
  * whichever of `parsed.runAt`/`parsed.minutes`/`parsed.expr` applies).
  */
 export function canonicalScheduleInput(t: {
+  runAsUser?: ScheduledTask['runAsUser'];
   calendar?: string;
   calendarDayType?: import('./work-calendar.js').CalendarDayType;
   name: string;
@@ -162,6 +163,7 @@ export function canonicalScheduleInput(t: {
     // slot is dropped by computeInputHash and their canonical JSON is
     // byte-for-byte unchanged.
     ownerOpenId: t.ownerOpenId?.trim() || undefined,
+    runAsUser: t.runAsUser ? { larkAppId: t.runAsUser.larkAppId, openId: t.runAsUser.openId, unionId: t.runAsUser.unionId } : undefined,
   };
 }
 
@@ -376,6 +378,7 @@ function migrate(raw: any): ScheduledTask | null {
     // "no creator".
     ownerOpenId: raw.ownerOpenId,
     ownerUnionId: raw.ownerUnionId,
+    runAsUser: raw.runAsUser,
     enabled: raw.enabled !== false,
     disabledReason: raw.disabledReason === 'once_completed' || raw.disabledReason === 'manual'
       ? raw.disabledReason
@@ -670,6 +673,7 @@ export function createTask(params: {
   creatorLarkAppId?: string;
   ownerOpenId?: string;
   ownerUnionId?: string;
+  runAsUser?: ScheduledTask['runAsUser'];
   nextRunAt?: string;
   repeat?: { times: number | null; completed: number };
   deliver?: 'origin' | 'local' | 'new-topic';
@@ -752,6 +756,7 @@ export function createTask(params: {
       creatorLarkAppId: params.creatorLarkAppId,
       ownerOpenId: params.ownerOpenId,
       ownerUnionId: params.ownerUnionId,
+      runAsUser: params.runAsUser,
       enabled: true,
       createdAt: new Date().toISOString(),
       nextRunAt: params.nextRunAt,
@@ -786,7 +791,7 @@ export function removeTask(id: string, appId?: string): boolean {
 export function updateTask(
   id: string,
   updates: Partial<Pick<ScheduledTask,
-    'calendar' | 'calendarDayType' | 'lastCalendarCheck' | 'manualRunRequested' | 'enabled' | 'disabledReason' | 'lastRunAt' | 'nextRunAt' | 'lastStatus' | 'lastRunId' | 'lastError' | 'lastDeliveryError' | 'consecutiveFailures' | 'failureAlertSent' | 'repeat' | 'rootMessageId' | 'scope' | 'executionPosition' | 'topicTitle' | 'chatType' | 'deliver' | 'name' | 'prompt' | 'schedule' | 'parsed' | 'silent' | 'workingDir' | 'followActive' | 'preconditionRef' | 'chatId' | 'model' | 'reasoningEffort'
+    'calendar' | 'calendarDayType' | 'lastCalendarCheck' | 'manualRunRequested' | 'enabled' | 'disabledReason' | 'lastRunAt' | 'nextRunAt' | 'lastStatus' | 'lastRunId' | 'lastError' | 'lastDeliveryError' | 'consecutiveFailures' | 'failureAlertSent' | 'repeat' | 'rootMessageId' | 'scope' | 'executionPosition' | 'topicTitle' | 'chatType' | 'deliver' | 'name' | 'prompt' | 'schedule' | 'parsed' | 'silent' | 'workingDir' | 'followActive' | 'preconditionRef' | 'chatId' | 'model' | 'reasoningEffort' | 'runAsUser'
   >> & { chatIds?: readonly string[] | null },
   appId?: string,
 ): boolean {

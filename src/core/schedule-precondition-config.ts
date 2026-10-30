@@ -204,6 +204,7 @@ function restoreUpdatedTaskRow(
   const patch: Parameters<typeof scheduleStore.updateTask>[1] = {
     preconditionRef: before.preconditionRef,
   };
+  if (updates.runAsUser !== undefined) patch.runAsUser = before.runAsUser;
   if (updates.name !== undefined) patch.name = before.name;
   if (updates.prompt !== undefined) patch.prompt = before.prompt;
   if (updates.silent !== undefined) patch.silent = before.silent;

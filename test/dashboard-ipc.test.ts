@@ -6517,6 +6517,52 @@ describe('GET /api/schedules', () => {
   });
 });
 
+describe('automation user IPC and schedule selection', () => {
+  it('lists app-scoped historical users and resolves a selected user without replacing the task creator', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-automation-'));
+    const previousDataDir = config.session.dataDir;
+    const appId = 'cli_automation_ipc';
+    const identities = await import('../src/im/lark/identity-cache.js');
+    try {
+      config.session.dataDir = join(dir, 'data');
+      mkdirSync(config.session.dataDir, { recursive: true });
+      scheduleStore.setScheduleScope(appId);
+      vi.spyOn(sessionStore, 'readBotSessionsStrict').mockReturnValue([]);
+      registerBot({ larkAppId: appId, larkAppSecret: '', cliId: 'codex', apiOnly: true,
+        allowedUsers: ['ou_creator', 'ou_runner'],
+        triggerUserAuth: { enabled: true, tools: ['bytedcli'], fallback: 'bot-identity' } });
+      identities.recordIdentity(appId, { openId: 'ou_runner', type: 'user', interactedAt: 1, unionId: 'on_runner', name: 'Runner' });
+      identities.recordIdentity(appId, { openId: 'ou_mentioned', type: 'user', source: 'mention' });
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+      const users = await (await fetch(`${base}/api/automation-users`)).json();
+      expect(users.users).toEqual([{ openId: 'ou_runner', name: 'Runner' }]);
+      const resolved = await (await fetch(`${base}/api/automation-users/resolve`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ runAsOpenId: 'ou_runner', unionId: 'on_forged' }),
+      })).json();
+      expect(resolved.user).toMatchObject({ larkAppId: appId, openId: 'ou_runner', unionId: 'on_runner' });
+      const response = await fetch(`${base}/api/schedules`, { method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ name: 'Selected identity', schedule: 'every 1h', prompt: 'Check', chatId: 'oc_target', runAsOpenId: 'ou_runner' }) });
+      expect(response.status).toBe(200);
+      const task = (await response.json()).task;
+      expect(task.runAsUser).toMatchObject({ openId: 'ou_runner', unionId: 'on_runner' });
+      expect(scheduleStore.getTask(task.id, appId)?.ownerOpenId).toBe('ou_creator');
+      const clear = await fetch(`${base}/api/schedules/${task.id}`, { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ runAsOpenId: '' }) });
+      expect(clear.status).toBe(200);
+      expect((await clear.json()).task.runAsUser).toBeUndefined();
+    } finally {
+      identities.flushIdentityCacheSync();
+      if (handle) await handle.close();
+      handle = null;
+      config.session.dataDir = previousDataDir;
+      scheduleStore.setScheduleScope('cli_ipc_test_bot001');
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('POST /api/schedules — creator identity binding', () => {
   it('persists the deployment owner union_id only after an exact live app mapping', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-schedule-owner-'));

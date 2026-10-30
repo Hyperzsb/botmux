@@ -197,6 +197,32 @@ describe('connector-api write routes', () => {
     expect(raw).toContain(created.connector.verify.secretRef);
   });
 
+  it('round-trips the host-resolved execution user, preserves omitted selections and clears explicitly', async () => {
+    const identity = await import('../src/services/automation-identity.js');
+    const selected = { larkAppId: 'app1', openId: 'ou_selected', unionId: 'on_selected' };
+    const resolve = vi.spyOn(identity, 'resolveAutomationUser').mockImplementation(async (appId, value) => {
+      if (!value) return undefined;
+      if (appId !== selected.larkAppId || value !== selected.openId) throw new Error('run_as_user_not_observed');
+      return selected;
+    });
+    const created = await json(await fetch(`${baseUrl}/api/connectors`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+        name: 'Selected user', target: { mode: 'dynamic', kind: 'turn', botId: 'app1' },
+        runAsOpenId: selected.openId, runAsUser: { ...selected, unionId: 'on_forged' },
+      }),
+    }));
+    expect(resolve).toHaveBeenCalledWith('app1', selected.openId);
+    expect(created.connector.runAsUser).toEqual(selected);
+    const endpoint = `${baseUrl}/api/connectors/${encodeURIComponent(created.connector.id)}`;
+    const kept = await json(await fetch(endpoint, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: 'Renamed' }) }));
+    expect(kept.connector.runAsUser).toEqual(selected);
+    const invalid = await fetch(endpoint, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ runAsOpenId: 'ou_unknown', rotateSecret: true }) });
+    expect(invalid.status).toBe(400);
+    const cleared = await json(await fetch(endpoint, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ runAsOpenId: '' }) }));
+    expect(cleared.connector.runAsUser).toBeUndefined();
+    expect((await json(await fetch(endpoint))).connector.runAsUser).toBeUndefined();
+  });
+
   it('defaults to token mode and bakes the secret into the webhook URL path', async () => {
     const created = await json(await fetch(`${baseUrl}/api/connectors`, {
       method: 'POST',

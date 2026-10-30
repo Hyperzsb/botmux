@@ -997,6 +997,7 @@ export function addTask(params: {
   /** Creator's Lark union_id (tenant-stable). Stamped only for human creators;
    *  a task without it runs its scheduled turns with no user identity. */
   ownerUnionId?: string;
+  runAsUser?: ScheduledTask['runAsUser'];
   parsed?: ParsedSchedule;
   repeat?: { times: number | null; completed: number };
   deliver?: 'origin' | 'local' | 'new-topic';
@@ -1081,6 +1082,7 @@ export function addTask(params: {
     creatorLarkAppId: params.creatorLarkAppId,
     ownerOpenId: params.ownerOpenId,
     ownerUnionId: params.ownerUnionId,
+    runAsUser: params.runAsUser,
     nextRunAt,
     repeat: params.repeat,
     // Delivery shape is now expressed by scope/rootMessageId. Persist only the
@@ -1450,6 +1452,7 @@ export function toggleDelivery(id: string): {
 export function updateTask(
   id: string,
   updates: {
+    runAsUser?: ScheduledTask['runAsUser'] | null;
     name?: string;
     calendar?: string | null;
     calendarDayType?: import('../services/work-calendar.js').CalendarDayType | null;
@@ -1471,6 +1474,10 @@ export function updateTask(
 ): { ok: boolean; error?: string; deferredEventPatch?: Record<string, unknown> } {
   const task = runtimeTask(id);
   if (!task) return { ok: false, error: 'not_found' };
+  const appId = authorityAppId(task.larkAppId);
+  if (updates.runAsUser != null && appId && authorityStore?.getRecord(appId, id)?.kind === 'delegated') {
+    return { ok: false, error: 'delegated_schedule_identity_immutable' };
+  }
 
   let calendar: string | undefined;
   try { calendar = updates.calendar === undefined ? task.calendar : normalizeCalendarBinding(updates.calendar); }
@@ -1498,6 +1505,10 @@ export function updateTask(
     patch.lastCalendarCheck = undefined;
     eventPatch.calendar = calendar ?? null;
     eventPatch.lastCalendarCheck = null;
+  }
+  if (updates.runAsUser !== undefined) {
+    patch.runAsUser = updates.runAsUser ?? undefined;
+    eventPatch.runAsUser = updates.runAsUser;
   }
   if (updates.name !== undefined) patch.name = updates.name;
   if (updates.prompt !== undefined) patch.prompt = updates.prompt;

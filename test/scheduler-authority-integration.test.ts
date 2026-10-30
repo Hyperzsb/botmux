@@ -52,6 +52,29 @@ describe('scheduler host authority integration', () => {
     workingDir: '/repo', chatId: 'oc_chat', larkAppId: APP,
   };
 
+  it('persists execution user changes without rewriting task control ownership', () => {
+    const selected = { larkAppId: APP, openId: 'ou_runner', unionId: 'on_runner' };
+    const task = scheduler.addTask({ ...params, ownerOpenId: 'ou_creator', ownerUnionId: 'on_creator', runAsUser: selected });
+    expect(scheduleStore.getTask(task.id, APP)?.runAsUser).toEqual(selected);
+    expect(store.getRecord(APP, task.id)).toMatchObject({ controlOpenId: 'ou_creator', task: { runAsUser: selected } });
+    expect(scheduler.updateTask(task.id, { runAsUser: { ...selected, openId: 'ou_next', unionId: 'on_next' } }).ok).toBe(true);
+    expect(store.getRecord(APP, task.id)).toMatchObject({ controlOpenId: 'ou_creator', task: {
+      ownerOpenId: 'ou_creator', runAsUser: { openId: 'ou_next' },
+    } });
+    expect(scheduler.updateTask(task.id, { runAsUser: null }).ok).toBe(true);
+    expect(store.getRecord(APP, task.id)?.task.runAsUser).toBeUndefined();
+  });
+
+  it('does not allow a dashboard identity edit to replace a delegated grant', () => {
+    const result = commit();
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error(result.error);
+    const task = result.task;
+    expect(scheduler.updateTask(task.id, { runAsUser: { larkAppId: APP, openId: 'ou_other', unionId: 'on_other' } }))
+      .toMatchObject({ ok: false, error: 'delegated_schedule_identity_immutable' });
+    expect(store.getRecord(APP, task.id)?.controlOpenId).toBe('ou_user');
+  });
+
   it('rejects reuse of a deleted direct id without leaving an enabled projection', () => {
     scheduler.addTask(params);
     expect(scheduler.removeTask(params.id)).toBe(true);

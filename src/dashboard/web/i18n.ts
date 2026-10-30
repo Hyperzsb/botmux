@@ -5,6 +5,13 @@ type DashboardMessages = Record<string, string>;
 export const DASHBOARD_LOCALE_STORAGE_KEY = 'botmux.dashboard.locale';
 
 const zh = {
+  'automation.runAs': '执行身份',
+  'automation.defaultIdentity': '默认身份（保持原有行为）',
+  'automation.runAsHelp': '可选择曾向此机器人发送消息的用户。需开启按触发人鉴权；受管工具使用所选用户的授权，缺少授权时拒绝执行。',
+  'automation.loading': '正在加载用户…',
+  'automation.noUsers': '暂无使用记录；请先向此机器人发送消息。',
+  'automation.loadError': '无法加载用户列表。',
+  'automation.retry': '重试',
   'app.name': 'botmux',
   'app.subtitle': '飞书 AI CLI 控制台',
   'nav.docs': '文档',
@@ -4049,6 +4056,13 @@ const zh = {
 } satisfies DashboardMessages;
 
 const en: Record<keyof typeof zh, string> = {
+  'automation.runAs': 'Run as',
+  'automation.defaultIdentity': 'Default identity (existing behavior)',
+  'automation.runAsHelp': 'Choose someone who has messaged this bot. Requires trigger-user authentication. Managed tools use this user’s authorization and refuse calls without it.',
+  'automation.loading': 'Loading users…',
+  'automation.noUsers': 'No users yet. Send a message to this bot first.',
+  'automation.loadError': 'Could not load users.',
+  'automation.retry': 'Retry',
   'app.name': 'botmux',
   'app.subtitle': 'Feishu AI CLI Control',
   'nav.docs': 'Docs',

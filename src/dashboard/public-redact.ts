@@ -152,6 +152,7 @@ export function redactSchedulesForPublic(schedules: unknown[]): unknown[] {
     const {
       prompt: _prompt,
       workingDir: _workingDir,
+      runAsUser: _runAsUser,
       ...rest
     } = projected as Record<string, unknown>;
     return rest;

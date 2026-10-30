@@ -113,6 +113,38 @@ describe('authorizeScheduledTurn', () => {
     expect(task?.ownerOpenId).toBe(owner);
   });
 
+  it('uses the run snapshot after the configured execution user changes, and rechecks that user', () => {
+    const original = { larkAppId: appId, openId: 'ou_original', unionId: 'on_original' };
+    writeTask({ runAsUser: { ...original, openId: 'ou_new', unionId: 'on_new' } });
+    const seen: string[] = [];
+    expect(authorizeScheduledTurn({
+      turnId: TURN_ID, dataDir, sessionLarkAppId: appId, sessionChatId: chatId,
+      executionUser: original, isOwnerAllowed: (_app, openId) => { seen.push(openId); return openId === original.openId; },
+    })).toMatchObject({ ownerOpenId: original.openId });
+    expect(seen).toEqual([original.openId]);
+    expect(authorizeScheduledTurn({
+      turnId: TURN_ID, dataDir, sessionLarkAppId: appId, sessionChatId: chatId,
+      executionUser: original, isOwnerAllowed: deny,
+    })).toEqual({ error: 'owner_revoked' });
+  });
+
+  it('never infers a newly configured user when an execution snapshot is missing', () => {
+    writeTask({ runAsUser: { larkAppId: appId, openId: 'ou_new', unionId: 'on_new' } });
+    expect(call()).toEqual({ error: 'task_identity_missing' });
+    expect(authorizeScheduledTurn({
+      turnId: TURN_ID, dataDir, sessionLarkAppId: appId, sessionChatId: chatId,
+      executionUser: null, isOwnerAllowed: allow,
+    })).toMatchObject({ ownerOpenId: owner });
+  });
+
+  it('rejects a run snapshot scoped to another bot', () => {
+    writeTask();
+    expect(authorizeScheduledTurn({
+      turnId: TURN_ID, dataDir, sessionLarkAppId: appId, sessionChatId: chatId,
+      executionUser: { larkAppId: 'another_app', openId: 'ou_user', unionId: 'on_user' }, isOwnerAllowed: allow,
+    })).toEqual({ error: 'binding_mismatch' });
+  });
+
   it('rejects when the task does not exist', () => {
     expect(call()).toEqual({ error: 'task_not_found' });
   });
@@ -317,6 +349,18 @@ describe('mintScheduledContinuationTurnId', () => {
 });
 
 describe('trustedCallerForScheduledTask', () => {
+  it('uses the selected execution user while retaining the creator on the stored task', () => {
+    const task = { id: TASK_ID, ownerOpenId: 'ou_creator', ownerUnionId: 'on_creator',
+      runAsUser: { larkAppId: 'cli_target', openId: 'ou_runner', unionId: 'on_runner' } } as any;
+    expect(trustedCallerForScheduledTask(task, 'cli_target')).toMatchObject({
+      requestLarkAppId: 'cli_target', requestUserOpenId: 'ou_runner', requestUserUnionId: 'on_runner',
+      source: 'schedule_creator', taskId: TASK_ID,
+    });
+    expect(task.ownerOpenId).toBe('ou_creator');
+    expect(trustedCallerForScheduledTask(task, 'cli_other')).toBeUndefined();
+    expect(trustedCallerForScheduledTask(task, 'cli_target', null)?.requestUserOpenId).toBe('ou_creator');
+  });
+
   const base = {
     id: TASK_ID,
     name: 'hourly',

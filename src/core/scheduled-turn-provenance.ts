@@ -1,3 +1,4 @@
+import type { AutomationUser } from '../services/automation-identity.js';
 /**
  * Scheduled-turn authentication shared by the CLI-side provenance resolver
  * (current-turn-provenance) and the daemon-side relay authorizer
@@ -86,7 +87,14 @@ export function mintScheduledContinuationTurnId(
 export function trustedCallerForScheduledTask(
   task: ScheduledTask,
   larkAppId: string,
+  executionUser?: AutomationUser | null,
 ): TrustedCaller | undefined {
+  if (executionUser !== undefined) task = { ...task, runAsUser: executionUser ?? undefined };
+  if (task.runAsUser) {
+    if (task.runAsUser.larkAppId !== larkAppId) return undefined;
+    return { requestUserOpenId: task.runAsUser.openId, requestUserUnionId: task.runAsUser.unionId,
+      requestLarkAppId: larkAppId, senderType: 'user', source: 'schedule_creator', taskId: task.id };
+  }
   if (!task.ownerUnionId) return undefined;
   return {
     ...(task.ownerOpenId ? { requestUserOpenId: task.ownerOpenId } : {}),
@@ -132,6 +140,7 @@ export type ScheduledTurnAuthError =
   | 'task_not_found'
   | 'task_disabled'
   | 'task_owner_missing'
+  | 'task_identity_missing'
   | 'owner_revoked'
   | 'binding_mismatch';
 
@@ -149,6 +158,7 @@ export interface ScheduledTurnAuth {
  */
 export function authorizeScheduledTurn(input: {
   turnId: string;
+  executionUser?: AutomationUser | null;
   dataDir: string;
   sessionLarkAppId: string;
   sessionChatId: string;
@@ -160,8 +170,10 @@ export function authorizeScheduledTurn(input: {
   if (!taskId) return { error: 'task_not_found' };
   if (!input.sessionLarkAppId || !input.sessionChatId) return { error: 'binding_mismatch' };
 
-  const task = readScheduledTaskForProvenance(input.dataDir, input.sessionLarkAppId, taskId);
+  let task = readScheduledTaskForProvenance(input.dataDir, input.sessionLarkAppId, taskId);
   if (!task) return { error: 'task_not_found' };
+  if (task.runAsUser && input.executionUser === undefined) return { error: 'task_identity_missing' };
+  if (input.executionUser !== undefined) task = { ...task, runAsUser: input.executionUser ?? undefined };
   if (task.enabled === false) {
     const autoCompletedStillLive = task.parsed?.kind === 'once'
       && task.disabledReason === 'once_completed'
@@ -169,7 +181,9 @@ export function authorizeScheduledTurn(input: {
     if (!autoCompletedStillLive) return { error: 'task_disabled' };
   }
 
-  const ownerOpenId = typeof task.ownerOpenId === 'string' ? task.ownerOpenId.trim() : '';
+  if (task.runAsUser && task.runAsUser.larkAppId !== input.sessionLarkAppId) return { error: 'binding_mismatch' };
+  const executionOpenId = task.runAsUser?.openId ?? task.ownerOpenId;
+  const ownerOpenId = typeof executionOpenId === 'string' ? executionOpenId.trim() : '';
   if (!ownerOpenId) return { error: 'task_owner_missing' };
 
   // The task must be bound to the presenting session's bot/chat. A task
@@ -208,6 +222,8 @@ export function scheduledTurnAuthErrorMessage(code: ScheduledTurnAuthError): str
       return '定时任务不存在或已被删除，拒绝授权当前命令';
     case 'task_disabled':
       return '定时任务已被禁用，拒绝授权当前命令';
+    case 'task_identity_missing':
+      return '定时执行缺少冻结的身份快照，拒绝使用任务当前配置替代；请重新触发任务';
     case 'task_owner_missing':
       return '定时任务缺少创建者身份（ownerOpenId），拒绝授权当前命令；请重新创建该定时任务';
     case 'owner_revoked':

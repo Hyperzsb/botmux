@@ -79,8 +79,9 @@ export interface TrustedCaller {
    *  failed human turn; it does not prove a new human action. Consumers that must
    *  distinguish "a human asked just now" from
    *  "someone's scheduled task is running" (audit trails, approval gates) read
-   *  this instead of inferring it. */
-  source?: 'schedule_creator' | 'failed_turn_recovery';
+   *  this instead of inferring it. 'automation' records a host-selected webhook
+   *  execution identity without claiming a new human message. */
+  source?: 'schedule_creator' | 'failed_turn_recovery' | 'automation';
   /** Scheduled task id — set only alongside `source: 'schedule_creator'`. */
   taskId?: string;
   /** Type of the sender whose message opened this turn. Absent when no inbound
@@ -258,6 +259,8 @@ export interface TurnParticipant {
  * ambiguity gate; `rootMessageId`/`quoteOnly`/`substitute` are chat-scope-only
  * routing metadata. */
 export interface ReplyTargetEntry {
+  /** Host-selected user for this synthetic turn, never read from event payload. */
+  automationUser?: import('./services/automation-identity.js').AutomationUser | null;
   rootMessageId?: string;
   updatedAt: string;
   quoteOnly?: boolean;
@@ -1542,6 +1545,8 @@ export interface ParsedSchedule {
 export type ScheduleExecutionPosition = 'top-level' | 'topic' | 'new-topic' | 'task';
 
 export interface ScheduledTask {
+  /** Explicit execution user; task creator/control ownership remains unchanged. */
+  runAsUser?: import('./services/automation-identity.js').AutomationUser;
   id: string;
   /** Optional per-bot work-calendar name; filters automatic recurring dispatch only. */
   calendar?: string;

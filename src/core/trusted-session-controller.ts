@@ -6,7 +6,7 @@ import { getBot } from '../bot-registry.js';
  * groups accept their input as a later turn, regardless of how the session began. */
 export function isSerialGroupInput(ds: DaemonSession, caller?: TrustedCaller): boolean {
   if (!caller || caller.requestLarkAppId !== ds.larkAppId
-    || caller.source === 'schedule_creator' || ds.adoptedFrom
+    || caller.source === 'schedule_creator' || caller.source === 'automation' || ds.adoptedFrom
     || ds.chatType !== 'group') return false;
   return getBot(ds.larkAppId).config.groupSerialInput?.[ds.chatId] === true;
 }

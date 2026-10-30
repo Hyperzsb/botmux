@@ -446,6 +446,7 @@ export function beginReplyTargetTurn(
   const isChatScope = ds.scope === 'chat';
   const targets = { ...(ds.session.replyTargets ?? {}) };
   targets[turnId] = {
+    ...(targets[turnId]?.automationUser !== undefined ? { automationUser: targets[turnId].automationUser } : {}),
     ...(isChatScope && replyRootId ? { rootMessageId: replyRootId } : {}),
     updatedAt: nowIso,
     ...(isChatScope ? { quoteOnly: opts?.quoteOnly, substitute: opts?.substitute } : {}),

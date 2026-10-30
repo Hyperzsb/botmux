@@ -195,6 +195,38 @@ describe('publishTurnCliIdentity — the sender acts as themselves', () => {
     expect(body).not.toContain(APP);
   });
 
+  it.each(['lark-cli', 'bytedcli'] as const)('keeps %s on the selected user and denies missing credentials under legacy bot-identity fallback', async tool => {
+    const config = botConfig({ enabled: true, tools: [tool], fallback: 'bot-identity' });
+    const home = join(dir, 'selected-home');
+    mkdirSync(home);
+    larkHomes.set(ALICE, '/homes/machine-owner');
+    larkHomes.set(BOB, home);
+    byteCloudJwts.set(ALICE, { cn: 'owner-cloud' });
+    byteCloudJwts.set(BOB, { cn: 'selected-cloud' });
+    const runner = join(dir, `selected-runner-${tool}`);
+    const proof = join(dir, `selected-proof-${tool}`);
+    writeFileSync(runner, '#!/bin/sh\ncat "$BOTMUX_TEST_PROOF_FILE"\n', { mode: 0o755 });
+    const wrapper = join(dir, `selected-wrapper-${tool}`);
+    writeFileSync(wrapper, renderIdentityWrapper(tool, '/usr/bin/printenv', 'proven', [runner]));
+    const env = { PATH: '/usr/bin:/bin', SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION, BOTMUX_TEST_PROOF_FILE: proof };
+    const execute = () => spawnSync('/bin/sh', [wrapper, tool === 'bytedcli' ? 'BYTECLOUD_CLI_API_JWT_TOKEN_CN' : 'HOME'], { env, encoding: 'utf8' });
+    await publish(config, BOB);
+    const { publishActiveTurn } = await import('../src/core/cli-identity.js');
+    publishActiveTurn(dir, SESSION, 'turn-default');
+    writeFileSync(proof, identityBody(tool));
+    const selected = execute();
+    expect(selected.status, selected.stderr).toBe(0);
+    expect(selected.stdout.trim()).toBe(tool === 'bytedcli' ? 'selected-cloud' : home);
+    larkHomes.delete(BOB);
+    byteCloudJwts.delete(BOB);
+    await publish(config, BOB);
+    writeFileSync(proof, identityBody(tool));
+    const refused = execute();
+    expect(refused.status).toBe(77);
+    expect(refused.stdout).not.toContain('owner-cloud');
+    expect(refused.stdout).not.toContain('/homes/machine-owner');
+  });
+
   it('swaps the acting identity when a different person speaks next', async () => {
     larkHomes.set(ALICE, '/homes/alice-personal-app');
     larkHomes.set(BOB, '/homes/bob-personal-app');
@@ -237,8 +269,8 @@ describe('publishTurnCliIdentity — withholding removes, never inherits', () =>
     expect(identityBody('lark-cli')).not.toContain('/homes/alice-personal-app');
   });
 
-  it('reports needs-authorization instead of degrading under fallback: none', async () => {
-    const config = botConfig({ enabled: true, tools: ['lark-cli'], fallback: 'none' });
+  it.each(['none', 'bot-identity'] as const)('reports needs-authorization instead of degrading under fallback: %s', async fallback => {
+    const config = botConfig({ enabled: true, tools: ['lark-cli'], fallback });
     const outcomes = await publish(config, BOB);
     expect(identityBody('lark-cli')).toContain('飞书');
     expect(outcomes.find(o => o.tool === 'lark-cli')?.state).toBe('needs-authorization');

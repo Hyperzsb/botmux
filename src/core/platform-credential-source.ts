@@ -22,6 +22,7 @@ import {
 } from '../platform/credential-grant-client.js';
 import { resolveUnionIdFromOpenId } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
+import { recordIdentity } from '../im/lark/identity-cache.js';
 import type { BotConfig } from '../bot-registry.js';
 import type { TriggerUserAuthTool } from '../services/trigger-user-auth.js';
 import type { LarkCliIdentity, BytedCliIdentity, LarkdevIdentity } from './cli-identity.js';
@@ -122,6 +123,12 @@ export function noteInboundSenderUnionId(larkAppId: string, data: unknown): void
   const sender = (data as { sender?: { sender_type?: unknown; sender_id?: { open_id?: unknown; union_id?: unknown } } } | null)?.sender;
   if (!sender || sender.sender_type !== 'user') return;
   noteSenderUnionId(larkAppId, sender.sender_id?.open_id, sender.sender_id?.union_id);
+  const openId = sender.sender_id?.open_id;
+  const unionId = sender.sender_id?.union_id;
+  if (typeof openId === 'string' && OPEN_ID_RE.test(openId)) {
+    recordIdentity(larkAppId, { openId, type: 'user', source: 'sender', interactedAt: Date.now(),
+      ...(typeof unionId === 'string' && unionId.startsWith('on_') && UNION_ID_RE.test(unionId) ? { unionId } : {}) });
+  }
 }
 
 /** Same as {@link noteInboundSenderUnionId} for a pair the daemon already holds

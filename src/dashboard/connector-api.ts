@@ -1,3 +1,4 @@
+import { resolveAutomationUser } from '../services/automation-identity.js';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import {
   deleteConnector,
@@ -245,10 +246,10 @@ function sameConnectorTarget(
     && sameStringSet(left.allowChats, right.allowChats);
 }
 
-function normalizeConnectorInput(
+async function normalizeConnectorInput(
   raw: unknown,
-  opts: { id?: string; prior?: ConnectorDefinition | null; secretRef?: string },
-): { ok: true; connector: ConnectorDefinition } | { ok: false; error: string } {
+  opts: { id?: string; prior?: ConnectorDefinition | null; secretRef?: string; resolveRunAsUser?: typeof resolveAutomationUser },
+): Promise<{ ok: true; connector: ConnectorDefinition } | { ok: false; error: string }> {
   const body = record(raw);
   const c = record(body.connector ?? body);
   const prior = opts.prior ?? null;
@@ -269,6 +270,11 @@ function normalizeConnectorInput(
   if (!['turn', 'workflow'].includes(targetKind)) return { ok: false, error: 'bad_target_kind' };
   const botId = typeof target.botId === 'string' && target.botId.trim() ? target.botId.trim() : prior?.target.botId;
   if (!botId) return { ok: false, error: 'target_bot_required' };
+  let runAsUser = prior?.runAsUser;
+  try {
+    if (hasOwn(c, 'runAsOpenId')) runAsUser = await (opts.resolveRunAsUser ?? resolveAutomationUser)(botId, c.runAsOpenId);
+    if (runAsUser && runAsUser.larkAppId !== botId) return { ok: false, error: 'run_as_user_app_mismatch' };
+  } catch (error) { return { ok: false, error: error instanceof Error ? error.message : String(error) }; }
   const botIds = hasOwn(target, 'botIds')
     ? Array.from(new Set(stringList(target.botIds).map(x => x.trim()).filter(Boolean)))
     : prior?.target.botIds;
@@ -306,6 +312,7 @@ function normalizeConnectorInput(
 
   const now = new Date().toISOString();
   const next: ConnectorDefinition = {
+    ...(runAsUser ? { runAsUser } : {}),
     id,
     name,
     enabled: bool(c.enabled, prior?.enabled ?? true),
@@ -411,6 +418,7 @@ export async function handleConnectorApi(
   req: IncomingMessage,
   res: ServerResponse,
   url: URL,
+  deps: { resolveRunAsUser?: typeof resolveAutomationUser } = {},
 ): Promise<boolean> {
   if (req.method === 'GET' && url.pathname === '/api/connectors') {
     jsonRes(res, 200, { connectors: listConnectors() });
@@ -479,7 +487,7 @@ export async function handleConnectorApi(
       const providedSecret = typeof body.secret === 'string' && body.secret ? body.secret : undefined;
       const generatedSecret = providedSecret ? undefined : generateWebhookSecretPlaintext();
       const record = createWebhookSecret(providedSecret ?? generatedSecret!);
-      const normalized = normalizeConnectorInput(body, { secretRef: record.ref });
+      const normalized = await normalizeConnectorInput(body, { secretRef: record.ref, resolveRunAsUser: deps.resolveRunAsUser });
       if (!normalized.ok) {
         deleteWebhookSecret(record.ref);
         jsonRes(res, 400, { ok: false, error: normalized.error });
@@ -514,10 +522,11 @@ export async function handleConnectorApi(
         // Validate the complete update before rotating the secret. In
         // particular, a rejected legacy-workflow target mutation must not
         // leave behind an otherwise successful credential side effect.
-        const preflight = normalizeConnectorInput({ ...body, id }, {
+        const preflight = await normalizeConnectorInput({ ...body, id }, {
           id,
           prior,
           secretRef: prior.verify.secretRef,
+          resolveRunAsUser: deps.resolveRunAsUser,
         });
         if (!preflight.ok) {
           jsonRes(res, 400, { ok: false, error: preflight.error });
@@ -536,11 +545,8 @@ export async function handleConnectorApi(
           setWebhookSecret(secretRef, generatedSecret);
           plaintextForUrl = generatedSecret;
         }
-        const normalized = normalizeConnectorInput({ ...body, id }, { id, prior, secretRef });
-        if (!normalized.ok) {
-          jsonRes(res, 400, { ok: false, error: normalized.error });
-          return true;
-        }
+        const normalized = preflight;
+        if (secretRef) normalized.connector.verify.secretRef = secretRef;
         const connector = upsertConnector(normalized.connector);
         jsonRes(res, 200, {
           ok: true,

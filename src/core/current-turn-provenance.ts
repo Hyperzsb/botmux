@@ -27,6 +27,7 @@ interface PersistedTurnSession {
    * been folded into the session. Recovery continuations hold a COPY of the
    * original turn's entry — registryTurnMayAuthenticateHuman excludes those. */
   replyTargets?: Record<string, {
+    automationUser?: import('../services/automation-identity.js').AutomationUser | null;
     rootMessageId?: string;
     senderOpenId?: string;
     participants?: Array<{ openId?: string; isBot?: boolean }>;
@@ -164,6 +165,7 @@ export function resolveCurrentTurnProvenance(
   if (parseScheduledTurnId(marker.turnId)) {
     const auth = authorizeScheduledTurn({
       turnId: marker.turnId,
+      executionUser: session.replyTargets?.[marker.turnId]?.automationUser,
       dataDir: options.dataDir,
       sessionLarkAppId: session.larkAppId,
       sessionChatId: session.chatId,
