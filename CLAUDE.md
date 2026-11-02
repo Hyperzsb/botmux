@@ -14,6 +14,7 @@
 | online | `2605:340:cd52:700:4b1d:5870:1031:4ba0` | `feat/byte_approval/release` | 业务线上部署 |
 | preview | `2605:340:cd52:700:bf87:dee0:bd61:d0ef` | `feat/byte_approval/dev` | 日常开发与不稳定改动验证 |
 
+- 代码开发可以在本地进行，但是任何编译和测试都要在 preview 机器上执行，以节约本地资源。
 - **默认发布/部署分支是 `feat/byte_approval/release`**，也是本 fork 的 GitHub 默认分支。online 的 Botmux 必须始终从该分支的 checkout 构建、认领全局命令并启动。
 - **默认开发分支是 `feat/byte_approval/dev`**。不稳定的功能改动在该分支开发，日常运行与人工验证使用 preview；验证完成后再将准备上线的改动集成到 release。
 - 部署前确认目标机器、实际 checkout、当前分支、提交和工作区状态。保护已有未提交改动；不要将 online 切到 dev、临时 review 分支或即将删除的 worktree。
@@ -31,6 +32,8 @@ ssh -K jump.byted.org -tt ssh -6 root@2605:340:cd52:700:4b1d:5870:1031:4ba0
 ssh -K jump.byted.org -tt ssh -6 root@2605:340:cd52:700:bf87:dee0:bd61:d0ef
 ```
 
+该环境下不支持通过跳板机传递任意命令至实际远端机器，需要构造一个 interactive TTY 作为入口，把实际的命令作为键盘输入发送到这个入口中，才能正常和远端机器交互。不要在 Sandbox 中执行 SSH 命令，会无法解析跳板机地址。
+
 如果任一机器无法访问，明确告知用户是 online 还是 preview、给出连接错误，并提醒用户申请或续期对应机器当天的人工访问权限。不要将连接失败误判为 Botmux 故障，也不要把访问不了 preview 当成可以改在线上开发的理由。
 
 ### IPv6 兼容
@@ -40,10 +43,6 @@ ssh -K jump.byted.org -tt ssh -6 root@2605:340:cd52:700:bf87:dee0:bd61:d0ef
 - URL 中的 IPv6 字面地址必须加方括号，例如 `http://[2605:340:cd52:700:4b1d:5870:1031:4ba0]:7891/`；主机地址与端口分别处理，不能用简单的 `split(':')` 解析。
 - URL 的构造与解析复用现有工具（例如 `src/core/dashboard-url.ts` 的 `formatUrlHost`）及 `URL` API，避免重复拼接方括号或丢失端口、路径、查询参数。
 - 修改相关配置/链接逻辑时，在 preview 验证生成的 IPv6 链接可实际访问，并保留现有 IPv4/域名场景的兼容性。SSH 命令中的裸地址与 URL 的方括号格式应分别处理。
-
-### 指南维护
-
-后续新增约定按环境/分支、访问、网络、构建、架构或协作主题放入对应小节，并注明适用范围。规则变化时更新原条目及相关示例，避免在多个位置留下相互冲突的版本；新增主题再增加独立小节。
 
 ## 影响范围评估（改前必做）
 
