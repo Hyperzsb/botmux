@@ -44,6 +44,13 @@ function fixture() {
     expiresAt: Date.now() + 3600_000 };
   return { root, store, t, job };
 }
+describe('background credential policy key', () => {
+  it('treats an omitted lark tool binding as disabled and detects explicit enablement', () => {
+    const omitted = backgroundCredentialPolicyKey({} as any);
+    expect(backgroundCredentialPolicyKey({ larkToolBinding: false } as any)).toBe(omitted);
+    expect(backgroundCredentialPolicyKey({ larkToolBinding: true } as any)).not.toBe(omitted);
+  });
+});
 describe.skipIf(process.platform !== 'linux')('registered background execution policy', () => {
   it('persists registration across authority-store restart and keeps ordinary fire bookkeeping valid', () => {
     const h = fixture(); h.store.registerBackgroundExecution(h.job);

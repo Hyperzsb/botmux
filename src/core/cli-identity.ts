@@ -1217,7 +1217,9 @@ const BYTEDCLI_LOGIN_GUARD_FN: readonly string[] = [
   '    esac',
   '  done',
   '  [ -n "$__botmux_bd_hit" ] || [ "$__botmux_bd_w1" = login ] || { [ "$__botmux_bd_w1" = auth ] && [ "$__botmux_bd_w2" = login ]; } || return 1',
-  '  __botmux_bd_dir="${XDG_DATA_HOME:-$__botmux_bd_target/.local/share}/bytedcli"',
+  // The governed child below always pins XDG_DATA_HOME to this HOME. Do not
+  // let an ambient machine XDG_DATA_HOME make the guard inspect another path.
+  '  __botmux_bd_dir="$__botmux_bd_target/.local/share/bytedcli"',
   // Nearest existing ancestor decides: login creates the store on first use.
   '  __botmux_bd_probe=$__botmux_bd_dir',
   '  while [ ! -e "$__botmux_bd_probe" ] && [ "$__botmux_bd_probe" != / ]; do __botmux_bd_probe=$(dirname "$__botmux_bd_probe"); done',
@@ -1485,13 +1487,13 @@ export function renderIdentityWrapper(
     ...bytedcliSiteGuard,
     '    fi',
     '    umask 077',
-    // Site-labelled grants passed the exact-site guard above. Reuse their
-    // daemon-published per-person session HOME so normal CLI state survives
-    // across calls without exposing the daemon's long-lived login directory.
-    // A legacy single-region JWT has no exact-site proof, so keep that shape in
-    // a disposable HOME and prevent SDK fallback to a machine login.
+    // Reuse the daemon-published per-person session HOME whenever it exists so
+    // manual login state and normal CLI state survive across calls without
+    // exposing the daemon's long-lived login directory. Identities from older
+    // publishers that carry no HOME still get a disposable directory and can
+    // never fall back to the machine login.
     '    __botmux_bytedcli_ephemeral=',
-    '    if [ -n "$BOTMUX_IDENTITY_HOME" ] && [ -z "$BYTEDCLI_USER_CLOUD_JWT" ]; then',
+    '    if [ -n "$BOTMUX_IDENTITY_HOME" ]; then',
     '      __botmux_bytedcli_home="$BOTMUX_IDENTITY_HOME"',
     '      command -p mkdir -p "$__botmux_bytedcli_home" || {',
     `        printf '%s\\n' 'botmux: bytedcli 按人认证目录创建失败，命令未执行。' >&2`,
@@ -1509,6 +1511,7 @@ export function renderIdentityWrapper(
     '      }',
     '      __botmux_bytedcli_ephemeral=1',
     '    fi',
+    '    if __botmux_bd_login_blocked "$__botmux_bytedcli_home" "$@"; then exit 1; fi',
     `    export ${exportKeys}`,
     `    unset ${MODE_VAR} ${DENY_MSG_VAR} ${TURN_VAR} ${HOME_VAR}`,
     '    __botmux_bytedcli_child=',
@@ -1634,12 +1637,6 @@ export function renderIdentityWrapper(
     `    exit ${IDENTITY_DENIED_EXIT_CODE}`,
     '    ;;',
     'esac',
-    // user|bot only past this point. HOME_VAR set (#2550 per-person scratch
-    // HOME on a bytedcli user identity) is the exec's HOME; unset → machine
-    // HOME. Probe whichever one a login would actually write into.
-    ...(tool === 'bytedcli' ? [
-      `if __botmux_bd_login_blocked "\${${HOME_VAR}:-$HOME}" "$@"; then exit 1; fi`,
-    ] : []),
     // A person-scoped HOME published with a user identity (bytedcli): scoped to
     // this exec exactly like the user-home branch, so the parent shell and
     // every other tool keep the machine HOME. Created here, on first use: the

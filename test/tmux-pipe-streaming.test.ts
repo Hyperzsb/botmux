@@ -6,12 +6,12 @@ import { TmuxPipeBackend } from '../src/adapters/backend/tmux-pipe-backend.js';
 import { pipePaneShellCommand } from '../src/adapters/backend/tmux-pipe-relay.js';
 import { resetTmuxVersionCacheForTests } from '../src/setup/ensure-tmux.js';
 import { tsRunnerPrefix } from './helpers/ts-runner.js';
-import { defaultTmuxListenerIsUnreachable } from './helpers/environment-capabilities.js';
+import { defaultTmuxServerConflictsWithPrivateFixture } from './helpers/environment-capabilities.js';
 
 const quote = (value: string) => `'${value.replace(/'/g, "'\\''")}'`;
 let realTmux: string | undefined;
 try { realTmux = execFileSync('which', ['tmux'], { encoding: 'utf8' }).trim(); } catch { /* optional backend */ }
-const defaultTmuxBlocked = Boolean(realTmux) && defaultTmuxListenerIsUnreachable();
+const defaultTmuxBlocked = Boolean(realTmux) && defaultTmuxServerConflictsWithPrivateFixture();
 const realCat = execFileSync('which', ['cat'], { encoding: 'utf8' }).trim();
 const originalPath = process.env.PATH;
 

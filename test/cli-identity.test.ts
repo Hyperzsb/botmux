@@ -42,6 +42,7 @@ import {
   gitIdentityConfigPairs,
   applyTurnGitConfigEnv,
   prepareTurnGitConfigEnv,
+  bytedcliTurnHome,
 } from '../src/core/cli-identity.js';
 import { BYTECLOUD_USER_JWT_ENV_BY_SITE, type ByteCloudUserSite } from '../src/utils/bytecloud-sites.js';
 
@@ -1534,13 +1535,16 @@ printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' \
     expect(existsSync(marker)).toBe(false);
   });
 
-  it('forwards termination to bytedcli and removes its isolated HOME', () => {
+  it('forwards termination to bytedcli and preserves its stable identity HOME', () => {
     const ready = join(dir, 'child-ready');
     const terminated = join(dir, 'child-terminated');
     const homePresent = join(dir, 'child-home-present');
+    const homeUsed = join(dir, 'child-home-used');
+    const expectedHome = bytedcliTurnHome(dir, SESSION, {});
     const bin = join(dir, 'bytedcli-real');
     writeFileSync(bin, `#!/bin/sh
 trap 'printf terminated > "$TERMINATED"; sleep 0.2; [ -d "$HOME" ] && printf present > "$HOME_PRESENT"; exit 143' TERM
+printf %s "$HOME" > "$HOME_USED"
 printf ready > "$READY"
 while :; do sleep 1; done
 `, { mode: 0o755 });
@@ -1563,13 +1567,15 @@ printf %s "$?"
       env: {
         PATH: '/usr/bin:/bin', TMPDIR: dir,
         SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION,
-        WRAPPER: wrapper, READY: ready, TERMINATED: terminated, HOME_PRESENT: homePresent,
+        WRAPPER: wrapper, READY: ready, TERMINATED: terminated,
+        HOME_PRESENT: homePresent, HOME_USED: homeUsed,
       },
     });
     expect(status).toBe('143');
     expect(readFileSync(terminated, 'utf8')).toBe('terminated');
     expect(readFileSync(homePresent, 'utf8')).toBe('present');
-    expect(readdirSync(join(dir, 'botmux-bytedcli-home'))).toEqual([]);
+    expect(readFileSync(homeUsed, 'utf8')).toBe(expectedHome);
+    expect(existsSync(expectedHome)).toBe(true);
   });
 
   it('preserves larkdev termination status until its isolated auth directory is cleaned', () => {

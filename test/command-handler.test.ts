@@ -7455,7 +7455,11 @@ describe('handleCommand', () => {
       })) as any);
       return makeDeps(makeLegacyLarkSession({ chatType }));
     }
-    function withFixedPolicy(credentialSource: 'auto' | 'platform' | 'local', bound: boolean) {
+    function withFixedPolicy(
+      credentialSource: 'auto' | 'platform' | 'local',
+      bound: boolean,
+      tools: Array<'lark-cli' | 'bytedcli' | 'larkdev'> = ['bytedcli'],
+    ) {
       vi.mocked(platformCredentialsUrl).mockReturnValue(bound ? PAGE : null);
       vi.mocked(getBot).mockImplementation((() => ({
         botName: 'Claude',
@@ -7465,7 +7469,7 @@ describe('handleCommand', () => {
           triggerUserAuth: parseTriggerUserAuthConfig({ enabled: false, tools: [] }) ?? undefined,
           toolIdentity: {
             user: { larkAppId: 'app-1', openId: 'ou_fixed', unionId: 'on_fixed' },
-            tools: ['bytedcli'], credentialSource,
+            tools, credentialSource,
           },
         },
       })) as any);
@@ -7708,6 +7712,41 @@ describe('handleCommand', () => {
       expect(reply(deps)).toBe(t('auth_link.sent_privately', undefined, 'zh'));
     });
 
+    it('fixed lark user with a platform-only source never reports or completes a local login', async () => {
+      const deps = withFixedPolicy('platform', true, ['lark-cli']);
+      const message = (content: string) => makeLarkMessage(content, {
+        senderId: 'ou_fixed', senderUnionId: 'on_fixed',
+      });
+      vi.mocked(hasLarkCliHome).mockClear();
+      vi.mocked(pendingLarkCliChallenge).mockClear();
+
+      await handleCommand('/login', ROOT_ID, message('/login status'), deps, LARK_APP_ID);
+      expect(reply(deps)).toContain(PAGE);
+      expect(hasLarkCliHome).not.toHaveBeenCalled();
+
+      await handleCommand('/login', ROOT_ID, message('/login done'), deps, LARK_APP_ID);
+      expect(pendingLarkCliChallenge).not.toHaveBeenCalled();
+      expect(hasLarkCliHome).not.toHaveBeenCalled();
+      expect(completeLarkCliLogin).not.toHaveBeenCalled();
+    });
+
+    it('fixed bytedcli user with a platform-only source never reports or completes a local login', async () => {
+      const deps = withFixedPolicy('platform', true);
+      const message = (content: string) => makeLarkMessage(content, {
+        senderId: 'ou_fixed', senderUnionId: 'on_fixed',
+      });
+      vi.mocked(hasBytedcliHome).mockClear();
+      vi.mocked(pendingBytedcliChallenge).mockClear();
+
+      await handleCommand('/login', ROOT_ID, message('/login status i18n-bd'), deps, LARK_APP_ID);
+      expect(reply(deps)).toContain(PAGE);
+      expect(hasBytedcliHome).not.toHaveBeenCalled();
+
+      await handleCommand('/login', ROOT_ID, message('/login done'), deps, LARK_APP_ID);
+      expect(pendingBytedcliChallenge).not.toHaveBeenCalled();
+      expect(completeBytedcliLogin).not.toHaveBeenCalled();
+    });
+
     it('fixed assigned user can start its own local login with sender auth off', async () => {
       const deps = withFixedPolicy('local', true);
       await handleCommand('/login', ROOT_ID, makeLarkMessage('/login bytedcli i18n-bd', {
@@ -7759,6 +7798,33 @@ describe('handleCommand', () => {
           triggerUserAuth: parseTriggerUserAuthConfig({
             enabled: true, tools: ['lark-cli'], credentialSource: 'platform',
           }) ?? undefined,
+        },
+      })) as any);
+      const deps = makeDeps();
+      try {
+        await handleCommand('/logout', ROOT_ID, makeLarkMessage('/logout'), deps, LARK_APP_ID);
+        const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+        expect(replyContent).toContain(t('cmd.logout.platform_note', { url: page }, 'zh'));
+      } finally {
+        vi.mocked(platformCredentialsUrl).mockReturnValue(null);
+        if (previousGetBot) vi.mocked(getBot).mockImplementation(previousGetBot);
+      }
+    });
+
+    it('keeps the platform notice for the fixed assigned user when sender auth is off', async () => {
+      const page = 'https://platform.example.test/credentials';
+      const previousGetBot = vi.mocked(getBot).getMockImplementation();
+      vi.mocked(platformCredentialsUrl).mockReturnValue(page);
+      vi.mocked(getBot).mockImplementation((() => ({
+        botName: 'Claude',
+        config: {
+          larkAppId: 'app-1', larkAppSecret: 'secret-1', cliId: 'claude-code' as const,
+          workingDir: '~/projects', workingDirs: ['~/projects'],
+          triggerUserAuth: parseTriggerUserAuthConfig({ enabled: false, tools: [] }) ?? undefined,
+          toolIdentity: {
+            user: { larkAppId: 'app-1', openId: 'ou_sender', unionId: 'on_sender' },
+            tools: ['bytedcli'], credentialSource: 'platform',
+          },
         },
       })) as any);
       const deps = makeDeps();

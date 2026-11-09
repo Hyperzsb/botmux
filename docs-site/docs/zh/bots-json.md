@@ -416,7 +416,7 @@ botmux 用 app-server 协议运行 Codex 时，拿不到 Codex App 内置的 Chr
 | `credentialsSourceDir` | 沙盒 bot 每次启动时从这个目录复制 CLI 登录凭证，而不是用本机共享的登录。适合一台机器多个账号 |
 | `codexAuthSync` | Codex 登录策略：`shared`（默认）沿用全局登录；`isolated` 始终用这个 bot 自己的 `CODEX_HOME`，不读也不复制全局凭证 |
 | `triggerUserAuth` | 默认关闭。开启后，会话里的 `lark-cli` 等工具以「发这条消息的人」自己的授权调用；没授权的人会收到授权链接 |
-| `larkToolBinding` | 默认开启：会话里的 `lark-cli` 默认用当前 bot 的应用身份调用，可用 `--as user`、`--profile` 切换。设 `false` 完全不注入 bot 凭据 |
+| `larkToolBinding` | 显式开启：只有设为 `true` 时，会话里的 `lark-cli` 才默认用当前 bot 的应用身份调用，并可用 `--as user`、`--profile` 切换。未配置或设为 `false` 都不注入 bot 凭据 |
 
 > ZMX 后端没法执行文件沙盒，开着沙盒的配置组合会直接拒绝启动，见 [ZMX 后端](/zmx)。
 

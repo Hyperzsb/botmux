@@ -259,7 +259,7 @@ botmux autostart status   # 查看状态
 
 你点开链接完成授权后，AI 用 `botmux auth wait` 在同一轮里等授权生效（最多 5 分钟），然后重试原来的操作。这一轮已经结束也没关系：链接有效期内授权完，再发一条消息就能接着做。不想等 AI 发链接，也可以自己在话题里发 `/login`（或 `/login --scope <权限名>`）。
 
-前提：这个 Bot 的 `lark-cli` 走 botmux 的应用绑定（`larkToolBinding`，默认开），或者 Bot 开了[按触发人身份调用 CLI](/bots-json#trigger-user-auth) 且覆盖 `lark-cli`。两者都关时 daemon 会拒绝，返回 `lark_user_auth_disabled`。链接只发给本轮经过验证的真人，AI 不能替别人申请。
+前提：这个 Bot 的 `lark-cli` 显式开启了 botmux 应用绑定（`larkToolBinding: true`），或者 Bot 开了[按触发人身份调用 CLI](/bots-json#trigger-user-auth) 且覆盖 `lark-cli`。两者都关时 daemon 会拒绝，返回 `lark_user_auth_disabled`。链接只发给本轮经过验证的真人，AI 不能替别人申请。
 
 ### 只读查询
 

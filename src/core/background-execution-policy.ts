@@ -27,7 +27,7 @@ export interface BackgroundExecutionRegistration {
 
 export function backgroundCredentialPolicyKey(bot: BotConfig): string {
   return computeInputHash({ triggerUserAuth: bot.triggerUserAuth ?? null,
-    larkToolBinding: bot.larkToolBinding ?? true, apiOnly: bot.apiOnly ?? false });
+    larkToolBinding: bot.larkToolBinding === true, apiOnly: bot.apiOnly ?? false });
 }
 
 /** Only task definition and authorization belong here. rootMessageId is

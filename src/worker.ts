@@ -59,7 +59,7 @@ import { join, basename, dirname, delimiter, relative, extname } from 'node:path
 import { resolveBotmuxWrapperBinDir, prependBotmuxBin } from './core/botmux-wrapper.js';
 import { sessionIdentityBinDir, publishActiveTurn, canonicalPathNearest, identityShellTransportEnv, prepareTurnGitConfigEnv } from './core/cli-identity.js';
 import { prepareLarkToolEnv, usesLarkToolBinding, cleanupLarkToolBinding, larkToolBindingPath, resolveLarkToolDataDir, resolveIdentityStorageModel, larkToolLoopbackService } from './core/lark-tool-binding.js';
-import { tokenStoreProtection, triggerUserAuthApplies } from './services/trigger-user-auth.js';
+import { larkToolBindingEnabled, tokenStoreProtection, triggerUserAuthApplies } from './services/trigger-user-auth.js';
 import { installAidenCodexShim, writeAidenCodexShellConfigs } from './services/aiden-codex-shim.js';
 import { scanCredentialBearingMcpServers, credentialBearingMcpAdvisory } from './services/credential-bearing-mcp.js';
 import { homedir, tmpdir, userInfo } from 'node:os';
@@ -23887,7 +23887,7 @@ async function spawnCliBody(
           BOTMUX_ROOT_MESSAGE_ID: cfg.rootMessageId, BOTMUX_SESSION_SCOPE: rootIsMessage || silentListener ? 'thread' : 'chat',
           BOTMUX_LINK_REF_TURN_MODE: currentBotmuxLinkRefMode };
         delete env.BOTMUX_LARK_TOOL_BINDING;
-        if (cfg.larkToolBinding !== false) {
+        if (larkToolBindingEnabled(cfg)) {
           prepareLarkToolEnv({ env, dataDir: process.env.SESSION_DATA_DIR ?? config.session.dataDir,
             sessionId, appId: cfg.larkAppId, brand: cfg.brand });
         }

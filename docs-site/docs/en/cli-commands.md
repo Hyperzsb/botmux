@@ -259,7 +259,7 @@ When run inside a botmux session, these commands detect the current session and 
 
 After you authorize, the AI waits for it with `botmux auth wait` in the same turn (up to 5 minutes) and retries the original action. If the turn has already ended, that's fine: authorize while the link is valid, then send another message to continue. You can also skip the wait and send `/login` (or `/login --scope <scope>`) in the topic yourself.
 
-Prerequisite: this bot's `lark-cli` goes through botmux's app binding (`larkToolBinding`, on by default), or the bot has [Run CLI calls as the message sender](/en/bots-json#trigger-user-auth) on with `lark-cli` covered. With both off, the daemon refuses with `lark_user_auth_disabled`. The link only goes to the verified human of the current turn; the AI cannot request it on someone else's behalf.
+Prerequisite: this bot explicitly enables botmux's app binding for `lark-cli` (`larkToolBinding: true`), or the bot has [Run CLI calls as the message sender](/en/bots-json#trigger-user-auth) on with `lark-cli` covered. With both off, the daemon refuses with `lark_user_auth_disabled`. The link only goes to the verified human of the current turn; the AI cannot request it on someone else's behalf.
 
 ### Read-only queries
 

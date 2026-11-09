@@ -1805,9 +1805,9 @@ export interface BotConfig {
    */
   toolIdentityInvalid?: string;
   /**
-   * lark-cli 应用绑定开关（默认开启）。
-   * 默认开启（未配置或 true）：会话内 lark-cli 默认以当前 Bot 应用凭证以 bot 身份调用，支持 --as user 与 --profile 透传；
-   * 显式关闭（false）：不安装托管包装器，完全沿用宿主机环境及按触发人鉴权规则。需 /restart 重启或新建会话生效。
+   * lark-cli 应用绑定开关（显式 opt-in）。
+   * true：会话内 lark-cli 默认以当前 Bot 应用凭证以 bot 身份调用，支持 --as user 与 --profile 透传；
+   * 未配置或 false：不安装托管包装器，完全沿用宿主机环境及按触发人鉴权规则。需 /restart 重启或新建会话生效。
    */
   larkToolBinding?: boolean;
   /**
@@ -3864,9 +3864,9 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       throw new Error(`Bot config [${i}]: ${(e as Error).message}`);
     }
     // Automation identity is optional and is re-validated against the target
-    // app on every use. A malformed entry is ignored with a warning (the bot
-    // keeps running, automation simply has no default) rather than taking a
-    // working bot offline.
+    // app on every use. A malformed entry keeps the bot running but is retained
+    // as an invalid sentinel, so automatic tools fail closed instead of
+    // silently acting as another principal.
     const automationIdentityParsed = parseAutomationIdentityConfig(entry.automationIdentity, entry.larkAppId);
     const parsedAutomationSetting = automationIdentityParsed.value;
     const automationIdentityInvalid = isInvalidAutomationIdentity(parsedAutomationSetting)

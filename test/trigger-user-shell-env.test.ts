@@ -12,6 +12,7 @@ import { buildWrappedLaunch } from '../src/setup/cli-selection.js';
 import {
   GIT_ASKPASS_BASENAME,
   IDENTITY_DENIED_EXIT_CODE,
+  bytedcliTurnHome,
   identityShellTransportEnv,
   installIdentityWrapper,
   prepareTriggerUserCliEnv,
@@ -238,7 +239,7 @@ describe.each([
       let [cnJwt, bdJwt, isolatedHome, legacyJwt, machineAk] = first.stdout.split('|');
       expect(cnJwt).toBe('test-alice-cn');
       expect(bdJwt).toBe('test-alice-bd');
-      expect(isolatedHome).toContain('botmux-bytedcli-home/invocation.');
+      expect(isolatedHome).toBe(bytedcliTurnHome(dataDir, 'botmux-session', {}));
       expect(legacyJwt).toBe('');
       expect(machineAk).toBe('');
       publish('test-bob', 'turn-b');
@@ -247,7 +248,7 @@ describe.each([
       expect(first.status).toBe(0);
       expect(cnJwt).toBe('test-bob-cn');
       expect(bdJwt).toBe('test-bob-bd');
-      expect(isolatedHome).toContain('botmux-bytedcli-home/invocation.');
+      expect(isolatedHome).toBe(bytedcliTurnHome(dataDir, 'botmux-session', {}));
       expect(legacyJwt).toBe('');
       expect(machineAk).toBe('');
 

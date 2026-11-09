@@ -411,7 +411,7 @@ export type BotDefaultsRow = {
     gitHost?: string;
     gitTokenExchangeUrl?: string;
   } | null;
-  /** lark-cli 应用绑定开关（默认开启）。默认开启以当前 Bot 应用凭证调用并支持 --profile 透传；设为 false 显式关闭。 */
+  /** lark-cli 应用绑定开关（显式 opt-in）。只有 true 才使用当前 Bot 应用凭证；未配置或 false 沿用宿主机原生环境。 */
   larkToolBinding?: boolean;
   /** 固定执行用户（plan §4.1）：某工具按人鉴权关闭时的普通会话执行身份 + 自动轮次低优先级默认。 */
   toolIdentity?: { user: { larkAppId: string; openId: string; unionId: string; name?: string }; tools: string[]; credentialSource?: string; updatedAt?: string } | null;

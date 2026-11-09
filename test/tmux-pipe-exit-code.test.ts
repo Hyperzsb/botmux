@@ -22,7 +22,7 @@ import { TmuxPipeBackend, resolvePaneDeath } from '../src/adapters/backend/tmux-
 import { TmuxBackend } from '../src/adapters/backend/tmux-backend.js';
 import { readUnreapedPaneExit } from '../src/adapters/backend/unreaped-pane-exit.js';
 import { rmSandboxScratch } from './helpers/rm-sandbox-scratch.js';
-import { defaultTmuxListenerIsUnreachable } from './helpers/environment-capabilities.js';
+import { defaultTmuxServerConflictsWithPrivateFixture } from './helpers/environment-capabilities.js';
 
 // Pure fold for the corpse waiter: merge one raw
 // `#{pane_dead}:#{pane_dead_status}[:#{pane_pid}:#{pid}]` line into the
@@ -52,7 +52,7 @@ function mergePaneObservation(
 
 let realTmux: string | undefined;
 try { realTmux = execFileSync('which', ['tmux'], { encoding: 'utf8' }).trim(); } catch { /* optional */ }
-const defaultTmuxBlocked = Boolean(realTmux) && defaultTmuxListenerIsUnreachable();
+const defaultTmuxBlocked = Boolean(realTmux) && defaultTmuxServerConflictsWithPrivateFixture();
 
 // The #2453 lab chains `remain-on-exit failed` into new-session; tmux < 3.2
 // rejects that value and no corpse is created, so the lab is modern-tmux only.

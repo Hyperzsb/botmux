@@ -405,7 +405,7 @@ Details in [File sandbox](/en/sandbox).
 | `credentialsSourceDir` | A sandboxed bot copies its CLI login from this directory on every start, instead of the machine's shared login. Useful for several accounts on one machine |
 | `codexAuthSync` | Codex login policy: `shared` (default) uses the global login; `isolated` always uses this bot's own `CODEX_HOME` and never reads or copies global credentials |
 | `triggerUserAuth` | Off by default. When on, tools such as `lark-cli` in the session run with the authorization of the person who sent the message; people who haven't authorized get an authorization link |
-| `larkToolBinding` | On by default: `lark-cli` in the session uses the current bot's app identity, and `--as user` / `--profile` can switch. `false` injects no bot credentials at all |
+| `larkToolBinding` | Explicit opt-in: only `true` makes session `lark-cli` use the current bot's app identity and enables `--as user` / `--profile` switching. Unset or `false` injects no bot credentials |
 
 > The ZMX backend can't enforce the file sandbox; sandboxed combinations are refused at startup. See [ZMX backend](/en/zmx).
 

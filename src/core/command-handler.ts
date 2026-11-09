@@ -15,7 +15,7 @@ import { join, resolve, basename } from 'node:path';
 import { config } from '../config.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { getBot, getAllBots, getBotOpenId, getOwnerOpenId, findOncallChat, effectiveDefaultWorkingDir, loadBotConfigs, type BotConfig } from '../bot-registry.js';
-import { credentialSourceOf, triggerUserAuthApplies } from '../services/trigger-user-auth.js';
+import { triggerUserAuthApplies } from '../services/trigger-user-auth.js';
 import { senderToolCredentialSource } from '../services/tool-identity-config.js';
 import { platformCredentialsUrl } from '../platform/credential-grant-client.js';
 import { beginBytedcliLogin, completeBytedcliLogin, pendingBytedcliChallenge, hasBytedcliHome } from '../services/bytedcli-auth.js';
@@ -4452,15 +4452,16 @@ export async function handleCommand(
         // fetched again next turn; this process cannot revoke it. Say so when
         // this bot actually takes credentials from the platform, the same way
         // /login points at that page.
-        const credSource = credentialSourceOf(botCfg.triggerUserAuth);
-        const platformUrl = botCfg.triggerUserAuth?.enabled && credSource !== 'local'
-          ? platformCredentialsUrl()
-          : null;
-        const platformNote = !botCfg.triggerUserAuth?.enabled || credSource === 'local'
-          ? ''
-          : platformUrl
+        const managedSources = (['lark-cli', 'bytedcli', 'larkdev'] as const)
+          .map(tool => senderToolCredentialSource(botCfg, openId, tool))
+          .filter((source): source is NonNullable<typeof source> => source !== undefined);
+        const mayUsePlatform = managedSources.some(source => source !== 'local');
+        const platformUrl = mayUsePlatform ? platformCredentialsUrl() : null;
+        const platformNote = mayUsePlatform
+          ? platformUrl
             ? `\n${t('cmd.logout.platform_note', { url: platformUrl }, loc)}`
-            : `\n${t('cmd.logout.platform_unbound', undefined, loc)}`;
+            : `\n${t('cmd.logout.platform_unbound', undefined, loc)}`
+          : '';
         await sessionReply(rootId, t('cmd.logout.ok', undefined, loc) + platformNote);
         break;
       }
@@ -4511,17 +4512,20 @@ export async function handleCommand(
         // the sender's token from the platform only, so a bot-app authorization
         // would be useless there. The platform branch below already answers the
         // bare and explicit forms; status/done must not report one either.
-        const larkPlatformOnly = credentialSourceOf(botCfg2.triggerUserAuth) === 'platform'
-          && triggerUserAuthApplies(botCfg2.triggerUserAuth, 'lark-cli');
         // 中心化平台来源：本机已绑定且本 bot 的凭据来源不是 local 时，裸 /login 指向
         // 平台凭据页（一次授权、所有机器通用）；platform 模式下 /login lark|bytedcli
         // 也只给平台链接；auto 模式下显式的 /login lark|bytedcli 仍可走本机扫码。
         const larkCredentialSource = senderToolCredentialSource(botCfg2, loginOpenId, 'lark-cli');
+        // Resolve against this sender's winning policy, not only the legacy
+        // trigger-user block: a fixed assigned user can independently select
+        // platform-only credentials while sender auth is disabled.
+        const larkPlatformOnly = larkCredentialSource === 'platform';
         // larkdev and bytedcli share the ByteCloud account. Prefer the direct
         // bytedcli assignment when both are present; otherwise either tool is
         // sufficient reason for this sender to establish that account.
         const bytedcliCredentialSource = senderToolCredentialSource(botCfg2, loginOpenId, 'bytedcli')
           ?? senderToolCredentialSource(botCfg2, loginOpenId, 'larkdev');
+        const bytedcliPlatformOnly = bytedcliCredentialSource === 'platform';
         const larkGoverned = larkCredentialSource !== undefined;
         const bytedcliGoverned = bytedcliCredentialSource !== undefined;
         const loginProvider = subCmd.split(/\s+/, 1)[0];
@@ -4622,7 +4626,13 @@ export async function handleCommand(
           }
           // ByteCloud 是另一个身份提供方，飞书授权了不代表这边也授权了。
           if (loginOpenId && bytedcliGoverned) {
-            if (!site || subCmd.split(/\s+/).length !== 2) {
+            if (bytedcliPlatformOnly) {
+              // As above for lark-cli, a platform-only ByteCloud policy never
+              // consumes this machine's login store or its pending challenge.
+              if (!platformCredsUrl && !larkPlatformOnly) {
+                lines.push(t('cmd.login.platform_unbound', undefined, loc));
+              }
+            } else if (!site || subCmd.split(/\s+/).length !== 2) {
               lines.push(t('cmd.login.bytedcli_usage', { sites: BYTECLOUD_USER_SITE_USAGE }, loc));
             } else {
               const status = await bytedcliLoginStatus(loginOpenId, site);
@@ -4666,17 +4676,19 @@ export async function handleCommand(
           } else if (hasLarkCliHome(loginOpenId)) {
             doneLines.push(t('cmd.login.lark_status_yes', undefined, loc));
           }
-          for (const site of BYTECLOUD_USER_SITES) {
-            const bytedPending = pendingBytedcliChallenge(loginOpenId, site);
-            if (!bytedPending) continue;
-            const { state, detail } = await completeBytedcliLogin(loginOpenId, site, bytedPending);
-            doneLines.push(state === 'authorized'
-              ? bytedcliLoginSuccessReply(botCfg2, loc, site)
-              : state === 'pending'
-                ? t('cmd.login.bytedcli_pending', { site }, loc)
-                : state === 'unavailable'
-                  ? t('cmd.login.bytedcli_unavailable', { site }, loc)
-                  : t('cmd.login.bytedcli_failed', { site, detail: detail ?? 'unknown' }, loc));
+          if (!bytedcliPlatformOnly) {
+            for (const site of BYTECLOUD_USER_SITES) {
+              const bytedPending = pendingBytedcliChallenge(loginOpenId, site);
+              if (!bytedPending) continue;
+              const { state, detail } = await completeBytedcliLogin(loginOpenId, site, bytedPending);
+              doneLines.push(state === 'authorized'
+                ? bytedcliLoginSuccessReply(botCfg2, loc, site)
+                : state === 'pending'
+                  ? t('cmd.login.bytedcli_pending', { site }, loc)
+                  : state === 'unavailable'
+                    ? t('cmd.login.bytedcli_unavailable', { site }, loc)
+                    : t('cmd.login.bytedcli_failed', { site, detail: detail ?? 'unknown' }, loc));
+            }
           }
           if (!doneLines.length) doneLines.push(t('cmd.login.no_challenge', undefined, loc));
           await sessionReply(rootId, doneLines.join('\n'));
