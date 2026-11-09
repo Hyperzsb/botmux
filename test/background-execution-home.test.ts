@@ -32,7 +32,7 @@ function probe(body: string): void {
     import { enumerateScratchSecretPaths } from './src/adapters/backend/scratch-credentials.js';
     const data = join(homedir(), 'custom-state'); const session = 'background-home-session';
     const id = randomUUID(); const turn = 'background:' + id;
-    const grant = { tool:'bytedcli', cloudJwt:'job-jwt', openId:'ou_background', turnId:turn };
+    const grant = { tool:'bytedcli', cloudJwts:{cn:'job-jwt'}, openId:'ou_background', turnId:turn };
     const publish = (jobId = id) => {
       identity.writeSessionIdentity(data, session, { ...grant, turnId:'background:' + jobId }, 'proven');
       const env = identity.recallProvenIdentityContent(data, session, 'background:' + jobId, 'bytedcli');
@@ -68,7 +68,7 @@ describe.skipIf(process.platform !== 'linux')('registered background HOME lifecy
     assert.equal(readFileSync(state, 'utf8'), 'original-person');
     assert.equal(publish(), jobHome);
     const tool=join(homedir(),'tool');
-    writeFileSync(tool, '#!/bin/sh\\ncat "$HOME/.local/share/bytedcli/userinfo.json"\\nprintf "|%s|%s" "$BYTEDCLI_USER_CLOUD_JWT" "$HOME"\\n');
+    writeFileSync(tool, '#!/bin/sh\\ncat "$HOME/.local/share/bytedcli/userinfo.json"\\nprintf "|%s|%s" "$BYTECLOUD_CLI_API_JWT_TOKEN_CN" "$HOME"\\n');
     chmodSync(tool, 0o755);
     const wrapper=join(homedir(),'wrapper');
     writeFileSync(wrapper, identity.renderIdentityWrapper('bytedcli', tool, 'single'));

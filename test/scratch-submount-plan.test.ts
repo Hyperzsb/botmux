@@ -8,6 +8,7 @@ import {
   scratchSubmountOverflowNotice,
 } from '../src/adapters/backend/scratch-sandbox.js';
 import { rmSandboxScratch } from './helpers/rm-sandbox-scratch.js';
+import { checkoutIsUnderSystemTemp } from './helpers/environment-capabilities.js';
 
 /** One /proc/self/mountinfo line (fields per proc(5)). */
 function line(id: number, mountpoint: string, fstype: string, source = 'none'): string {
@@ -91,7 +92,7 @@ describe('planScratchSubmounts: botmux\'s own scratch trees are never re-wrapped
 });
 
 describe('planScratchSubmounts: the on-disk tree fingerprint', () => {
-  it('recognises a tree by its subroots dir or its marker, not by a look-alike path', () => {
+  it.skipIf(checkoutIsUnderSystemTemp())('recognises a tree by its subroots dir or its marker, not by a look-alike path', () => {
     // Not under tmpdir(): /tmp (CI's TMPDIR) is a prefix scratch never wraps at all.
     const base = realpathSync(mkdtempSync(join(resolve('.'), '.scratch-plan-')));
     try {

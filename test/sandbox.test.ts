@@ -21,8 +21,10 @@ import { protectedMcpHomeDenyPaths, protectedMcpHomePaths, type ProtectedMcpWork
 import { PROTECTED_HTTP_EGRESS_SOCKET_ENV, protectedHttpEgressAuthTokenPath } from '../src/core/protected-http-egress-host.js';
 import { materializeProtectedHttpLoopbackArgs } from '../src/core/protected-http-egress-loopback.js';
 import type { NetworkLaunchPlan } from '../src/core/sandbox-network-launch.js';
+import { commandAvailable } from './helpers/environment-capabilities.js';
 
 const tmp = () => mkdtempSync(join(tmpdir(), 'sbx-'));
+const hasSlirp4netns = commandAvailable('slirp4netns');
 
 describe('codex-app sandboxExtraExecPaths', () => {
   it('returns exactly the resolved codex bin and never the working dir', () => {
@@ -57,7 +59,7 @@ describe('prepareDirectSandbox protected egress socket mount', () => {
     return server;
   }
 
-  it('carries the actual Codex argument boundary through the shell and bwrap launch plan', async () => {
+  it.skipIf(process.platform === 'linux' && !hasSlirp4netns)('carries the actual Codex argument boundary through the shell and bwrap launch plan', async () => {
     if (process.platform !== 'linux') return;
     const root = mkdtempSync(join(tmpdir(), 'sbx-provider-argv-'));
     const socketDir = join(root, 'sockets');
@@ -147,7 +149,7 @@ describe('prepareDirectSandbox protected egress socket mount', () => {
     }
   });
 
-  it('carries a route-scoped local-service bridge in the network runner without mounting an MCP socket', async () => {
+  it.skipIf(process.platform === 'linux' && !hasSlirp4netns)('carries a route-scoped local-service bridge in the network runner without mounting an MCP socket', async () => {
     if (process.platform !== 'linux') return;
     const root = mkdtempSync(join(tmpdir(), 'sbx-local-service-bridge-'));
     const socketDir = join(root, 'sockets');

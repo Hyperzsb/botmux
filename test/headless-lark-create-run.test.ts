@@ -7,13 +7,16 @@ import { createHeadlessSession } from '../src/core/session-manager.js';
 import { triggerSessionTurn } from '../src/core/trigger-session.js';
 import { sessionKey } from '../src/core/types.js';
 import { larkToolPrompt, usesLarkToolBinding } from '../src/core/lark-tool-binding.js';
+import { escapeXmlTagLikeTokens } from '../src/utils/xml.js';
 import type { DaemonSession } from '../src/core/types.js';
 
 const state = vi.hoisted(() => ({ rows: new Map<string, any>(), fork: vi.fn() }));
 const appId = 'cli_headless_contract';
 vi.mock('../src/bot-registry.js', async importOriginal => ({
   ...await importOriginal<Record<string, unknown>>(),
-  getBot: () => ({ config: { larkAppId: 'cli_headless_contract', cliId: 'codex', backendType: 'pty', lang: 'zh' } }),
+  getBot: () => ({ config: {
+    larkAppId: 'cli_headless_contract', cliId: 'codex', backendType: 'pty', lang: 'zh', larkToolBinding: true,
+  } }),
   effectiveDefaultWorkingDir: () => undefined,
 }));
 vi.mock('../src/services/session-store.js', async importOriginal => ({
@@ -62,12 +65,12 @@ it('real create-then-run dispatches bot-only inline guidance and durable headles
   expect(ds.session.headless).toMatchObject({ id: created.headlessId, source: 'cli' });
   expect(ds).toBe(activeSessions.get(sessionKey(ds.chatId, appId)));
   expect(options.resume).toBe(false);
-  const expectedPolicy = larkToolPrompt(appId, 'zh', true);
-  const interactivePolicy = larkToolPrompt(appId, 'zh', false);
+  const expectedPolicy = escapeXmlTagLikeTokens(larkToolPrompt(appId, 'zh', true));
+  const interactivePolicy = escapeXmlTagLikeTokens(larkToolPrompt(appId, 'zh', false));
   expect(expectedPolicy).not.toBe(interactivePolicy);
   expect(input.content).toContain(`<botmux_lark_tool>\n  ${expectedPolicy}\n</botmux_lark_tool>`);
   expect(input.content).not.toContain(interactivePolicy);
-  expect(usesLarkToolBinding({ sessionId: created.sessionId, larkAppId: appId, chatId: ds.chatId,
+  expect(usesLarkToolBinding({ sessionId: created.sessionId, larkAppId: appId, larkToolBinding: true, chatId: ds.chatId,
     headless: ds.session.headless, backendType: 'pty', resume: options.resume }, root)).toBe(true);
 });
 

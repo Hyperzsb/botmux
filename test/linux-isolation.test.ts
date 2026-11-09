@@ -23,6 +23,9 @@ const canRunBwrap = linux && spawnSync('bwrap', [
 const repoRoot = realpathSync(fileURLToPath(new URL('..', import.meta.url)));
 const bwrapArgs = ['--ro-bind', '/', '/', '--unshare-user', '--unshare-pid',
   '--unshare-net', '--proc', '/proc', '--dev', '/dev', '--'];
+const canRunNestedBwrap = canRunBwrap && spawnSync('bwrap', [
+  ...bwrapArgs, 'bwrap', ...bwrapArgs, '/bin/true',
+], { stdio: 'ignore', timeout: 5_000 }).status === 0;
 
 type Launch = ReturnType<typeof linuxIsolationLaunch>;
 
@@ -213,13 +216,13 @@ describe.skipIf(!canRunBwrap || !supported)('Linux isolation kernel probe', () =
     });
   }, 20_000);
 
-  it('survives another user/PID/mount namespace with no environment markers', () => {
+  it.skipIf(!canRunNestedBwrap)('survives another user/PID/mount namespace with no environment markers', () => {
     expect(run(linuxIsolationLaunch('bwrap', [
       ...bwrapArgs, 'bwrap', ...bwrapArgs, ...cleanCli,
     ]))).toMatchObject({ isolated: true, offline: true });
   });
 
-  it.each([0, 3, 38])('does not trust an overlaid seccomp errno %s', errno => {
+  it.skipIf(!canRunNestedBwrap).each([0, 3, 38])('does not trust an overlaid seccomp errno %s', errno => {
     const inner = linuxIsolationLaunch('bwrap', [...bwrapArgs, ...cleanCli]);
     const bytes = filterBytes(inner);
     let replaced = 0;

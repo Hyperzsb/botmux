@@ -9,8 +9,11 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { mkdtempSync, rmdirSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { lastJsonLine, privateMountNsAvailable, runInPrivateMountNs } from './helpers/private-mount-ns.js';
+import { checkoutIsUnderSystemTemp, commandAvailable } from './helpers/environment-capabilities.js';
 
 const runtime = privateMountNsAvailable();
+const runtimeCanExposeCheckout = !checkoutIsUnderSystemTemp();
+const hasFuseOverlay = commandAvailable('fuse-overlayfs');
 
 // Outside /tmp (container-owned in scratch); a namespace-private tmpfs on top.
 const bases: string[] = [];
@@ -116,7 +119,7 @@ console.log(JSON.stringify({ report, hostBotmuxAfterPrepare }));
   expect(report!.ordinary).toBe('not a secret');
 }
 
-describe.skipIf(!runtime)('scratch credential masks (real container, private namespace)', () => {
+describe.skipIf(!runtime || !runtimeCanExposeCheckout || !hasFuseOverlay)('scratch credential masks (real container, private namespace)', () => {
   it('per-person secret dirs stay unreadable for files created after the session started', () => {
     lateSecretsReport(false);
   }, 120_000);

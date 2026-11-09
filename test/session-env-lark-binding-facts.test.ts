@@ -58,7 +58,13 @@ function sessionFor(shape: Shape): any {
 }
 
 function botWith(env: { env?: Record<string, string>; envUnset?: string[] }): any {
-  return { larkAppId: 'cli_bindingfacts', cliId: 'claude-code', backendType: 'pty', ...env };
+  return {
+    larkAppId: 'cli_bindingfacts',
+    cliId: 'claude-code',
+    backendType: 'pty',
+    larkToolBinding: true,
+    ...env,
+  };
 }
 
 /** What the worker decides from the init config the daemon sends for this shape. */
@@ -71,6 +77,7 @@ function workerBinds(shape: Shape): boolean {
     adoptMode: !!shape.adoptedFrom,
     existingAppServerEndpoint: shape.existingAppServerEndpoint,
     backendType: (shape.backendType ?? 'pty') as any,
+    larkToolBinding: true,
   });
 }
 

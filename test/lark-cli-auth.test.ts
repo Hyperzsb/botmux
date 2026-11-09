@@ -272,12 +272,11 @@ describe('lark-cli per-person HOME layout', () => {
   });
 
   it('reports per-person state without reading the encrypted token', () => {
-    seedMachine();
-    simulateUserToken(OPEN);
-    expect(describeLarkCliAuth(OPEN)).toEqual({ state: 'authorized' });
-    expect(describeLarkCliAuth(OPEN_B)).toEqual({ state: 'needs-login' });
+    simulateUserToken(ALICE);
+    expect(describeLarkCliAuth(ALICE)).toEqual({ state: 'authorized' });
+    expect(describeLarkCliAuth(BOB)).toEqual({ state: 'needs-login' });
     expect(describeLarkCliAuth('../etc/passwd')).toEqual({ state: 'unknown' });
-    expect(JSON.stringify(describeLarkCliAuth(OPEN))).not.toContain('their-user-token');
+    expect(JSON.stringify(describeLarkCliAuth(ALICE))).not.toContain('their-user-token');
   });
 });
 

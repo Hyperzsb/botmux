@@ -1237,7 +1237,7 @@ export function renderIdentityWrapper(
   const dynamicByteCloudScrub = tool === 'lark-cli' ? [] : DYNAMIC_BYTECLOUD_IDENTITY_SCRUB;
   const bytedcliSiteGuard = tool === 'bytedcli'
     ? [
-        '    __botmux_site=cn',
+        '    __botmux_site="$__botmux_requested_site"',
         '    __botmux_site_next=',
         '    for __botmux_site_arg in "$@"; do',
         '      if [ -n "$__botmux_site_next" ]; then',
@@ -1246,6 +1246,7 @@ export function renderIdentityWrapper(
         '        continue',
         '      fi',
         '      case "$__botmux_site_arg" in',
+        '        --) break ;;',
         '        --site) __botmux_site_next=1 ;;',
         '        --site=*) __botmux_site="${__botmux_site_arg#--site=}" ;;',
         '      esac',
@@ -1254,12 +1255,14 @@ export function renderIdentityWrapper(
         `      printf '%s\n' 'botmux: bytedcli 的 --site 缺少值，命令未执行。' >&2`,
         `      exit ${IDENTITY_DENIED_EXIT_CODE}`,
         '    fi',
+        '    __botmux_site="$(printf \'%s\' "$__botmux_site" | command -p tr \'[:upper:]\' \'[:lower:]\' | command -p sed \'s/^[[:space:]]*//; s/[[:space:]]*$//\')"',
         '    case "$__botmux_site" in',
-        '      cn|boe) __botmux_site=cn; __botmux_site_jwt="$BYTECLOUD_CLI_API_JWT_TOKEN_CN" ;;',
+        '      cn|boe|prod|online|sinf-cn|boei18n|boe-i18n|"") __botmux_site=cn; __botmux_site_jwt="$BYTECLOUD_CLI_API_JWT_TOKEN_CN" ;;',
         '      i18n|i18n-bd) __botmux_site=i18n-bd; __botmux_site_jwt="$BYTECLOUD_CLI_API_JWT_TOKEN_I18N_BD" ;;',
-        '      i18n-tt) __botmux_site=i18n-tt; __botmux_site_jwt="$BYTECLOUD_CLI_API_JWT_TOKEN_I18N_TT" ;;',
-        '      eu-ttp|eu-ttp-limited|eu-ttp-full) __botmux_site=eu-ttp; __botmux_site_jwt="$BYTECLOUD_CLI_API_JWT_TOKEN_EU_TTP" ;;',
-        '      us-ttp|us-ttp-bdee|us-ttp-usts) __botmux_site=us-ttp; __botmux_site_jwt="$BYTECLOUD_CLI_API_JWT_TOKEN_US_TTP" ;;',
+        '      i18n-tt|row|i18ntt|tiktok-row) __botmux_site=i18n-tt; __botmux_site_jwt="$BYTECLOUD_CLI_API_JWT_TOKEN_I18N_TT" ;;',
+        '      eu-ttp|eu-ttp-limited|eu-ttp-full|euttp|ttp-eu) __botmux_site=eu-ttp; __botmux_site_jwt="$BYTECLOUD_CLI_API_JWT_TOKEN_EU_TTP" ;;',
+        '      us-ttp|us-ttp-bdee|us-ttp-usts|usttp|tx-ttp|ttp-us|ttp-us-limited|usttpbdee|usttpusts) __botmux_site=us-ttp; __botmux_site_jwt="$BYTECLOUD_CLI_API_JWT_TOKEN_US_TTP" ;;',
+        '      us-ttpbd) __botmux_site=i18n-bd; __botmux_site_jwt="$BYTECLOUD_CLI_API_JWT_TOKEN_I18N_BD" ;;',
         '      *)',
         `        printf '%s\n' "botmux: 不支持为 bytedcli 站点 $__botmux_site 注入按人身份；命令未执行。支持：cn|i18n-bd|i18n-tt|eu-ttp|us-ttp。" >&2`,
         `        exit ${IDENTITY_DENIED_EXIT_CODE}`,
@@ -1269,7 +1272,7 @@ export function renderIdentityWrapper(
         `      printf '%s\n' "botmux: 当前消息发起人没有站点 $__botmux_site 的 ByteCloud 凭证，命令未执行。请发送 /login bytedcli $__botmux_site 完成授权后重试。" >&2`,
         `      exit ${IDENTITY_DENIED_EXIT_CODE}`,
         '    fi',
-        '    unset __botmux_site_arg __botmux_site_next __botmux_site_jwt __botmux_site',
+        '    unset __botmux_requested_site __botmux_site_arg __botmux_site_next __botmux_site_jwt __botmux_site',
       ]
     : [];
   const larkdevSiteGuard = tool === 'larkdev'
@@ -1409,6 +1412,10 @@ export function renderIdentityWrapper(
     `  exec ${shellSingleQuote(realBinaryPath)} "$@"`,
     'fi',
     `__botmux_resolved_mode="$${MODE_VAR}"`,
+    // BYTEDCLI_CLOUD_SITE selects which current-turn token is required. Capture
+    // it before the ambient identity scrub below, then keep it shell-local so
+    // it cannot leak into the governed CLI as a second source of authority.
+    ...(tool === 'bytedcli' ? ['__botmux_requested_site="${BYTEDCLI_CLOUD_SITE:-cn}"'] : []),
     `unset ${WRAPPER_IDENTITY_OVERRIDE_ENV_KEYS.join(' ')}`,
     ...dynamicByteCloudScrub,
     'eval "$__botmux_cred_body"',
@@ -1477,26 +1484,38 @@ export function renderIdentityWrapper(
     '      :',
     ...bytedcliSiteGuard,
     '    fi',
-    // A single BYTEDCLI_USER_CLOUD_JWT is valid but bound to one region; when a
-    // command selects another site bytedcli deliberately skips it. The SDK's
-    // site-specific variables avoid that ambiguity. Run in a fresh HOME so an
-    // unavailable site/token fails closed instead of consulting ~/.local/share/
-    // bytedcli and silently acting as the machine's persistent login.
-    '    __botmux_bytedcli_base="${TMPDIR:-/tmp}/botmux-bytedcli-home"',
     '    umask 077',
-    '    command -p mkdir -p "$__botmux_bytedcli_base" || {',
-    `      printf '%s\\n' 'botmux: bytedcli 隔离认证目录创建失败，命令未执行。' >&2`,
-    `      exit ${IDENTITY_DENIED_EXIT_CODE}`,
-    '    }',
-    '    __botmux_bytedcli_home="$(command -p mktemp -d "$__botmux_bytedcli_base/invocation.XXXXXX")" || {',
-    `      printf '%s\\n' 'botmux: bytedcli 隔离认证目录创建失败，命令未执行。' >&2`,
-    `      exit ${IDENTITY_DENIED_EXIT_CODE}`,
-    '    }',
+    // Site-labelled grants passed the exact-site guard above. Reuse their
+    // daemon-published per-person session HOME so normal CLI state survives
+    // across calls without exposing the daemon's long-lived login directory.
+    // A legacy single-region JWT has no exact-site proof, so keep that shape in
+    // a disposable HOME and prevent SDK fallback to a machine login.
+    '    __botmux_bytedcli_ephemeral=',
+    '    if [ -n "$BOTMUX_IDENTITY_HOME" ] && [ -z "$BYTEDCLI_USER_CLOUD_JWT" ]; then',
+    '      __botmux_bytedcli_home="$BOTMUX_IDENTITY_HOME"',
+    '      command -p mkdir -p "$__botmux_bytedcli_home" || {',
+    `        printf '%s\\n' 'botmux: bytedcli 按人认证目录创建失败，命令未执行。' >&2`,
+    `        exit ${IDENTITY_DENIED_EXIT_CODE}`,
+    '      }',
+    '    else',
+    '      __botmux_bytedcli_base="${TMPDIR:-/tmp}/botmux-bytedcli-home"',
+    '      command -p mkdir -p "$__botmux_bytedcli_base" || {',
+    `        printf '%s\\n' 'botmux: bytedcli 隔离认证目录创建失败，命令未执行。' >&2`,
+    `        exit ${IDENTITY_DENIED_EXIT_CODE}`,
+    '      }',
+    '      __botmux_bytedcli_home="$(command -p mktemp -d "$__botmux_bytedcli_base/invocation.XXXXXX")" || {',
+    `        printf '%s\\n' 'botmux: bytedcli 隔离认证目录创建失败，命令未执行。' >&2`,
+    `        exit ${IDENTITY_DENIED_EXIT_CODE}`,
+    '      }',
+    '      __botmux_bytedcli_ephemeral=1',
+    '    fi',
     `    export ${exportKeys}`,
     `    unset ${MODE_VAR} ${DENY_MSG_VAR} ${TURN_VAR} ${HOME_VAR}`,
     '    __botmux_bytedcli_child=',
     '    __botmux_bytedcli_forwarded=',
-    '    __botmux_bytedcli_cleanup() { command -p rm -rf -- "$__botmux_bytedcli_home"; }',
+    '    __botmux_bytedcli_cleanup() {',
+    '      if [ -n "$__botmux_bytedcli_ephemeral" ]; then command -p rm -rf -- "$__botmux_bytedcli_home"; fi',
+    '    }',
     '    __botmux_bytedcli_forward() {',
     '      __botmux_bytedcli_forwarded="$1"',
     '      if [ -n "$__botmux_bytedcli_child" ]; then',

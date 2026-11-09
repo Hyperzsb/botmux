@@ -129,7 +129,10 @@ describe('resolveSessionEnv', () => {
     // lark wrapper there, so the user's shell startup files must reach the CLI.
     expect(resolveSessionEnv({ bot: { env, backendType: 'pty' }, backendType: 'remote-runner' }).env).toEqual(env);
     // The reverse: a remote-runner bot whose session runs locally is wrapped.
-    expect(resolveSessionEnv({ bot: { env, backendType: 'remote-runner' }, backendType: 'tmux' }).env).toEqual({ OTHER: 'x' });
+    expect(resolveSessionEnv({
+      bot: { env, backendType: 'remote-runner', larkToolBinding: true },
+      backendType: 'tmux',
+    }).env).toEqual({ OTHER: 'x' });
   });
 
   it('lock context follows the bot flags', () => {

@@ -25,6 +25,7 @@ vi.setConfig({ testTimeout: 90_000 });
 import { MojoBackend } from '../src/adapters/backend/mojo-backend.js';
 import { readProcessIdentity } from '../src/adapters/backend/mojo-process-tree.js';
 import { isLinux } from './helpers/synthetic-proc.js';
+import { runningAsRoot } from './helpers/environment-capabilities.js';
 
 /** The fake `mojo` is a bash script spawned per turn; under a loaded parallel
  *  vitest run its first stdout line can take well over vi.waitFor's 1s default
@@ -193,7 +194,7 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-escaped","w
   // Linux-only: it needs a REAL live child plus /proc enumeration to reach a
   // termination verdict. Off Linux the scanner returns unsupported-platform by
   // design, so this case is skipped explicitly instead of failing.
-  it.runIf(isLinux)('refuses the close while the escaped descendant cannot be killed', async () => {
+  it.runIf(isLinux && !runningAsRoot)('refuses the close while the escaped descendant cannot be killed', async () => {
     // Same escape, but the survivor cannot be signalled away. The close must fail
     // closed so the row stays active and its device-isolation blocker is retained,
     // instead of reporting ok:true with a credentialed process still running.

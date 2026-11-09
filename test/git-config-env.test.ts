@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { buildBotmuxEnvAssignments, shellCommandArgv, shellWrapperScript } from '../src/adapters/backend/tmux-backend.js';
 import { tmuxEnv } from '../src/setup/ensure-tmux.js';
 import { isBotmuxManagedTmuxServerGlobalEnvKey } from '../src/utils/child-env.js';
+import { runningAsRoot, runningUnderBun } from './helpers/environment-capabilities.js';
 
 type Pair = readonly [string, string];
 
@@ -73,14 +74,14 @@ for (const shell of SHELLS) {
       });
     }
 
-    it.each([4, 7, 14, 19])('forwards all %i carrier entries through the shell and Git', (count) => {
+    it.skipIf(runningAsRoot && runningUnderBun).each([4, 7, 14, 19])('forwards all %i carrier entries through the shell and Git', (count) => {
       const pairs = probePairs(count);
       const result = runPane({ pairs, command: ['git', 'config', '--null', '--get-all', 'botmuxprobe.value'] });
       expect(result.status, result.stderr).toBe(0);
       expect(result.stdout).toBe(pairs.map(([, value]) => `${value}\0`).join(''));
     });
 
-    it('rebuilds the carrier over ambient COUNT=14 / high-index pairs and ignores both', () => {
+    it.skipIf(runningAsRoot && runningUnderBun)('rebuilds the carrier over ambient COUNT=14 / high-index pairs and ignores both', () => {
       const pairs = probePairs(3);
       const result = runPane({
         pairs,

@@ -6,10 +6,12 @@ import { TmuxPipeBackend } from '../src/adapters/backend/tmux-pipe-backend.js';
 import { pipePaneShellCommand } from '../src/adapters/backend/tmux-pipe-relay.js';
 import { resetTmuxVersionCacheForTests } from '../src/setup/ensure-tmux.js';
 import { tsRunnerPrefix } from './helpers/ts-runner.js';
+import { defaultTmuxListenerIsUnreachable } from './helpers/environment-capabilities.js';
 
 const quote = (value: string) => `'${value.replace(/'/g, "'\\''")}'`;
 let realTmux: string | undefined;
 try { realTmux = execFileSync('which', ['tmux'], { encoding: 'utf8' }).trim(); } catch { /* optional backend */ }
+const defaultTmuxBlocked = Boolean(realTmux) && defaultTmuxListenerIsUnreachable();
 const realCat = execFileSync('which', ['cat'], { encoding: 'utf8' }).trim();
 const originalPath = process.env.PATH;
 
@@ -147,7 +149,7 @@ describe.each(CATS)('pipe-pane copy command with %s', (_label, cat) => {
   });
 });
 
-describe.skipIf(!realTmux)('TmuxPipeBackend streaming through a real tmux server', () => {
+describe.skipIf(!realTmux || defaultTmuxBlocked)('TmuxPipeBackend streaming through a real tmux server', () => {
   const CASES = [
     ['short ready and final markers', ['›\r\n', '\x1b]777;botmux:final:e30=\x07›\r\n']],
     ['Unicode and terminal controls', ['你好\x1b[32m✓\x1b[0m', '\x1b[2K第二轮完成🌍']],

@@ -23,6 +23,7 @@ import { buildNewTopicPrompt, buildFollowUpCliInput } from '../src/core/session-
 import { createCliAdapterSync } from '../src/adapters/cli/registry.js';
 import { parseTriggerUserAuthConfig } from '../src/services/trigger-user-auth.js';
 import { larkToolPrompt } from '../src/core/lark-tool-binding.js';
+import { escapeXmlTagLikeTokens } from '../src/utils/xml.js';
 
 const policy = parseTriggerUserAuthConfig({ enabled: true })!;
 
@@ -202,7 +203,11 @@ describe('buildBotmuxSystemPromptText — claude-family path', () => {
 
   it.each(['zh', 'en'] as const)('describes headless bot-only access in system and inline prompts (%s)', locale => {
     const appId = 'cli_headless';
-    stubbedBots.set(appId, { config: { larkAppId: appId, backendType: 'pty' } });
+    stubbedBots.set(appId, { config: {
+      larkAppId: appId,
+      backendType: 'pty',
+      larkToolBinding: true,
+    } });
     const headlessId = 'hl_11111111-1111-4111-8111-111111111111';
     stubbedSessions.set('headless-session', { headless: { id: headlessId, source: 'cli' } });
     try {
@@ -215,8 +220,8 @@ describe('buildBotmuxSystemPromptText — claude-family path', () => {
       const firstRun = buildFollowUpCliInput('read the linked doc', 'headless-session', {
         larkAppId: appId, chatId: `headless_${headlessId}`, cliId: 'codex', locale,
       }).content;
-      const expectedPolicy = larkToolPrompt(appId, locale, true);
-      const interactivePolicy = larkToolPrompt(appId, locale, false);
+      const expectedPolicy = escapeXmlTagLikeTokens(larkToolPrompt(appId, locale, true));
+      const interactivePolicy = escapeXmlTagLikeTokens(larkToolPrompt(appId, locale, false));
       expect(expectedPolicy).not.toBe(interactivePolicy);
       for (const prompt of [system, inline, firstRun]) {
         expect(prompt).toContain(`<botmux_lark_tool>\n  ${expectedPolicy}\n</botmux_lark_tool>`);

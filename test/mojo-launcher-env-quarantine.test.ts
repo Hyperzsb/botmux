@@ -24,6 +24,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { runningAsRoot } from './helpers/environment-capabilities.js';
 
 vi.mock('../src/utils/logger.js', () => ({
   logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -331,7 +332,7 @@ describe('quarantine durability and integrity', () => {
       .toThrow(MojoQuarantineUnavailableError);
   });
 
-  it('THROWS on EACCES instead of reading it as "file absent"', () => {
+  it.skipIf(runningAsRoot)('THROWS on EACCES instead of reading it as "file absent"', () => {
     recordQuarantinedLauncherEnvKeys('sid-1', ['LD_PRELOAD'], dir);
     chmodSync(join(dir, FILE), 0o000);
     try {
@@ -368,7 +369,7 @@ describe('quarantine durability and integrity', () => {
     expect(readFileSync(join(dir, FILE), 'utf8')).toBe(before);
   }, 20_000);
 
-  it('PROPAGATES a write failure instead of logging and swallowing it', () => {
+  it.skipIf(runningAsRoot)('PROPAGATES a write failure instead of logging and swallowing it', () => {
     // Read-only dir => rename/write fails. The caller must learn the risk was not
     // recorded rather than believe it was.
     recordQuarantinedLauncherEnvKeys('sid-seed', ['PATH'], dir);

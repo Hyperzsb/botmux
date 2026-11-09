@@ -16,11 +16,13 @@ import { join } from 'node:path';
 import { setStartupTmuxRetrySleepForTests, TmuxPipeBackend } from '../src/adapters/backend/tmux-pipe-backend.js';
 import { isTransientStartupFailure } from '../src/core/worker-startup-retry.js';
 import { rmSandboxScratch } from './helpers/rm-sandbox-scratch.js';
+import { defaultTmuxListenerIsUnreachable } from './helpers/environment-capabilities.js';
 
 let realTmux: string | undefined;
 try { realTmux = execFileSync('which', ['tmux'], { encoding: 'utf8' }).trim(); } catch { /* optional */ }
+const defaultTmuxBlocked = Boolean(realTmux) && defaultTmuxListenerIsUnreachable();
 
-describe.skipIf(!realTmux)('TmuxPipeBackend.retireSessionCreatedBySpawn', () => {
+describe.skipIf(!realTmux || defaultTmuxBlocked)('TmuxPipeBackend.retireSessionCreatedBySpawn', () => {
   let dir: string;
   let socket: string;
   const saved: Record<string, string | undefined> = {};

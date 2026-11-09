@@ -13,6 +13,7 @@ import { accessForPath, buildFsPolicy, type FsPolicyContext } from '../src/adapt
 import { resolve } from 'node:path';
 import type { InstalledPluginRecord } from '../src/core/plugins/types.js';
 import { spawnSyncTsScript } from './helpers/ts-runner.js';
+import { runningAsRoot } from './helpers/environment-capabilities.js';
 
 /**
  * A sandboxed bot gets `~/.botmux/plugins-registry.json` read-only and nothing
@@ -32,7 +33,7 @@ const record = (id: string, contributions?: unknown): InstalledPluginRecord => (
   ...(contributions === undefined ? {} : { contributions }),
 } as InstalledPluginRecord);
 
-describe('plugin registry reads survive a read-only ~/.botmux (sandboxed bot)', () => {
+describe.skipIf(runningAsRoot)('plugin registry reads survive a read-only ~/.botmux (sandboxed bot)', () => {
   let home: string;
   let botmuxHome: string;
 

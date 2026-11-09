@@ -167,6 +167,7 @@ describe('managed lark-cli binding', () => {
   });
   it('binds new local headless runners without enabling other API-only sessions', () => {
     const config = { sessionId: 'headless-session', larkAppId: 'cli_current',
+      larkToolBinding: true,
       chatId: 'headless_hl_11111111-1111-4111-8111-111111111111', backendType: 'pty' as const,
       headless: { id: 'hl_11111111-1111-4111-8111-111111111111', source: 'cli' } };
     expect(usesLarkToolBinding(config, dir)).toBe(true);

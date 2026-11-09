@@ -11,8 +11,10 @@ import { join, resolve } from 'node:path';
 import { lastJsonLine, privateMountNsAvailable, runInPrivateMountNs } from './helpers/private-mount-ns.js';
 import { tsEvalArgs, tsRunnerPrefix } from './helpers/ts-runner.js';
 import { scratchFailureNotice } from '../src/adapters/backend/scratch-capability.js';
+import { commandAvailable } from './helpers/environment-capabilities.js';
 
 const runtime = privateMountNsAvailable();
+const hasFuseOverlay = commandAvailable('fuse-overlayfs');
 
 // Outside /tmp: scratch treats /tmp as container-owned. The base gets a
 // namespace-private tmpfs, so on the host it stays an empty dir.
@@ -77,7 +79,7 @@ console.log(JSON.stringify({ first, switched }));
     expect(result.switched, run.stderr).toEqual({ ok: false, reason: 'storage-conflict', recordedStorage: 'disk' });
   });
 
-  it('a non-root daemon: tmpfs reports tmpfs-needs-root, and the probe said so beforehand', () => {
+  it.skipIf(!hasFuseOverlay)('a non-root daemon: tmpfs reports tmpfs-needs-root, and the probe said so beforehand', () => {
     const base = freshBase();
     // The daemon side, run as nobody: probe first, then a real tmpfs prepare.
     const child = `

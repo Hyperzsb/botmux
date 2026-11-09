@@ -8,15 +8,17 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { mkdtempSync, rmdirSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { lastJsonLine, privateMountNsAvailable, runInPrivateMountNs } from './helpers/private-mount-ns.js';
+import { commandAvailable } from './helpers/environment-capabilities.js';
 
 const runtime = privateMountNsAvailable();
+const hasFuseOverlay = commandAvailable('fuse-overlayfs');
 
 const bases: string[] = [];
 afterEach(() => {
   for (const base of bases.splice(0)) rmdirSync(base);
 });
 
-describe.skipIf(!runtime)('scratch sandbox retry after a crash-loop stop (real mounts, private namespace)', () => {
+describe.skipIf(!runtime || !hasFuseOverlay)('scratch sandbox retry after a crash-loop stop (real mounts, private namespace)', () => {
   it('the retried CLI runs in a live tree that stays mounted', () => {
     // Outside /tmp: the base gets a namespace-private tmpfs, so on the host it stays an empty dir.
     const base = mkdtempSync(join(resolve('.'), '.scratch-retry-'));

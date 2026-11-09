@@ -20,6 +20,7 @@ import { spawnSync } from 'node:child_process';
 import { mkdtempSync, rmdirSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { lastJsonLine, privateMountNsAvailable, runInPrivateMountNs } from './helpers/private-mount-ns.js';
+import { checkoutIsUnderSystemTemp } from './helpers/environment-capabilities.js';
 import { SCRATCH_SUBMOUNT_OVERLAY_LIMIT } from '../src/adapters/backend/scratch-sandbox.js';
 
 const runtime = privateMountNsAvailable();
@@ -61,7 +62,7 @@ const runContainer = (sbx) => {
 };
 `;
 
-describe.skipIf(!runtime)('scratch submounts (real mounts, private namespace)', () => {
+describe.skipIf(!runtime || !hasFuseOverlay || checkoutIsUnderSystemTemp())('scratch submounts (real mounts, private namespace)', () => {
   it('a new session never re-wraps earlier sessions\' trees, and real data submounts stay copy-on-write', () => {
     const base = freshBase();
     const run = runInPrivateMountNs(`${PRELUDE}

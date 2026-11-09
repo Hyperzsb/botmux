@@ -13,6 +13,7 @@ import { linuxIsolationLaunch } from '../src/core/linux-isolation.js';
 import { IDENTITY_DENIED_EXIT_CODE, renderIdentityWrapper, writeSessionIdentity, bytedcliTurnHome } from '../src/core/cli-identity.js';
 import { ensureSessionTempDir } from '../src/core/session-temp.js';
 import { tsRunnerPrefix } from './helpers/ts-runner.js';
+import { checkoutIsUnderSystemTemp } from './helpers/environment-capabilities.js';
 
 const repoRoot = realpathSync(fileURLToPath(new URL('..', import.meta.url)));
 const cliEntry = join(repoRoot, 'src', 'cli.ts');
@@ -31,6 +32,7 @@ function spawnBwrap(bin: string, args: readonly string[], options: Parameters<ty
 const canRunBwrap = linux && ['x64', 'arm64', 'ia32', 'arm'].includes(process.arch) && spawnBwrap('bwrap', [
   '--ro-bind', '/', '/', '--unshare-user', '--unshare-pid', '--proc', '/proc', '--', '/bin/true',
 ], { stdio: 'ignore', timeout: 5_000 }).status === 0;
+const checkoutHiddenByPrivateTmp = checkoutIsUnderSystemTemp();
 
 const roots: string[] = [];
 const children: ChildProcess[] = [];
@@ -207,7 +209,7 @@ describe('fleet commands from a sandbox (no namespace needed)', () => {
   }, 120_000);
 });
 
-describe.skipIf(!canRunBwrap)('fleet commands inside a real PID-namespace sandbox', () => {
+describe.skipIf(!canRunBwrap || checkoutHiddenByPrivateTmp)('fleet commands inside a real PID-namespace sandbox', () => {
   it('status refuses instead of reporting a healthy fleet as stopped', () => {
     const home = fakeHome();
     const result = runCliInBwrap(home, ['status'], { marker: true });

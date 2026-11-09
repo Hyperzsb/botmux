@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { normalizeCodexProfile, scanCodexProfiles, validateCodexProfile, resolveCodexProfileHome, assertCodexProfileConfig, assertCodexProfileRuntime, type ProfileLaunch } from '../src/services/codex-profiles.js';
 import { parseBotConfigsFromText } from '../src/bot-registry.js';
+import { runningAsRoot } from './helpers/environment-capabilities.js';
 
 const dirs: string[] = [];
 afterEach(() => { vi.unstubAllEnvs(); dirs.splice(0).forEach(d => rmSync(d, { recursive: true, force: true })); });
@@ -55,7 +56,7 @@ describe('Codex profiles: bounded, target-local and non-executing scan', () => {
   it.each(['../secret', '/secret', 'a/b', 'a b', '-p x', 'x.config.toml', 'x\n', 'x'.repeat(129)])('rejects invalid name %j', name => {
     expect(() => normalizeCodexProfile(name)).toThrow('invalid_name');
   });
-  it('distinguishes empty, missing directory and denied access', async () => {
+  it.skipIf(runningAsRoot)('distinguishes empty, missing directory and denied access', async () => {
     const { home, cfg } = fixture();
     expect((await scanCodexProfiles(cfg)).status).toBe('empty');
     expect(await scanCodexProfiles(cfg, join(home, 'missing'))).toMatchObject({ status: 'scan_failed', error: 'not_found' });

@@ -20,6 +20,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { renderIdentityEnv, renderIdentityWrapper } from '../src/core/cli-identity.js';
 import { NAMESPACE_UID, privateTmpAvailable, runWithPrivateTmp } from './helpers/session-temp-ns-probe.js';
 import { tsRunnerPrefix } from './helpers/ts-runner.js';
+import { checkoutIsUnderSystemTemp } from './helpers/environment-capabilities.js';
 
 let dir: string;
 let previousHome: string | undefined;
@@ -69,6 +70,7 @@ const repoRoot = process.cwd();
 // NOT process.getuid(): the probes run inside a user namespace where the boot
 // code sees NAMESPACE_UID, and every planted path must agree with it.
 const uid = NAMESPACE_UID;
+const checkoutHiddenByPrivateTmp = checkoutIsUnderSystemTemp();
 
 /** A bytedcli wrapper whose published HOME the caller chooses. */
 function writeWrapper(home: string): string {
@@ -112,7 +114,7 @@ function publishAndRunArgv(): string[] {
   return [command, ...prefixArgs, probe];
 }
 
-describe('session temp layout created by the identity wrapper (#2574)', () => {
+describe.skipIf(checkoutHiddenByPrivateTmp)('session temp layout created by the identity wrapper (#2574)', () => {
   /**
    * Never let this file pass by SKIPPING.
    *
@@ -249,7 +251,7 @@ describe('session temp layout created by the identity wrapper (#2574)', () => {
   });
 });
 
-describe('a hub replaced by a symlink (#2574)', () => {
+describe.skipIf(checkoutHiddenByPrivateTmp)('a hub replaced by a symlink (#2574)', () => {
   it.skipIf(!privateTmpAvailable())('never receives a write from the wrapper, through realpath or through mkdir', () => {
     // Two ways to leak into a foreign tree, and both must be shut: publishing a
     // path that RESOLVES into it (realpath), and publishing a lexical
@@ -276,7 +278,7 @@ describe('a hub replaced by a symlink (#2574)', () => {
   });
 });
 
-describe('adoption carries a scratch tree that holds special files (#2574)', () => {
+describe.skipIf(checkoutHiddenByPrivateTmp)('adoption carries a scratch tree that holds special files (#2574)', () => {
   /**
    * The alias subtree is a CLI's TMPDIR, so it legitimately holds a FIFO and/or
    * a listening unix socket. Cross-filesystem adoption must not open either:
@@ -349,7 +351,7 @@ describe('adoption carries a scratch tree that holds special files (#2574)', () 
   });
 });
 
-describe('adoption merges instead of replacing (#2574)', () => {
+describe.skipIf(checkoutHiddenByPrivateTmp)('adoption merges instead of replacing (#2574)', () => {
   /**
    * The `/tmp` copy and the cache root can both hold a directory of the same
    * name with DIFFERENT children: the cache copy from an earlier session, the
@@ -394,7 +396,7 @@ describe('adoption merges instead of replacing (#2574)', () => {
   });
 });
 
-describe('adoption is serialised across booting processes (#2574)', () => {
+describe.skipIf(checkoutHiddenByPrivateTmp)('adoption is serialised across booting processes (#2574)', () => {
   /**
    * A daemon and the CLIs it spawns all reach adoption on their first session.
    * Two of them walking the same `/tmp` tree while a third renames entries out

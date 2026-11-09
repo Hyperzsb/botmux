@@ -22,6 +22,7 @@ import { TmuxPipeBackend, resolvePaneDeath } from '../src/adapters/backend/tmux-
 import { TmuxBackend } from '../src/adapters/backend/tmux-backend.js';
 import { readUnreapedPaneExit } from '../src/adapters/backend/unreaped-pane-exit.js';
 import { rmSandboxScratch } from './helpers/rm-sandbox-scratch.js';
+import { defaultTmuxListenerIsUnreachable } from './helpers/environment-capabilities.js';
 
 // Pure fold for the corpse waiter: merge one raw
 // `#{pane_dead}:#{pane_dead_status}[:#{pane_pid}:#{pid}]` line into the
@@ -51,6 +52,7 @@ function mergePaneObservation(
 
 let realTmux: string | undefined;
 try { realTmux = execFileSync('which', ['tmux'], { encoding: 'utf8' }).trim(); } catch { /* optional */ }
+const defaultTmuxBlocked = Boolean(realTmux) && defaultTmuxListenerIsUnreachable();
 
 // The #2453 lab chains `remain-on-exit failed` into new-session; tmux < 3.2
 // rejects that value and no corpse is created, so the lab is modern-tmux only.
@@ -186,7 +188,7 @@ async function expectLiveSessionWithDeadPaneKept(tmux: TmuxRun, socket: string, 
   expect(stillDead, stillDead.seen).toMatchObject({ dead: true, status: '8' });
 }
 
-describe.skipIf(!realTmux)('tmux backend reports the pane pid\'s real exit code', () => {
+describe.skipIf(!realTmux || defaultTmuxBlocked)('tmux backend reports the pane pid\'s real exit code', () => {
   let dir: string;
   let socket: string;
   const saved: Record<string, string | undefined> = {};
@@ -411,7 +413,7 @@ describe.skipIf(!realTmux)('tmux backend reports the pane pid\'s real exit code'
  * 地方都必须先排除它，否则会话永远不报退出、且下一次启动会把尸体当活会话
  * attach。这两条钉的是 probe 层，也就是所有调用方共用的那一个判断。
  */
-describe.skipIf(!realTmux)('tmux liveness probes treat a kept corpse as missing', () => {
+describe.skipIf(!realTmux || defaultTmuxBlocked)('tmux liveness probes treat a kept corpse as missing', () => {
   let dir: string;
   let socket: string;
   const saved: Record<string, string | undefined> = {};

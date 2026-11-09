@@ -337,7 +337,7 @@ describe.skipIf(!canRunBwrap)('identity helper inside a bwrap root that only mou
         '',
       ].join('\n'), { mode: 0o755 });
       writeSessionIdentity(layout.canonicalDataDir, SESSION,
-        { tool: 'bytedcli', cloudJwt: 'user-jwt', openId: 'ou_alice', turnId: 't1' }, 'single');
+        { tool: 'bytedcli', cloudJwts: { cn: 'user-jwt' }, openId: 'ou_alice', turnId: 't1' }, 'single');
       publishActiveTurn(layout.canonicalDataDir, SESSION, 't1');
       const home = bytedcliTurnHome(layout.canonicalDataDir, SESSION, { openId: 'ou_alice' });
       expect(home.startsWith(`${realpathSync(scratch)}/`)).toBe(true);

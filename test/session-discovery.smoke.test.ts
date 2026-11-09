@@ -18,6 +18,7 @@ import {
   __testOnly_readCwd,
   __testOnly_getChildPids,
 } from '../src/core/session-discovery.js';
+import { runningUnderBun } from './helpers/environment-capabilities.js';
 
 let child: ChildProcessWithoutNullStreams;
 let childCwd: string;
@@ -51,7 +52,7 @@ afterAll(() => {
 });
 
 describe('readComm', () => {
-  it('返回子进程的 comm 名 (basename, 不含路径)', () => {
+  it.skipIf(process.platform === 'linux' && runningUnderBun)('返回子进程的 comm 名 (basename, 不含路径)', () => {
     const comm = __testOnly_readComm(child.pid!);
     expect(comm).toBeDefined();
     // Linux /proc/<pid>/comm 给短名 "node"；BSD ps 给完整路径，readComm

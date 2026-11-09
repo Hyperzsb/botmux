@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { afterEach, describe, expect, it } from 'vitest';
 import { installAidenCodexShim, renderAidenCodexShim, writeAidenCodexShellConfigs } from '../src/services/aiden-codex-shim.js';
+import { shellIgnoresMissingLoopRedirect } from './helpers/environment-capabilities.js';
 
 const dirs: string[] = [];
 
@@ -159,7 +160,7 @@ describe('Aiden Codex shell-config file', () => {
     ]);
   });
 
-  it('fails closed when the configured file is missing', () => {
+  it.skipIf(shellIgnoresMissingLoopRedirect())('fails closed when the configured file is missing', () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-aiden-shim-cfg-missing-'));
     dirs.push(dir);
     const shimDir = installAidenCodexShim(join(dir, 'shim'));

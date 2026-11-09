@@ -217,9 +217,13 @@ describe('requestSessionRestart live-worker branch carries env (behavioral)', ()
   });
 
   it('locks identity-wrapper names only for sessions the worker really wraps', () => {
-    // Lark tool binding is on by default, but not for an HTTP virtual chat or an
-    // external Codex App Server — there the worker leaves ZDOTDIR alone.
-    getBotMock.mockReturnValue({ config: { env: { ZDOTDIR: '/mine', OTHER: 'x' } } });
+    // Lark tool binding is an explicit opt-in, and remains off for an HTTP
+    // virtual chat or external Codex App Server — there the worker leaves
+    // ZDOTDIR alone.
+    getBotMock.mockReturnValue({ config: {
+      larkToolBinding: true,
+      env: { ZDOTDIR: '/mine', OTHER: 'x' },
+    } });
     const { ds } = makeDs();
     ds.chatId = 'oc_real_chat';
     expect(latestSessionEnvForRestart(ds)?.env).toEqual({ OTHER: 'x' });

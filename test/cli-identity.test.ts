@@ -43,6 +43,7 @@ import {
   applyTurnGitConfigEnv,
   prepareTurnGitConfigEnv,
 } from '../src/core/cli-identity.js';
+import { BYTECLOUD_USER_JWT_ENV_BY_SITE, type ByteCloudUserSite } from '../src/utils/bytecloud-sites.js';
 
 let dir: string;
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'botmux-cli-identity-')); });
@@ -808,85 +809,80 @@ describe('renderIdentityWrapper', () => {
     expect(output.trim()).toBe('authorized-human');
   });
 
-  it.each([
-    [[], {}, 'cn-tok'],
-    [['--site', 'i18n-tt', 'auth', 'userinfo'], {}, 'i18n-tok'],
-    [['--json', '--site=eu-ttp', 'x'], {}, 'i18n-tok'],
-    [['--site', 'i18n-bd'], {}, 'bd-tok'],
-    [['--site', 'i18n'], {}, 'bd-tok'],
-    [[], { BYTEDCLI_CLOUD_SITE: 'i18n' }, 'bd-tok'],
-    [['x'], { BYTEDCLI_CLOUD_SITE: 'us-ttp-usts' }, 'tx-tok'],
-    [['--site', 'cn'], { BYTEDCLI_CLOUD_SITE: 'i18n' }, 'cn-tok'],
-    [['--site', 'boe'], {}, 'cn-tok'],
-    [['--', '--site', 'i18n'], {}, 'cn-tok'],
-    [['--site', 'ROW', 'auth'], { BYTEDCLI_CLOUD_SITE: 'us-ttp' }, 'i18n-tok'],
-    [['--site', 'prod'], { BYTEDCLI_CLOUD_SITE: 'I18N-TT' }, 'cn-tok'],
-    [['--', '--site', 'row'], { BYTEDCLI_CLOUD_SITE: ' usttp ' }, 'tx-tok'],
-  ] as const)('selects the ByteCloud JWT for the call site: %j %j', (args, env, expected) => {
-    const tool = join(dir, 'real-bytedcli.sh');
-    writeFileSync(tool, '#!/bin/sh\nprintf "%s|%s|%s" "$BYTEDCLI_USER_CLOUD_JWT" "$BOTMUX_IDENTITY_CLOUD_JWT_I18N" "$*"\n');
-    chmodSync(tool, 0o755);
-    const wrapperPath = join(dir, 'bytedcli');
-    writeFileSync(wrapperPath, renderIdentityWrapper('bytedcli', tool));
-    writeSessionIdentity(dir, SESSION, {
-      tool: 'bytedcli', cloudJwt: 'cn-tok', regionalCloudJwts: { i18n: 'i18n-tok', i18nbd: 'bd-tok', tx: 'tx-tok' },
-    }, 'single');
-    const out = runWrapper(wrapperPath, { SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION, ...env }, [...args]);
-    // The regional variables stay internal; the arguments reach the tool unchanged.
-    expect(out).toBe(`${expected}||${args.join(' ')}`);
-  });
+  const siteTokens: Record<ByteCloudUserSite, string> = {
+    cn: 'cn-tok', 'i18n-tt': 'i18n-tok', 'i18n-bd': 'bd-tok',
+    'eu-ttp': 'eu-tok', 'us-ttp': 'tx-tok',
+  };
 
-  function bytedcliSiteToken(args: string[], env: Record<string, string> = {}): string {
+  function bytedcliSiteToken(args: string[], site: ByteCloudUserSite, env: Record<string, string> = {}): string {
     const tool = join(dir, 'site-token.sh');
-    writeFileSync(tool, '#!/bin/sh\nprintf "%s" "$BYTEDCLI_USER_CLOUD_JWT"\n');
+    const envKey = BYTECLOUD_USER_JWT_ENV_BY_SITE[site];
+    writeFileSync(tool, `#!/bin/sh\nprintf "%s" "$${envKey}"\n`);
     chmodSync(tool, 0o755);
     const wrapper = join(dir, 'bytedcli');
     writeFileSync(wrapper, renderIdentityWrapper('bytedcli', tool));
     writeSessionIdentity(dir, SESSION, {
-      tool: 'bytedcli', cloudJwt: 'cn-tok',
-      regionalCloudJwts: { i18n: 'i18n-tok', i18nbd: 'bd-tok', tx: 'tx-tok' },
+      tool: 'bytedcli', cloudJwts: { [site]: siteTokens[site] },
     }, 'single');
     return runWrapper(wrapper, { SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION, ...env }, args);
   }
+
+  it.each([
+    [[], {}, 'cn'],
+    [['--site', 'i18n-tt', 'auth', 'userinfo'], {}, 'i18n-tt'],
+    [['--json', '--site=eu-ttp', 'x'], {}, 'eu-ttp'],
+    [['--site', 'i18n-bd'], {}, 'i18n-bd'],
+    [['--site', 'i18n'], {}, 'i18n-bd'],
+    [[], { BYTEDCLI_CLOUD_SITE: 'i18n' }, 'i18n-bd'],
+    [['x'], { BYTEDCLI_CLOUD_SITE: 'us-ttp-usts' }, 'us-ttp'],
+    [['--site', 'cn'], { BYTEDCLI_CLOUD_SITE: 'i18n' }, 'cn'],
+    [['--site', 'boe'], {}, 'cn'],
+    [['--', '--site', 'i18n'], {}, 'cn'],
+    [['--site', 'ROW', 'auth'], { BYTEDCLI_CLOUD_SITE: 'us-ttp' }, 'i18n-tt'],
+    [['--site', 'prod'], { BYTEDCLI_CLOUD_SITE: 'I18N-TT' }, 'cn'],
+    [['--', '--site', 'row'], { BYTEDCLI_CLOUD_SITE: ' usttp ' }, 'us-ttp'],
+  ] as const)('selects the ByteCloud JWT for the call site: %j %j', (args, env, site) => {
+    expect(bytedcliSiteToken([...args], site, env)).toBe(siteTokens[site]);
+  });
 
   // Required layer: bytedcli 0.178 normalized canonical sites and their
   // bytecloudJwtRegionClaimForCloudSite partitions. The limited/full EU
   // variants normalize to eu-ttp before that lookup. Keep this external
   // contract explicit; tests never load the installed CLI's private bundle.
   const canonicalSiteClaims = [
-    ['cn', 'cn-tok'], ['i18n', 'bd-tok'], ['i18n-bd', 'bd-tok'],
-    ['i18n-tt', 'i18n-tok'], ['eu-ttp', 'i18n-tok'],
-    ['eu-ttp-limited', 'i18n-tok'], ['eu-ttp-full', 'i18n-tok'],
-    ['us-ttp', 'tx-tok'], ['us-ttp-bdee', 'tx-tok'], ['us-ttp-usts', 'tx-tok'],
+    ['cn', 'cn'], ['i18n', 'i18n-bd'], ['i18n-bd', 'i18n-bd'],
+    ['i18n-tt', 'i18n-tt'], ['eu-ttp', 'eu-ttp'],
+    ['eu-ttp-limited', 'eu-ttp'], ['eu-ttp-full', 'eu-ttp'],
+    ['us-ttp', 'us-ttp'], ['us-ttp-bdee', 'us-ttp'], ['us-ttp-usts', 'us-ttp'],
   ] as const;
-  it.each(canonicalSiteClaims)('matches the bytedcli 0.178 canonical site partition: %s', (site, token) => {
-    expect(bytedcliSiteToken(['--site', site])).toBe(token);
-    expect(bytedcliSiteToken([`--site=${site}`])).toBe(token);
-    expect(bytedcliSiteToken([], { BYTEDCLI_CLOUD_SITE: site })).toBe(token);
+  it.each(canonicalSiteClaims)('matches the bytedcli 0.178 canonical site partition: %s', (site, partition) => {
+    expect(bytedcliSiteToken(['--site', site], partition)).toBe(siteTokens[partition]);
+    expect(bytedcliSiteToken([`--site=${site}`], partition)).toBe(siteTokens[partition]);
+    expect(bytedcliSiteToken([], partition, { BYTEDCLI_CLOUD_SITE: site })).toBe(siteTokens[partition]);
   });
 
   // bytedcli normalizeCloudSiteSelection: trim, lowercase, then resolve
   // CLOUD_SITE_ALIAS_MAP (identical in 0.173–0.187).
   const aliasSiteClaims = [
-    ['row', 'i18n-tok'], ['i18ntt', 'i18n-tok'], ['tiktok-row', 'i18n-tok'],
-    ['euttp', 'i18n-tok'], ['ttp-eu', 'i18n-tok'],
-    ['usttp', 'tx-tok'], ['tx-ttp', 'tx-tok'], ['ttp-us', 'tx-tok'], ['ttp-us-limited', 'tx-tok'],
-    ['usttpbdee', 'tx-tok'], ['usttpusts', 'tx-tok'],
-    ['prod', 'cn-tok'], ['online', 'cn-tok'], ['sinf-cn', 'cn-tok'], ['boei18n', 'cn-tok'], ['boe-i18n', 'cn-tok'],
-    ['I18N-TT', 'i18n-tok'], ['US-TTP', 'tx-tok'], ['I18N', 'bd-tok'], ['Row', 'i18n-tok'],
-    [' i18n-tt ', 'i18n-tok'], ['\tUSTTP\n', 'tx-tok'], ['  ', 'cn-tok'],
+    ['row', 'i18n-tt'], ['i18ntt', 'i18n-tt'], ['tiktok-row', 'i18n-tt'],
+    ['euttp', 'eu-ttp'], ['ttp-eu', 'eu-ttp'],
+    ['usttp', 'us-ttp'], ['tx-ttp', 'us-ttp'], ['ttp-us', 'us-ttp'], ['ttp-us-limited', 'us-ttp'],
+    ['usttpbdee', 'us-ttp'], ['usttpusts', 'us-ttp'],
+    ['prod', 'cn'], ['online', 'cn'], ['sinf-cn', 'cn'], ['boei18n', 'cn'], ['boe-i18n', 'cn'],
+    ['I18N-TT', 'i18n-tt'], ['US-TTP', 'us-ttp'], ['I18N', 'i18n-bd'], ['Row', 'i18n-tt'],
+    [' i18n-tt ', 'i18n-tt'], ['\tUSTTP\n', 'us-ttp'], ['  ', 'cn'],
   ] as const;
-  it.each(aliasSiteClaims)('normalizes the site like bytedcli before choosing the partition: %j', (site, token) => {
-    expect(bytedcliSiteToken(['--site', site])).toBe(token);
-    expect(bytedcliSiteToken([`--site=${site}`])).toBe(token);
-    expect(bytedcliSiteToken([], { BYTEDCLI_CLOUD_SITE: site })).toBe(token);
+  it.each(aliasSiteClaims)('normalizes the site like bytedcli before choosing the partition: %j', (site, partition) => {
+    expect(bytedcliSiteToken(['--site', site], partition)).toBe(siteTokens[partition]);
+    expect(bytedcliSiteToken([`--site=${site}`], partition)).toBe(siteTokens[partition]);
+    expect(bytedcliSiteToken([], partition, { BYTEDCLI_CLOUD_SITE: site })).toBe(siteTokens[partition]);
   });
 
   // us-ttpbd is scoped to bmq / apm argos log / cloud-ticket; bytedcli sends
   // an i18n-bd JWT for all three (jwt_site / authSite "i18n-bd").
   it('uses the i18n-bd partition for the scoped us-ttpbd site', () => {
-    expect(bytedcliSiteToken(['--site', 'us-ttpbd', 'bmq'])).toBe('bd-tok');
-    expect(bytedcliSiteToken(['bmq'], { BYTEDCLI_CLOUD_SITE: 'US-TTPBD' })).toBe('bd-tok');
+    expect(bytedcliSiteToken(['--site', 'us-ttpbd', 'bmq'], 'i18n-bd')).toBe('bd-tok');
+    expect(bytedcliSiteToken(['bmq'], 'i18n-bd', { BYTEDCLI_CLOUD_SITE: 'US-TTPBD' })).toBe('bd-tok');
   });
 
   it('keeps the default ByteCloud JWT for a site whose region has no token', () => {
@@ -1515,7 +1511,7 @@ printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' \
     const attacker = join(dir, 'attacker-bin');
     mkdirSync(attacker);
     const marker = join(dir, 'attacker-ran');
-    for (const name of ['env', 'sed', 'mkdir', 'mktemp', 'rm']) {
+    for (const name of ['env', 'sed', 'tr', 'mkdir', 'mktemp', 'rm']) {
       writeFileSync(join(attacker, name), `#!/bin/sh\nprintf %s "$0" >> "$MARKER"\nexit 91\n`, { mode: 0o755 });
     }
     const bin = join(dir, 'bytedcli-real');
@@ -1551,7 +1547,7 @@ while :; do sleep 1; done
     const wrapper = join(dir, 'bytedcli-wrapper');
     writeFileSync(wrapper, renderIdentityWrapper('bytedcli', bin), { mode: 0o755 });
     writeSessionIdentity(dir, SESSION, {
-      tool: 'bytedcli', cloudJwts: { cn: 'alice-cn' }, turnId: 'turn-a',
+      tool: 'bytedcli', cloudJwt: 'alice-cn', turnId: 'turn-a',
     });
     publishActiveTurn(dir, SESSION, 'turn-a');
 
@@ -1817,12 +1813,16 @@ printf '%s|%s|%s|%s|%s|%s|%s|%s' \
     // No native/viewer CLI has been spawned. The model-owning process already
     // rejects absent identity rather than reaching the unwrapped binary.
     expect(run).toThrow();
+    let durableHome: string | undefined;
     for (const [turnId, jwt] of [['turn-a', 'user-a-jwt'], ['turn-b', 'user-b-jwt']]) {
       writeSessionIdentity(dir, SESSION, { tool: 'bytedcli', cloudJwts: { cn: jwt }, turnId });
       publishActiveTurn(dir, SESSION, turnId);
       const [actualJwt, isolatedHome, stalePrivateJwt] = run().split('|');
       expect(actualJwt).toBe(jwt);
-      expect(isolatedHome).toContain('botmux-bytedcli-home/invocation.');
+      expect(isolatedHome).toContain('/identity-home/bytedcli/');
+      if (durableHome === undefined) durableHome = isolatedHome;
+      else expect(isolatedHome).toBe(durableHome);
+      expect(existsSync(isolatedHome)).toBe(true);
       expect(stalePrivateJwt).toBe('');
       expect(env.BYTEDCLI_USER_CLOUD_JWT).toBeUndefined();
     }
