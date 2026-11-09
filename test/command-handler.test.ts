@@ -7704,7 +7704,8 @@ describe('handleCommand', () => {
         senderId: 'ou_fixed', senderUnionId: 'on_fixed',
       }), deps, LARK_APP_ID);
       expect(beginBytedcliLogin).not.toHaveBeenCalled();
-      expect(reply(deps)).toContain(PAGE);
+      expect(vi.mocked(sendUserMessage).mock.calls.at(-1)?.[2]).toContain(PAGE);
+      expect(reply(deps)).toBe(t('auth_link.sent_privately', undefined, 'zh'));
     });
 
     it('fixed assigned user can start its own local login with sender auth off', async () => {
@@ -7713,8 +7714,9 @@ describe('handleCommand', () => {
         senderId: 'ou_fixed', senderUnionId: 'on_fixed',
       }), deps, LARK_APP_ID);
       expect(beginBytedcliLogin).toHaveBeenCalledWith('ou_fixed', 'i18n-bd');
-      expect(reply(deps)).toContain('https://cloud.example.com/auth?state=x');
-      expect(reply(deps)).not.toContain(PAGE);
+      expect(vi.mocked(sendUserMessage).mock.calls.at(-1)?.[2]).toContain('https://cloud.example.com/auth?state=x');
+      expect(vi.mocked(sendUserMessage).mock.calls.at(-1)?.[2]).not.toContain(PAGE);
+      expect(reply(deps)).toBe(t('auth_link.sent_privately', undefined, 'zh'));
     });
   });
 
@@ -7791,7 +7793,7 @@ describe('handleCommand', () => {
 
       it('/login bytedcli: the ByteCloud link is DMed too', async () => {
         const deps = makeDeps(makeDaemonSession({ chatType: 'group' }));
-        await handleCommand('/login', ROOT_ID, makeLarkMessage('/login bytedcli'), deps, LARK_APP_ID);
+        await handleCommand('/login', ROOT_ID, makeLarkMessage('/login bytedcli cn'), deps, LARK_APP_ID);
         expect(vi.mocked(sendUserMessage).mock.calls[0]![2]).toContain('https://cloud.example.com/auth?state=x');
         expect(replies(deps).join('\n')).not.toContain('https://');
       });
@@ -7799,9 +7801,9 @@ describe('handleCommand', () => {
       it('DM fails: tells the sender to message the bot privately, never posts the link', async () => {
         vi.mocked(sendUserMessage).mockRejectedValueOnce(new Error('230013'));
         const deps = makeDeps(makeDaemonSession({ chatType: 'group' }));
-        await handleCommand('/login', ROOT_ID, makeLarkMessage('/login bytedcli'), deps, LARK_APP_ID);
+        await handleCommand('/login', ROOT_ID, makeLarkMessage('/login bytedcli cn'), deps, LARK_APP_ID);
         const text = replies(deps).join('\n');
-        expect(text).toBe(t('auth_link.dm_failed', { command: '/login bytedcli' }, 'zh'));
+        expect(text).toBe(t('auth_link.dm_failed', { command: '/login bytedcli cn' }, 'zh'));
         expect(text).not.toContain('https://');
       });
 

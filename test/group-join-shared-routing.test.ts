@@ -547,7 +547,7 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
     expect(ds?.session.lastCallerOpenId).toBeUndefined();
     const entry = ds?.session.replyTargets?.om_join_seed;
     expect(entry?.senderOpenId).toBeUndefined();
-    expect(entry?.participants).toBeUndefined();
+    expect(entry?.participants).toEqual([{ openId: operator, isBot: true }]);
     expect(modules.replyTarget.registryEntryProvesHumanSender(entry)).toBe(false);
   });
 
@@ -574,7 +574,7 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
     const entry = ds?.session.replyTargets?.om_join_seed;
     expect(entry).toBeDefined();
     expect(entry?.senderOpenId).toBeUndefined();
-    expect(entry?.participants).toBeUndefined();
+    expect(entry?.participants).toEqual([{ openId: operator, isBot: true }]);
     expect(replyTarget.registryEntryProvesHumanSender(entry)).toBe(false);
     expect(ds?.ownerOpenId).toBeUndefined();
     expect(ds?.session.ownerOpenId).toBeUndefined();

@@ -70,12 +70,30 @@ describe('schedule precondition compact editor', () => {
   let renderer: TestRenderer.ReactTestRenderer | undefined;
 
   beforeEach(() => {
-  vi.mocked(fetchWorkCalendars).mockResolvedValue({ calendars: [] });
+    vi.mocked(fetchWorkCalendars).mockResolvedValue({ calendars: [] });
     vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
     vi.stubGlobal('document', { addEventListener: vi.fn(), removeEventListener: vi.fn() });
-    vi.stubGlobal('fetch', vi.fn());
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request) => {
+      if (String(input).startsWith('/api/automation-users?')) {
+        return { ok: true, status: 200, json: vi.fn().mockResolvedValue({ users: [] }) } as unknown as Response;
+      }
+      throw new Error(`unexpected fetch: ${String(input)}`);
+    }));
     vi.mocked(fetchGroupsSnapshot).mockResolvedValue({ bots: BOTS, chats: CHATS });
   });
+
+  function mockPreconditionFetch(response: Response): void {
+    vi.mocked(fetch).mockImplementation(async input => {
+      if (String(input).startsWith('/api/automation-users?')) {
+        return { ok: true, status: 200, json: vi.fn().mockResolvedValue({ users: [] }) } as unknown as Response;
+      }
+      return response;
+    });
+  }
+
+  function preconditionFetchCalls() {
+    return vi.mocked(fetch).mock.calls.filter(([input]) => input === '/api/schedules/precondition/test');
+  }
 
   afterEach(() => {
     act(() => renderer?.unmount());
@@ -453,7 +471,7 @@ describe('schedule precondition compact editor', () => {
   });
 
   it('tests the unsaved draft without saving and reports pass accessibly', async () => {
-    vi.mocked(fetch).mockResolvedValue({
+    mockPreconditionFetch({
       ok: true,
       status: 200,
       json: vi.fn().mockResolvedValue({
@@ -479,8 +497,8 @@ describe('schedule precondition compact editor', () => {
       await Promise.resolve();
     });
 
-    expect(fetch).toHaveBeenCalledTimes(1);
-    const [url, init] = vi.mocked(fetch).mock.calls[0]!;
+    expect(preconditionFetchCalls()).toHaveLength(1);
+    const [url, init] = preconditionFetchCalls()[0]!;
     expect(url).toBe('/api/schedules/precondition/test');
     expect(init?.method).toBe('POST');
     expect(JSON.parse(String(init?.body))).toEqual({
@@ -500,7 +518,7 @@ describe('schedule precondition compact editor', () => {
   });
 
   it('tests a new task draft in the directory the daemon resolves for its target chat', async () => {
-    vi.mocked(fetch).mockResolvedValue({
+    mockPreconditionFetch({
       ok: false,
       status: 400,
       json: vi.fn().mockResolvedValue({
@@ -523,7 +541,7 @@ describe('schedule precondition compact editor', () => {
       await Promise.resolve();
     });
 
-    expect(JSON.parse(String(vi.mocked(fetch).mock.calls[0]![1]?.body))).toEqual({
+    expect(JSON.parse(String(preconditionFetchCalls()[0]![1]?.body))).toEqual({
       larkAppId: 'cli_precondition_layout',
       chatId: 'oc_precondition_layout',
       source: { kind: 'inline', script: 'printf 1' },
@@ -533,7 +551,7 @@ describe('schedule precondition compact editor', () => {
   });
 
   it('shows the complete test error code and exit detail', async () => {
-    vi.mocked(fetch).mockResolvedValue({
+    mockPreconditionFetch({
       ok: true,
       status: 200,
       json: vi.fn().mockResolvedValue({
@@ -561,7 +579,9 @@ describe('schedule precondition compact editor', () => {
 
   it('keeps testing locked after the draft changes and discards the stale response', async () => {
     let resolveResponse!: (value: Response) => void;
-    vi.mocked(fetch).mockImplementation(() => new Promise(resolve => { resolveResponse = resolve; }));
+    vi.mocked(fetch).mockImplementation(input => String(input).startsWith('/api/automation-users?')
+      ? Promise.resolve({ ok: true, status: 200, json: vi.fn().mockResolvedValue({ users: [] }) } as unknown as Response)
+      : new Promise(resolve => { resolveResponse = resolve; }));
     const form = await renderForm();
 
     act(() => form.testButton().props.onClick());
@@ -582,7 +602,7 @@ describe('schedule precondition compact editor', () => {
 
     expect(form.testButton().props.disabled).toBe(false);
     expect(textContent(form.root.findByProps({ className: 'schedule-precondition-test-result' }))).toBe('');
-    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(preconditionFetchCalls()).toHaveLength(1);
   });
 
   it('retains the warning for an unreadable legacy precondition', async () => {

@@ -109,7 +109,7 @@ describe('enumerateScratchSecretPaths', () => {
   it('masks the per-person secret dirs even before they exist, so later tokens inside stay hidden', () => {
     mkdirSync(data(), { recursive: true });
     const got = new Set(enumerateScratchSecretPaths({ botmuxHomes: [home()], dataDirs: [data()], sessionId: 'sess-1' }).denyPaths);
-    for (const dir of ['vc-meeting-daemon-auth', 'bytedcli-home', 'oauth-pending', 'cli-identity']) {
+    for (const dir of ['vc-meeting-daemon-auth', 'bytedcli-home', 'oauth-pending', 'cli-identity', 'identity-home']) {
       expect(got.has(join(data(), dir)), dir).toBe(true);
     }
   });
@@ -164,7 +164,7 @@ describe('enumerateScratchSecretPaths', () => {
     // unconditionally, independent of SESSION_DATA_DIR), the enumerator returns
     // at most the HOST's own lark-cli keystores (a real secret it must never
     // un-mask), no file from the absent fake homes.
-    const fixedDirs = ['vc-meeting-daemon-auth', 'bytedcli-home', 'oauth-pending', 'cli-identity'].map(d => join(data(), d));
+    const fixedDirs = ['vc-meeting-daemon-auth', 'bytedcli-home', 'oauth-pending', 'cli-identity', 'identity-home'].map(d => join(data(), d));
     fixedDirs.push(BACKGROUND_JOBS_HOME_ROOT);
     const got = enumerateScratchSecretPaths({ botmuxHomes: [home(), join(root, 'nope')], dataDirs: [data()] }).denyPaths;
     // The detached-job host root is sealed even though it lives outside the
@@ -190,7 +190,7 @@ describe('enumerateScratchSecretPaths', () => {
     // A custom SESSION_DATA_DIR leaves ~/.botmux/data uncreated until the first
     // login, which may happen while a scratch session runs.
     const got = new Set(enumerateScratchSecretPaths({ botmuxHomes: [], dataDirs: [data()], sessionId: 'sess-1' }).denyPaths);
-    for (const dir of ['vc-meeting-daemon-auth', 'bytedcli-home', 'oauth-pending', 'cli-identity']) {
+    for (const dir of ['vc-meeting-daemon-auth', 'bytedcli-home', 'oauth-pending', 'cli-identity', 'identity-home']) {
       expect(got.has(join(data(), dir)), dir).toBe(true);
     }
   });

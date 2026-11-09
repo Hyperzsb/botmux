@@ -122,7 +122,7 @@ describe('agent authorization in a group chat', () => {
     vi.mocked(larkClient.sendUserMessage).mockResolvedValue('om_dm');
     const retry = await (await post()).json() as Record<string, unknown>;
     expect(retry.delivery).toBe('dm');
-    expect(tokens.requestUserAuthorization).toHaveBeenCalledTimes(2);
+    expect(larkCliAuth.beginLarkCliLogin).toHaveBeenCalledTimes(2);
   });
 });
 

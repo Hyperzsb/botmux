@@ -67,7 +67,7 @@ setInterval(() => {}, 1000);
       child.send!({ type: 'init', sessionId, chatId: 'oc_test', rootMessageId: 'om_test',
         workingDir: work, cliId: 'grok', cliPathOverride: fixture, backendType: 'tmux', prompt: firstTurn,
         launchShell: '/bin/bash', env: { PATH: longPath, PROVIDER_TOKEN: 'provider-secret-0123456789' }, envUnset,
-        botName: 'TestBot', locale: 'zh', larkAppId: 'test', larkAppSecret: 'test' });
+        botName: 'TestBot', locale: 'zh', larkAppId: 'cli_test', larkAppSecret: 'test', larkToolBinding: true });
       // Plain deadline loop: `expect.poll` does not exist under `bun test`.
       const deadline = Date.now() + 20_000;
       while (!existsSync(report) && Date.now() < deadline) await new Promise(r => setTimeout(r, 50));

@@ -4829,7 +4829,7 @@ export async function handleCommand(
             t('cmd.login.bytedcli_step2', { site }, loc),
             '',
             t('cmd.login.bytedcli_note', { site }, loc),
-          ].join('\n'), '/login bytedcli');
+          ].join('\n'), `/login bytedcli ${site}`);
           break;
         }
         // `/login tags` — 会话群侧边栏分组（feed group）专项授权：追加

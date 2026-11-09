@@ -237,6 +237,10 @@ function renderedBotConfigLabelKeys(sources: string): Set<string> {
     const ternary = /\btitle=\{tr\([^?(){}]+\?\s*'([^']+)'\s*:\s*'([^']+)'\)\}/.exec(tag.body);
     if (ternary) add([ternary[1]!, ternary[2]!]);
   }
+  for (const tag of openingTags(sources, 'AutomationUserPicker')) {
+    const label = /\blabel=\{tr\('([^']+)'\)\}/.exec(tag.body);
+    if (label) add([label[1]!]);
+  }
   for (const label of elementChildren(sources, 'label')) {
     // label 自己的直接文本（嵌套元素的文本会被 directText 剥掉，不和下面的子元素重复计数）。
     add(trTextKeys(directText(label)));

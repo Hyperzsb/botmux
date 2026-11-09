@@ -1155,7 +1155,9 @@ describe('/rename production routing — must not pre-create a session (review P
   it.each(['idle', 'working'] as const)('/queue publishes this turn and caller identity before IPC while %s', async state => {
     const root = 'om_queue_identity';
     const bot = registerBot({ larkAppId: APP, larkAppSecret: 'fixture', cliId: 'codex-app',
-      allowedUsers: [OWNER], triggerUserAuth: { enabled: true, tools: ['lark-cli'], unauthorized: {} } as any });
+      allowedUsers: [OWNER], triggerUserAuth: {
+        enabled: true, tools: ['lark-cli'], credentialSource: 'local', unauthorized: {},
+      } as any });
     bot.resolvedAllowedUsers = [OWNER];
     const ds = seedThreadSession(root, 'identity queue');
     ds.session.cliId = 'codex-app'; ds.workingDir = '/tmp'; ds.lastScreenStatus = state;
@@ -1165,6 +1167,13 @@ describe('/rename production routing — must not pre-create a session (review P
       model: 'proven', sandboxEngaged: false, loopbackShared: true,
       workerPid: process.pid, workerGeneration: ds.workerGeneration ?? 1, reportedAt: 1,
     };
+    // A live managed worker must prove that the wrapper transport was present
+    // at spawn; otherwise the production admission gate correctly refuses to
+    // publish a person's credentials into an unwrapped process.
+    ds.initConfig = {
+      type: 'init', triggerUserAuth: bot.config.triggerUserAuth,
+      identityTools: ['lark-cli'], larkToolBinding: false,
+    } as any;
     mkdirSync(`${mocks.dataDir}/fixture-lark-home`, { recursive: true });
     const send = vi.fn((message: any) => {
       if (message.type === 'message') {

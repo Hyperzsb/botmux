@@ -6861,7 +6861,8 @@ describe('automation user IPC and schedule selection', () => {
       })).json();
       expect(resolved.user).toMatchObject({ larkAppId: appId, openId: 'ou_runner', unionId: 'on_runner' });
       const response = await fetch(`${base}/api/schedules`, { method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ name: 'Selected identity', schedule: 'every 1h', prompt: 'Check', chatId: 'oc_target', runAsOpenId: 'ou_runner' }) });
+        body: JSON.stringify({ name: 'Selected identity', schedule: 'every 1h', prompt: 'Check', chatId: 'oc_target',
+          workingDir: dir, runAsOpenId: 'ou_runner' }) });
       expect(response.status).toBe(200);
       const task = (await response.json()).task;
       expect(task.runAsUser).toMatchObject({ openId: 'ou_runner', unionId: 'on_runner' });
