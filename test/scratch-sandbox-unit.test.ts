@@ -4,6 +4,7 @@ import {
   remapIntoMerged,
   attachScratchSession,
   canonicalAllowMissing,
+  compileScratchWritableCarveArgs,
 } from '../src/adapters/backend/scratch-sandbox.js';
 import {
   scratchViewPath,
@@ -203,6 +204,18 @@ const diskScratchInPrivateNs = privateMountNsAvailable() && lastJsonLine<boolean
 import { probeScratchMountsInThisNamespace } from './test/helpers/scratch-mount-probe.js';
 console.log(JSON.stringify(probeScratchMountsInThisNamespace('disk')));
 `)) === true;
+
+describe('scratch writable carve compilation', () => {
+  it('rebinds only the trusted session below a shared denied temp root', () => {
+    const shared = '/home/u/.cache/botmux/session-tmp';
+    const own = `${shared}/profile/session-own`;
+    const sibling = `${shared}/profile/session-sibling`;
+    const args = compileScratchWritableCarveArgs([shared], [own]);
+    expect(args).toEqual(['--bind', own, own]);
+    expect(args).not.toContain(sibling);
+    expect(compileScratchWritableCarveArgs([shared], ['/home/u/unrelated'])).toEqual([]);
+  });
+});
 
 describe('prepareScratchSandbox session temp alias', () => {
   it.skipIf(!diskScratchInPrivateNs).each([false, true])('keeps temp files inside COW and deny masks effective (args file: %s)', useBwrapArgsFile => {

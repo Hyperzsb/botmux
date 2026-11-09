@@ -59,7 +59,7 @@ function validCaller(value: unknown): value is TrustedCaller {
   if (caller.requestUserOpenId !== undefined && !nonEmpty(caller.requestUserOpenId)) return false;
   if (caller.requestUserUnionId !== undefined && !nonEmpty(caller.requestUserUnionId)) return false;
   if (caller.senderType !== undefined && caller.senderType !== 'user' && caller.senderType !== 'bot') return false;
-  if (caller.source !== undefined && caller.source !== 'schedule_creator') return false;
+  if (caller.source !== undefined && caller.source !== 'schedule_creator' && caller.source !== 'automation') return false;
   if (caller.source === 'schedule_creator') return nonEmpty(caller.taskId);
   return caller.taskId === undefined;
 }

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { authorizeDelegatedScheduleRun, authorizeScheduleSelfManage } from '../src/core/schedule-delegated-runtime.js';
+import { authorizeDelegatedScheduleRun, authorizeScheduleSelfManage, isDelegatedScheduleRun } from '../src/core/schedule-delegated-runtime.js';
 import type { ScheduleAuthorityRecord } from '../src/services/schedule-authority-store.js';
 import type { ScheduledTask } from '../src/types.js';
 
@@ -28,10 +28,13 @@ const deps = () => ({
 describe('delegated schedule runtime authorization', () => {
   it('rechecks operator and membership then strips generic human identity', async () => {
     const input = deps();
-    await expect(authorizeDelegatedScheduleRun(task, authority, input)).resolves.toEqual({
-      task: { ...task, ownerOpenId: undefined, ownerUnionId: undefined },
-      targetOpenId: 'ou_user_target',
+    const result = await authorizeDelegatedScheduleRun(task, authority, input);
+    expect(result.task).toMatchObject({
+      ...task, runAsUser: undefined, ownerOpenId: undefined, ownerUnionId: undefined,
     });
+    // The in-memory marker carries delegated admission into the scheduler.
+    expect(isDelegatedScheduleRun(result.task)).toBe(true);
+    expect(result.targetOpenId).toBe('ou_user_target');
     expect(input.resolveTargetOpenId).toHaveBeenCalledWith('on_user');
     expect(input.listChatMemberOpenIds).toHaveBeenCalledWith('oc_chat');
   });

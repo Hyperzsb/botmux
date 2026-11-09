@@ -120,6 +120,12 @@ export const BOT_PROXY_ROUTES: readonly ProxyRoute[] = [
   // Trigger-user CLI auth：开关（PUT）+ 状态（GET），校验路径由 daemon 统一持有。
   putBotConfig('trigger-user-auth'),
   putBotConfig('lark-tool-binding'),
+  // Bot-level fixed execution user. Keep the Dashboard path aligned with the
+  // daemon's /api/bot-tool-identity persistence endpoint.
+  putBotConfig('tool-identity'),
+  // Bot-level automatic-turn Run as default (group entry / schedules /
+  // webhooks). The daemon resolves the user's union id and enforces tool scope.
+  putBotConfig('automation-identity'),
   {
     method: 'GET',
     path: botPath('trigger-user-auth-status'),

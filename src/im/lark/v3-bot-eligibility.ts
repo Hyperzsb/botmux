@@ -26,6 +26,7 @@ import { readSessionRowCopiesAcrossStores } from '../../services/session-store.j
 import { comparableSessionDir, unpinnedSessionWorkingDir } from '../../core/working-dir-range.js';
 import type { RunChatBinding } from '../../workflows/v3/grill-state.js';
 import type { V3MainTopicAvailability } from '../../workflows/v3/placement.js';
+import { V3_HANDOFF_IDENTITY_TOOLS } from '../../workflows/v3/run-envelope.js';
 import {
   v3MainTopicAvailability,
   v3OpensTopicSessions,
@@ -142,7 +143,9 @@ export function createLiveV3HandoffIdentityPolicy(bots: readonly BotConfig[]): V
     lookupUnionId: (larkAppId, openId) => resolveUnionIdFromOpenIdStrict(larkAppId, openId),
     botTools: (larkAppId) => {
       const policy = bots.find((bot) => bot.larkAppId === larkAppId)?.triggerUserAuth;
-      return policy?.enabled ? [...policy.tools] : [];
+      return policy?.enabled
+        ? V3_HANDOFF_IDENTITY_TOOLS.filter((tool) => policy.tools.includes(tool))
+        : [];
     },
   };
 }

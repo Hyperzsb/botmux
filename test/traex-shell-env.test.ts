@@ -1,3 +1,7 @@
+import { createCodexAdapter } from '../src/adapters/cli/codex.js';
+import { identityShellTransportEnv, sessionIdentityBinDir, GIT_ASKPASS_BASENAME } from '../src/core/cli-identity.js';
+import { wrapperIdentityTools } from '../src/services/tool-identity-config.js';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { createTraexAdapter } from '../src/adapters/cli/traex.js';
 
@@ -74,5 +78,26 @@ describe('TraeX trigger-user shell environment', () => {
 
     expect(adapter.buildArgs({ ...request, shellSubprocessEnv: shellEnv }))
       .toEqual(adapter.buildArgs(request));
+  });
+});
+
+
+describe('fixed-user shell transport', () => {
+  it.each(['codex', 'traex'] as const)('forwards fixed-user transport and git askpass to %s without sender authentication', cli => {
+    const tools = wrapperIdentityTools({ triggerUserAuth: { enabled: false, tools: [], fallback: 'none' }, toolIdentity: {
+      user: { larkAppId: 'cli_bot', openId: 'ou_fixed', unionId: 'on_fixed' }, tools: ['lark-cli', 'bytedcli'], credentialSource: 'platform',
+    } });
+    const env = identityShellTransportEnv({ enabled: true, tools, fallback: 'none' }, '/tmp/fixed "user"', 'session', false);
+    const adapter = cli === 'codex' ? createCodexAdapter('/bin/codex') : createTraexAdapter('/bin/traex');
+    const forwarded = shellOverrides(adapter.buildArgs({ sessionId: 'session', resume: false, shellSubprocessEnv: env }));
+    const bin = sessionIdentityBinDir('/tmp/fixed "user"', 'session');
+    expect(forwarded).toMatchObject({ SESSION_DATA_DIR: '/tmp/fixed "user"', BOTMUX_IDENTITY_BIN: bin,
+      ZDOTDIR: join(bin, 'shell'), BASH_ENV: join(bin, 'shell', 'bash_env.sh'), GIT_ASKPASS: join(bin, GIT_ASKPASS_BASENAME) });
+  });
+
+  it('keeps native shells unchanged and only adds git askpass for a ByteCloud wrapper', () => {
+    expect(identityShellTransportEnv(undefined, '/tmp/data', 'session', false)).toEqual({});
+    expect(identityShellTransportEnv({ enabled: true, tools: ['lark-cli'], fallback: 'none' }, '/tmp/data', 'session', false))
+      .not.toHaveProperty('GIT_ASKPASS');
   });
 });

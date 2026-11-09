@@ -1,7 +1,18 @@
 import type { ScheduledTask } from '../types.js';
 import type { ScheduleAuthorityRecord } from '../services/schedule-authority-store.js';
 import { isManualScheduleRun, isManualScheduledTurn } from './scheduled-turn-provenance.js';
-import { TRIGGER_USER_AUTH_TOOLS, type TriggerUserAuthTool } from '../services/trigger-user-auth.js';
+import type { TriggerUserAuthTool } from '../services/trigger-user-auth.js';
+
+/**
+ * Persistent delegation currently grants only the legacy bytedcli run scope.
+ * Keep its isolation prerequisite pinned to the two tools that existed when
+ * those grants were issued; adding opt-in larkdev support must not revoke every
+ * stored schedule merely because the global supported-tool enum grew.
+ */
+export const DELEGATED_SCHEDULE_REQUIRED_IDENTITY_TOOLS = [
+  'lark-cli',
+  'bytedcli',
+] as const satisfies readonly TriggerUserAuthTool[];
 
 export interface DelegatedScheduleRuntimeDependencies {
   manualRunId?: string;
@@ -16,8 +27,21 @@ export interface DelegatedScheduleRuntimeDependencies {
   listChatMemberOpenIds: (chatId: string) => Promise<readonly string[]>;
 }
 
+/** In-memory-only marker on an authorized delegated task copy.
+ *
+ * A delegated run must stay anonymous as a current actor even when the bot has
+ * an automation default. A symbol survives object spreads used by
+ * follow-active/recovery, but JSON persistence drops it — restart paths
+ * re-authorize from the host authority record and therefore re-add it. */
+export const DELEGATED_SCHEDULE_RUN = Symbol('botmux.delegatedScheduleRun');
+export type AuthorizedDelegatedScheduleTask = ScheduledTask & { [DELEGATED_SCHEDULE_RUN]?: true };
+
+export function isDelegatedScheduleRun(task: ScheduledTask): boolean {
+  return (task as AuthorizedDelegatedScheduleTask)[DELEGATED_SCHEDULE_RUN] === true;
+}
+
 export interface AuthorizedDelegatedScheduleRun {
-  task: ScheduledTask;
+  task: AuthorizedDelegatedScheduleTask;
   targetOpenId: string;
 }
 
@@ -72,7 +96,9 @@ export async function authorizeDelegatedScheduleRun(
     : isManualScheduleRun(authority.task, deps.manualRunId));
   if (authority.state !== 'active' && !manual) throw new Error(`schedule authority state is ${authority.state}`);
   if (!deps.runEnabled) throw new Error('delegated schedule execution is revoked by host policy');
-  if (!TRIGGER_USER_AUTH_TOOLS.every(tool => deps.triggerUserAuthTools.includes(tool))) {
+  if (!DELEGATED_SCHEDULE_REQUIRED_IDENTITY_TOOLS.every(
+    tool => deps.triggerUserAuthTools.includes(tool),
+  )) {
     throw new Error('delegated schedule requires triggerUserAuth isolation for every identity tool');
   }
   if (authority.runScopes.some(scope => !deps.hostRunScopes.includes(scope)
@@ -85,7 +111,18 @@ export async function authorizeDelegatedScheduleRun(
   const targetOpenId = await revalidateController(task, authority, deps);
   deps.assertAuthorityCurrent?.();
   assertBotGrantStillActive(authority, deps.validateBotGrant);
-  return { task: { ...task, ownerOpenId: undefined, ownerUnionId: undefined }, targetOpenId };
+  return {
+    task: {
+      ...task,
+      // A delegated run's authority is its signed grant, not the task creator
+      // or any Run as selection. Keep both out of current-actor provenance.
+      runAsUser: undefined,
+      ownerOpenId: undefined,
+      ownerUnionId: undefined,
+      [DELEGATED_SCHEDULE_RUN]: true,
+    },
+    targetOpenId,
+  };
 }
 
 export async function authorizeScheduleSelfManage(

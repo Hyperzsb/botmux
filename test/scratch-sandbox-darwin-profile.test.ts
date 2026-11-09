@@ -5,7 +5,11 @@
  * scripts/scratch-sandbox-darwin-probe.mjs.
  */
 import { describe, expect, it } from 'vitest';
-import { buildMacScratchProfile, macLarkKeystoreDenies } from '../src/adapters/backend/scratch-sandbox-darwin.js';
+import {
+  buildMacScratchProfile,
+  macLarkKeystoreDenies,
+  macScratchDenyHostsWritableCarve,
+} from '../src/adapters/backend/scratch-sandbox-darwin.js';
 
 const join = (lines: string[]) => lines.join('\n');
 const idx = (p: string, rule: string) => p.indexOf(rule);
@@ -78,6 +82,30 @@ describe('buildMacScratchProfile — three-stage credential sealing', () => {
     // Secrets stay sealed: the final file deny still comes last.
     expect(idx(p, '(deny file-read* (subpath "/Users/u/.botmux/bots.json"))'))
       .toBeGreaterThan(idx(p, '(allow file-read-metadata (literal "/Users/u/.botmux"))'));
+  });
+
+  it('seals sibling session-tmp reads and re-opens only the trusted session after cache write seals', () => {
+    const shared = '/Users/u/.cache/botmux/session-tmp';
+    const own = `${shared}/profile/session-own`;
+    const sibling = `${shared}/profile/session-sibling`;
+    const p = join(buildMacScratchProfile({
+      net: true,
+      authorityRootDenies: [shared],
+      writable: ['/clone/home'],
+      fileWriteDenyPaths: ['/Users/u/.cache'],
+      writableCarvePaths: [own],
+    }));
+    const sharedReadDeny = idx(p, `(deny file-read* (subpath "${shared}")`);
+    const cacheWriteDeny = idx(p, '(deny file-write* (subpath "/Users/u/.cache")');
+    const ownRead = idx(p, `(allow file-read* (subpath "${own}")`);
+    const ownWrite = idx(p, `(allow file-write* (subpath "${own}")`);
+    expect(sharedReadDeny).toBeGreaterThan(0);
+    expect(p).not.toContain(`allow file-read* (subpath "${sibling}")`);
+    expect(ownRead).toBeGreaterThan(sharedReadDeny);
+    expect(ownWrite).toBeGreaterThan(cacheWriteDeny);
+    expect(macScratchDenyHostsWritableCarve(shared, [own])).toBe(true);
+    expect(macScratchDenyHostsWritableCarve('/Users/u/.cache', [own])).toBe(true);
+    expect(macScratchDenyHostsWritableCarve(sibling, [own])).toBe(false);
   });
 
   it('still denies bots.json reads through the farm symlink (final file deny wins)', () => {

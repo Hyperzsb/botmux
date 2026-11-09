@@ -826,15 +826,19 @@ export function buildBotmuxEnvAssignments(
  * BOTMUX_CORE_ONLY / SESSION_DATA_DIR BEFORE this script runs (and the argv env
  * assignments only land at the final `exec /usr/bin/env`, too late). So the daemon
  * computes it from opts.env via resolveBotmuxWrapperBinDir and single-quotes it in.
+ * `identityBin`, when supplied, is also host-resolved and restored before the
+ * botmux bin after rcfile load. Keep the rest of the rcfile's PATH so its
+ * provider/tool directories remain available without copying daemon PATH.
  */
-export function shellWrapperScript(binDir: string, kind: ShellKind = 'sh'): string {
-  if (kind === 'fish') return fishShellWrapperScript(binDir);
-  const q = `'${binDir.replace(/'/g, `'\\''`)}'`;
+export function shellWrapperScript(binDir: string, kind: ShellKind = 'sh', identityBin?: string): string {
+  if (kind === 'fish') return fishShellWrapperScript(binDir, identityBin);
+  const q = [...(identityBin ? [identityBin] : []), binDir]
+    .map(dir => `'${dir.replace(/'/g, `'\\''`)}'`).join(':');
   return `cd -- "$1" && shift && ${PANE_ENV_UNSET_CLAUSE} && ${NON_INTERACTIVE_SHELL_ENV_UNSET_CLAUSE} && export PATH=${q}:"$PATH" && exec /usr/bin/env "$@"`;
 }
 
-function fishShellWrapperScript(binDir: string): string {
-  const q = fishSingleQuote(binDir);
+function fishShellWrapperScript(binDir: string, identityBin?: string): string {
+  const q = [...(identityBin ? [identityBin] : []), binDir].map(fishSingleQuote).join(' ');
   return [
     'cd -- $argv[1]; or exit',
     'set -e argv[1]',
@@ -883,10 +887,11 @@ export function diagnosticShellScript(kind: ShellKind = 'sh'): string {
  * it via accessSync(). `binDir` is the HOST-RESOLVED wrapper bin dir (same
  * literal-baking rationale as shellWrapperScript — pane can't resolve it).
  */
-export function buildDebugKeepShellScript(shellPath: string, binDir: string, kind: ShellKind = 'sh'): string {
-  if (kind === 'fish') return buildFishDebugKeepShellScript(shellPath, binDir);
+export function buildDebugKeepShellScript(shellPath: string, binDir: string, kind: ShellKind = 'sh', identityBin?: string): string {
+  if (kind === 'fish') return buildFishDebugKeepShellScript(shellPath, binDir, identityBin);
   const safeShell = shellPath.replace(/'/g, `'\\''`);
-  const qBin = `'${binDir.replace(/'/g, `'\\''`)}'`;
+  const qBin = [...(identityBin ? [identityBin] : []), binDir]
+    .map(dir => `'${dir.replace(/'/g, `'\\''`)}'`).join(':');
   return [
     'cd -- "$1" && shift',
     // Same managed-env cleanup as shellWrapperScript — so neither the CLI nor
@@ -902,9 +907,9 @@ export function buildDebugKeepShellScript(shellPath: string, binDir: string, kin
   ].join('; ');
 }
 
-function buildFishDebugKeepShellScript(shellPath: string, binDir: string): string {
+function buildFishDebugKeepShellScript(shellPath: string, binDir: string, identityBin?: string): string {
   const safeShell = fishSingleQuote(shellPath);
-  const qBin = fishSingleQuote(binDir);
+  const qBin = [...(identityBin ? [identityBin] : []), binDir].map(fishSingleQuote).join(' ');
   return [
     'cd -- $argv[1]; or exit',
     'set -e argv[1]',

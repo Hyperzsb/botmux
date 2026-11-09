@@ -89,6 +89,28 @@ function taskHash(task: ScheduledTask): string {
   return computeInputHash(canonicalScheduleInput(task));
 }
 
+/** V1 did not include the V2 `runAsUser` field in the canonical schedule
+ * input. A V2 row that is later updated by V1 therefore keeps the identity in
+ * task_json but receives this older hash. */
+function v1TaskHash(task: ScheduledTask): string {
+  const current = canonicalScheduleInput(task) as Record<string, unknown>;
+  const { runAsUser: _v2Only, ...v1Canonical } = current;
+  return computeInputHash(v1Canonical);
+}
+
+function hasValidRunAsUser(task: ScheduledTask, expectedAppId: string): boolean {
+  const user = task.runAsUser as unknown;
+  if (!user || typeof user !== 'object' || Array.isArray(user)) return false;
+  const record = user as Record<string, unknown>;
+  return typeof record.larkAppId === 'string'
+    && record.larkAppId === expectedAppId
+    && /^cli_[A-Za-z0-9_-]+$/.test(record.larkAppId)
+    && typeof record.openId === 'string'
+    && /^ou_[A-Za-z0-9_-]+$/.test(record.openId)
+    && typeof record.unionId === 'string'
+    && /^on_[A-Za-z0-9_-]+$/.test(record.unionId);
+}
+
 function stateFor(task: ScheduledTask): ScheduleAuthorityState {
   if (!task.enabled) return task.disabledReason === 'once_completed' ? 'completed' : 'paused';
   return 'active';
@@ -186,6 +208,31 @@ function migrateLegacyGrantUnique(db: DatabaseSyncLike): void {
   db.exec(`ALTER TABLE ${replacement} RENAME TO schedule_authority_tasks;`);
 }
 
+/** Repair only the downgrade/re-upgrade shape that can be proven byte-for-byte:
+ * task_json has a valid V2 run-as identity and every other canonical field
+ * still matches V1's hash. Arbitrary mismatches remain untouched so getRecord
+ * continues to fail closed. Called under the schema BEGIN IMMEDIATE lock. */
+function migrateV1RunAsHashes(db: DatabaseSyncLike): void {
+  const rows = db.prepare(`
+    SELECT app_id, task_id, task_json, canonical_hash FROM schedule_authority_tasks
+  `).all() as Array<Record<string, unknown>>;
+  const update = db.prepare(`
+    UPDATE schedule_authority_tasks SET canonical_hash = ?
+    WHERE app_id = ? AND task_id = ? AND canonical_hash = ?
+  `);
+  for (const row of rows) {
+    const appId = String(row.app_id);
+    const taskId = String(row.task_id);
+    const task = parseTask(row.task_json, appId);
+    const storedHash = String(row.canonical_hash);
+    const currentHash = taskHash(task);
+    if (storedHash === currentHash || !hasValidRunAsUser(task, appId)) continue;
+    if (storedHash !== v1TaskHash(task)) continue;
+    const result = update.run(currentHash, appId, taskId, storedHash);
+    if (Number(result.changes) !== 1) throw new Error('schedule_authority_hash_migration_conflict');
+  }
+}
+
 export class ScheduleAuthorityStore {
   private constructor(private readonly db: DatabaseSyncLike) {}
 
@@ -236,6 +283,7 @@ export class ScheduleAuthorityStore {
           PRIMARY KEY (app_id, task_id)
         );
       `);
+      migrateV1RunAsHashes(db);
       db.exec('COMMIT;');
       return new ScheduleAuthorityStore(db);
     } catch (error) {

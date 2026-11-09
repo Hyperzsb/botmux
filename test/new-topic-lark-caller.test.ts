@@ -55,7 +55,7 @@ const gatewayCaller = compile(extract(gateway, 'currentGatewayCallerOpenId'), 'c
 });
 const gateStart = ipc.indexOf('  const sender = delegated?.targetOpenId ?? originSender;');
 const gateSource = ipc.slice(gateStart, ipc.indexOf('  const cached =', gateStart));
-const larkSenderGate = new Function('delegated', 'originSender', 'jsonRes', 'res', gateSource + '; return {status:200,sender};');
+const larkSenderGate = new Function('delegated', 'originSender', 'turnId', 'jsonRes', 'res', gateSource + '; return {status:200,sender};');
 const callerSource = extract(daemon, 'startAutoWorktreePending');
 
 const helperSource = extract(card, 'runAutoWorktreeCommit');
@@ -169,7 +169,7 @@ async function runCase(name: string, options: Record<string, any> = {}) {
         send: (value: any) => {msg=value;}});
       const callerOpenId=originCaller(msg,ds,gatewayCaller);
       ds.managedTurnOrigin = {turnId, trustedCaller:msg.trustedCaller,callerOpenId};
-      const decision=larkSenderGate(undefined,callerOpenId,(_res: any,status: number,body: any)=>({status,...body}),{});
+      const decision=larkSenderGate(undefined,callerOpenId,turnId,(_res: any,status: number,body: any)=>({status,...body}),{});
       const probe={prepared, trustedCallerAtFork:trustedCaller??null,
         publishedTrustedCaller:msg.trustedCaller, callerAfterPublication:callerOpenId??null,
         replyTargetSender:ds.session.replyTargets[turnId].senderOpenId,
@@ -210,7 +210,7 @@ async function runCase(name: string, options: Record<string, any> = {}) {
     assert.equal(ds.pendingPrompt, 'new ticket', 'failure retains the opening message');
     assert.equal(errors.length, 1, name + ': failure is logged');
   } else {
-    assert.equal(errors.length, 0, name + ': no unexpected error');
+    assert.equal(errors.length, 0, name + ': no unexpected error: ' + errors.join(' | '));
     assert.equal(ds.pendingRepo, false);
   }
   if (options.fallback) assert.equal(ds.session.autoWorktreeFallbackDir, '/test/base');

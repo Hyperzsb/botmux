@@ -425,7 +425,12 @@ export function workflowDelegationRefusal(input: {
   const authority = record.authority;
   if (!run?.identity || run.identity.unionId !== authority.unionId || run.identity.openId !== authority.openId
     || authority.appId !== run.sourceLarkAppId
-    || authority.tools.some((tool) => !run!.identity!.tools.includes(tool))) return 'identity_mismatch';
+    // The generic dispatch authority also supports larkdev, while the durable
+    // v3 run-envelope protocol intentionally freezes only its two established
+    // handoff tools. Reject a widened authority instead of silently treating it
+    // as part of the older workflow contract.
+    || authority.tools.some((tool) => !V3_HANDOFF_IDENTITY_TOOLS.includes(tool as V3HandoffIdentityTool)
+      || !run!.identity!.tools.includes(tool as V3HandoffIdentityTool))) return 'identity_mismatch';
   if (run.chatId !== record.chatId || (!passedOn && run.sourceLarkAppId !== record.sourceAppId)) return 'chat_mismatch';
   if (!run.approvedBots.has(input.receiverLarkAppId)) return 'bot_not_approved';
 

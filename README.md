@@ -1,5 +1,7 @@
 # botmux
 
+This repository is a business-maintained fork of botmux.
+
 <p align="center">
   <img src="cover.svg" alt="botmux" width="760">
 </p>

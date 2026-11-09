@@ -147,6 +147,23 @@ describe('canRunDaemonCommand gate', () => {
     expect(canRunDaemonCommand('ct1', 'oc_1', 'ou_guest', undefined, '/login')).toBe(false);
   });
 
+  it('fixed assigned user can run /login at talk level, but another talk-only user cannot', () => {
+    const bot = getBot('ct1');
+    bot.config.canTalkDaemonCommands = undefined;
+    bot.config.triggerUserAuth = { enabled: false, tools: [], fallback: 'none' };
+    bot.config.toolIdentity = {
+      user: { larkAppId: 'ct1', openId: 'ou_guest', unionId: 'on_guest' },
+      tools: ['bytedcli'], credentialSource: 'local',
+    };
+    bot.config.chatGrants = { oc_1: ['ou_guest', 'ou_other'] };
+
+    expect(canTalk('ct1', 'oc_1', 'ou_guest')).toBe(true);
+    expect(canOperate('ct1', 'oc_1', 'ou_guest')).toBe(false);
+    expect(canRunDaemonCommand('ct1', 'oc_1', 'ou_guest', undefined, '/login')).toBe(true);
+    expect(canTalk('ct1', 'oc_1', 'ou_other')).toBe(true);
+    expect(canRunDaemonCommand('ct1', 'oc_1', 'ou_other', undefined, '/login')).toBe(false);
+  });
+
   it('trigger-user auth never lowers unrelated daemon commands to canTalk', () => {
     const bot = getBot('ct1');
     bot.config.canTalkDaemonCommands = undefined;

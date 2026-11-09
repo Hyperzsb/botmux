@@ -1,9 +1,45 @@
 import React from 'react';
 import TestRenderer, { act } from 'react-test-renderer';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { AutoStartControls } from '../src/dashboard/web/bot-defaults-page.js';
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
+
+afterEach(() => vi.unstubAllGlobals());
+
+describe('Bot 默认设置 — 自动开工执行身份', () => {
+  it('selects a verified user, saves the normalized identity, and clears it to the default', async () => {
+    const user = { larkAppId: 'app_identity_ui', openId: 'ou_verified', unionId: 'on_verified' };
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      const body = url.startsWith('/api/automation-users') ? { users: [user] }
+        : { ok: true, automationIdentity: JSON.parse(String(init?.body)).automationUserOpenId ? { user, tools: ['lark-cli'] } : null };
+      return { ok: true, status: 200, json: async () => body };
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const patchBot = vi.fn();
+    let renderer!: TestRenderer.ReactTestRenderer;
+    await act(async () => {
+      renderer = TestRenderer.create(React.createElement(AutoStartControls, {
+        bot: { larkAppId: user.larkAppId, autoStartOnGroupJoin: true }, patchBot,
+        putCardPref: vi.fn(async () => ({ ok: true, status: 200, body: { ok: true } })),
+      }));
+    });
+    const field = () => renderer.root.findByProps({ 'data-field': 'automation-identity' });
+    const select = () => field().findByType('select');
+    expect(select().props.value).toBe('');
+    expect(select().findAllByType('option').map(option => option.props.value)).toEqual(['', user.openId]);
+    act(() => select().props.onChange({ currentTarget: { value: user.openId } }));
+    await flushAction(() => renderer.root.findByProps({ 'data-action': 'save-automation-identity' }).props.onClick());
+    expect(fetchMock).toHaveBeenCalledWith('/api/bots/app_identity_ui/automation-identity', expect.objectContaining({
+      method: 'PUT', body: JSON.stringify({ automationUserOpenId: user.openId }),
+    }));
+    expect(patchBot).toHaveBeenLastCalledWith(user.larkAppId, { automationIdentity: { user, tools: ['lark-cli'] } });
+    act(() => select().props.onChange({ currentTarget: { value: '' } }));
+    await flushAction(() => renderer.root.findByProps({ 'data-action': 'save-automation-identity' }).props.onClick());
+    expect(patchBot).toHaveBeenLastCalledWith(user.larkAppId, { automationIdentity: null });
+    act(() => renderer.unmount());
+  });
+});
 
 function renderControls(appId: string, defaultSeed: string) {
   const putCardPref = vi.fn(async () => ({ ok: true, status: 200, body: { ok: true } }));

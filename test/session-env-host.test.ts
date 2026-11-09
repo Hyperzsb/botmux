@@ -63,7 +63,10 @@ describe('machine baseline views', () => {
 
   it('bot view applies the global layer under the bot layer and the identity lock', () => {
     process.env.SE_PLAIN = 'plain-value';
-    botConfig.current = { larkAppId: 'app_a', cliId: 'claude-code', env: { SE_PLAIN: 'bot-value', ZDOTDIR: '/z' }, envUnset: ['LANG'] };
+    botConfig.current = {
+      larkAppId: 'app_a', cliId: 'claude-code', larkToolBinding: true,
+      env: { SE_PLAIN: 'bot-value', ZDOTDIR: '/z' }, envUnset: ['LANG'],
+    };
     const view = botSessionEnvView(botConfig.current as any);
     expect(view.rows.find(r => r.key === 'SE_PLAIN')).toMatchObject({ source: 'bot', state: 'set', entry: 'set', value: 'bot-value' });
     expect(view.identityLockedKeys).toEqual(['ZDOTDIR', 'BASH_ENV']);

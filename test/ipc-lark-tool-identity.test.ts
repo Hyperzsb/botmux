@@ -45,7 +45,8 @@ beforeEach(async () => {
       preexistingProcessIdentities: [`${process.pid}:${readProcessStartIdentity(process.pid)}`] },
   };
   vi.spyOn(workerPool, 'findActiveBySessionId').mockImplementation(id => id === 'tool-session' ? session : undefined);
-  vi.spyOn(bots, 'getBot').mockReturnValue({ config: { larkAppId: 'cli_bound', larkAppSecret: 'bound-secret' } } as any);
+  // 绑定现为显式 opt-in（plan §3.4）：路由只服务显式绑定的会话。
+  vi.spyOn(bots, 'getBot').mockReturnValue({ config: { larkAppId: 'cli_bound', larkAppSecret: 'bound-secret', larkToolBinding: true } } as any);
   botToken.mockReset().mockResolvedValue('bound-bot-token');
   vi.spyOn(bots, 'getBotClient').mockReturnValue({ tokenManager: { getTenantAccessToken: botToken } } as unknown as Client);
   vi.spyOn(identities, 'resolveVerifiedUserIdentity').mockResolvedValue({ openId: 'ou_sender', type: 'user' } as any);
@@ -270,6 +271,31 @@ describe('session application identity route', () => {
     expect(await user.json()).toEqual({ ok: true, appId: 'cli_bound', mode: 'user', credentialType: 'user_access_token', credential: 'bound-user-token' });
     expect(tokens.resolveUserToken).toHaveBeenCalledWith('cli_bound', 'bound-secret', 'feishu', 'ou_sender');
   });
+  it('refuses managed Lark user identity when the frozen automation scope excludes lark-cli', async () => {
+    session.session.replyTargets = {
+      om_turn: {
+        senderOpenId: 'ou_sender',
+        automationUser: { larkAppId: 'cli_bound', openId: 'ou_sender', unionId: 'on_sender' },
+        automationIdentitySource: 'bot_default',
+        automationIdentityTools: ['bytedcli'],
+      },
+    };
+    const response = await request('user');
+    expect(response.status).toBe(403);
+    expect(await response.json()).toMatchObject({ ok: false, error: 'automation_tool_scope_excluded' });
+    expect(tokens.resolveUserToken).not.toHaveBeenCalled();
+    expect(identities.resolveVerifiedUserIdentity).not.toHaveBeenCalled();
+    const requestAuth = vi.spyOn(tokens, 'requestUserAuthorization');
+    const auth = await fetch(`http://127.0.0.1:${ipc!.port}/api/sessions/tool-session/auth-request`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-botmux-lark-session': binding.accessKey },
+      body: JSON.stringify({ scopes: ['im:chat:read'] }),
+    });
+    expect(auth.status).toBe(403);
+    expect(await auth.json()).toMatchObject({ ok: false, error: 'automation_tool_scope_excluded' });
+    expect(requestAuth).not.toHaveBeenCalled();
+  });
+
   it('uses each document turn author’s own grant without a normal message reply target', async () => {
     session.session = {
       sessionId: 'tool-session', status: 'active', ownerOpenId: 'ou_owner',
@@ -545,11 +571,11 @@ describe('session application identity route', () => {
     expect(res.status).toBe(403);
     expect(await res.json()).toEqual({ ok: false, error: 'lark_tool_session_unavailable' });
   });
-  it('allows identity request when larkToolBinding is unconfigured on the bot (default on)', async () => {
+  it('refuses identity request when larkToolBinding is unconfigured (binding is explicit opt-in; tool stays native)', async () => {
     vi.mocked(bots.getBot).mockReturnValue({ config: { larkAppId: 'cli_bound', larkAppSecret: 'bound-secret' } } as any);
     const res = await request('bot');
-    expect(res.status).toBe(200);
-    expect(await res.json()).toMatchObject({ ok: true, appId: 'cli_bound', mode: 'bot', credential: 'bound-bot-token' });
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ ok: false, error: 'lark_tool_session_unavailable' });
   });
 });
 
@@ -557,7 +583,7 @@ describe('platform-issued user credentials in a bound session', () => {
   // Nobody but the bot owner can grant the bot's own application (its
   // availability range excludes them), so their --as user comes from the platform.
   const PLATFORM = { platformUrl: 'https://platform.example.test', machineToken: 'mt', machineId: 'm-1' };
-  const platformBot = (credentialSource?: string) => ({ larkAppId: 'cli_bound', larkAppSecret: 'bound-secret',
+  const platformBot = (credentialSource?: string) => ({ larkAppId: 'cli_bound', larkAppSecret: 'bound-secret', larkToolBinding: true,
     triggerUserAuth: { enabled: true, tools: ['lark-cli'], fallback: 'none', ...(credentialSource ? { credentialSource } : {}) } });
   let grants: any[];
   beforeEach(() => {

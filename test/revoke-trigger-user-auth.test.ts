@@ -596,15 +596,11 @@ describe('cli epoch gates', () => {
   });
   const LARK_LOGIN = JSON.stringify({ verification_url: 'https://example.test/lark', device_code: 'dc' });
 
-  function plantIssuer(openId: string) {
-    const root = join(dataDir(), `lark-cli-issuer-${openId}`);
-    mkdirSync(join(root, '.lark-cli'), { recursive: true });
-    mkdirSync(join(root, '.local', 'share', 'lark-cli'), { recursive: true });
-    writeFileSync(join(root, '.lark-cli', 'config.json'), JSON.stringify({
+  function writePersonalAppConfig(home: string) {
+    mkdirSync(join(home, '.lark-cli'), { recursive: true });
+    writeFileSync(join(home, '.lark-cli', 'config.json'), JSON.stringify({
       apps: [{ appId: APP, brand: 'feishu', lang: 'zh', users: [] }],
     }));
-    writeFileSync(join(root, '.local', 'share', 'lark-cli', 'master.key'), 'k');
-    writeFileSync(join(root, '.local', 'share', 'lark-cli', `appsecret_${APP}.enc`), 's');
   }
 
   function writeLarkToken(home: string, openId: string) {
@@ -645,7 +641,17 @@ describe('cli epoch gates', () => {
 
   it('drops a lark-cli login whose CLI returns after revoke, and a later login stamps the new epoch', async () => {
     const { lark, epoch } = await loadRevoke();
-    plantIssuer(ALICE);
+    lark.__setLarkCliAppSetupRunnerForTest(async home => {
+      writePersonalAppConfig(home);
+      return {
+        ok: true,
+        stdout: 'https://open.feishu.cn/page/cli?user_code=PERSONAL',
+        stderr: '',
+      };
+    });
+    expect(await lark.beginLarkCliLogin(ALICE)).toMatchObject({ stage: 'app-setup' });
+    expect(lark.hasPersonalLarkCliApp(ALICE)).toBe(true);
+
     scriptSpawn = (args, home) => {
       if (!args.includes('--no-wait') || !home) return undefined;
       writeLarkToken(home, ALICE);
@@ -654,7 +660,11 @@ describe('cli epoch gates', () => {
     };
     expect(await lark.beginLarkCliLogin(ALICE)).toBeNull();
     expect(lark.hasLarkCliHome(ALICE)).toBe(false);
+    expect(lark.pendingLarkCliChallenge(ALICE)).toBeNull();
 
+    const setupAgain = await lark.beginLarkCliLogin(ALICE);
+    expect(setupAgain).toMatchObject({ stage: 'app-setup' });
+    expect(lark.hasPersonalLarkCliApp(ALICE)).toBe(true);
     scriptSpawn = (args, home) => {
       if (!args.includes('--no-wait') || !home) return undefined;
       writeLarkToken(home, ALICE);
@@ -662,6 +672,7 @@ describe('cli epoch gates', () => {
     };
     const again = await lark.beginLarkCliLogin(ALICE);
     expect(again?.authUrl).toBe('https://example.test/lark');
+    expect(again?.stage).toBe('user-login');
     const home = lark.larkCliHomeFor(ALICE);
     expect(readFileSync(join(home, '.botmux-auth-epoch'), 'utf8').trim()).toBe('1');
     expect(lark.hasLarkCliHome(ALICE)).toBe(true);

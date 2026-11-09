@@ -652,14 +652,25 @@ describe('dashboard bot payload helpers', () => {
     expect(empty.get('cli_anything')).toBeUndefined();
   });
 
+  it('shows the explicit opt-in binding default consistently online and offline', () => {
+    // 新契约：绑定是显式 opt-in。未配置/仅开按人授权都显示为未绑定（原生宿主行为），
+    // 旧的「按人授权反向决定绑定」关系已移除（plan §3.4）。
+    const triggerUserAuth = { enabled: true, tools: ['lark-cli'], fallback: 'none' };
+    const raw = { triggerUserAuth };
+    expect(botDefaultsPayload({ larkAppId: 'cli_test' }, raw).larkToolBinding).toBe(false);
+    expect(botDefaultsPayload({ larkAppId: 'cli_test' }, sparseOverridesFromRawBotConfig(raw)).larkToolBinding).toBe(false);
+    expect(botDefaultsPayload({ larkAppId: 'cli_test' }, { ...raw, larkToolBinding: true }).larkToolBinding).toBe(true);
+    expect(botDefaultsPayload({ larkAppId: 'cli_test' }, { triggerUserAuth: { enabled: true, tools: ['bytedcli'] } }).larkToolBinding).toBe(false);
+  });
+
   it('offline recovery rows keep a disabled larkToolBinding from raw bots.json', () => {
     // daemon 离线行由 sparseOverridesFromRawBotConfig 从 bots.json 摘字段喂给
-    // botDefaultsPayload；该字段缺省即开，显式 false 丢掉就会在离线时回显成开。
+    // botDefaultsPayload；未配置即关闭（显式 opt-in），只有保存的 true 需要带回。
     expect(sparseOverridesFromRawBotConfig({ larkToolBinding: false }).larkToolBinding).toBe(false);
     expect(sparseOverridesFromRawBotConfig({ larkToolBinding: true }).larkToolBinding).toBe(true);
-    // 未配置 / 非法手改值：undefined，交由 payload 层按缺省（开）归一化。
-    expect(sparseOverridesFromRawBotConfig({}).larkToolBinding).toBeUndefined();
-    expect(sparseOverridesFromRawBotConfig({ larkToolBinding: 'off' }).larkToolBinding).toBeUndefined();
+    // 未配置 / 非法手改值：未保存 true，统一按未绑定（关闭）回显。
+    expect(sparseOverridesFromRawBotConfig({}).larkToolBinding).toBe(false);
+    expect(sparseOverridesFromRawBotConfig({ larkToolBinding: 'off' }).larkToolBinding).toBe(false);
 
     const offlineRow = (raw: Record<string, unknown>) => botDefaultsPayload(
       { larkAppId: 'cli_offline' },
@@ -667,7 +678,7 @@ describe('dashboard bot payload helpers', () => {
     );
     expect(offlineRow({ larkToolBinding: false }).larkToolBinding).toBe(false);
     expect(offlineRow({ larkToolBinding: true }).larkToolBinding).toBe(true);
-    expect(offlineRow({}).larkToolBinding).toBe(true);
+    expect(offlineRow({}).larkToolBinding).toBe(false);
 
     // 一起搬迁的既有字段保持逐字段透传，归一化仍由 payload 层负责。
     expect(sparseOverridesFromRawBotConfig({ askOptionLayout: { layout: 'two-col' } }).askOptionLayout)
@@ -719,4 +730,12 @@ describe('mergeBotOncallFields (#2037 codexProfile list round-trip)', () => {
     expect(merged.model).toBe('new');
     expect(merged.turnTimeoutMs).toBe(60000);
   });
+});
+
+
+it('shows the persisted fixed user on an offline bot with the same shape as a live bot', () => {
+  const user = { larkAppId: 'cli_test', openId: 'ou_fixed', unionId: 'on_fixed' };
+  const raw = { larkAppId: 'cli_test', toolIdentity: { defaultUser: user, tools: ['lark-cli'], credentialSource: 'platform' } };
+  const payload = botDefaultsPayload(raw, sparseOverridesFromRawBotConfig(raw));
+  expect(payload.toolIdentity).toEqual({ user, tools: ['lark-cli'], credentialSource: 'platform' });
 });

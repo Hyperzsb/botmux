@@ -1,5 +1,9 @@
 import { config } from '../config.js';
 import { outputDeliveryJournal } from '../services/output-delivery-journal.js';
+import { normalizeToolIdentityPolicy } from '../services/tool-identity-config.js';
+import { assertAutomationUserAllowed, assertAutomationSession, automationTrustedCaller, resolveAutomationIdentity, type AutomationUser } from '../services/automation-identity.js';
+import { explicitAutomationIdentityTools } from '../services/automation-identity-config.js';
+import { buildAutomaticTurnDecision } from './tool-identity-decision.js';
 import { armTriggerStreamingCard } from './trigger-streaming-card.js';
 import { messageListenerTaskAnchor } from './message-listener-silence.js';
 import { rememberTriggerTurn } from './turn-origin.js';
@@ -21,6 +25,7 @@ import { markSessionActivity } from './session-activity.js';
 import {
   closeSessionForBackgroundCleanup,
   forkWorker,
+  prepareExternalTurnIdentity,
   getCurrentCliVersion,
   getDaemonBootId,
   hasQueuedActivationAdmissionGate,
@@ -54,6 +59,11 @@ export interface TriggerSessionDeps {
  * public TriggerRequest schema: an untrusted connector must not choose a turn
  * identity that participates in durable delivery reconciliation. */
 export interface TriggerSessionInternalOptions {
+  /** Host-resolved connector policy, never a public trigger field. */
+  executionUser?: AutomationUser;
+  /** Resolve the bot-level automation default when the connector has no
+   *  explicit Run as selection. The resolved user is frozen on this turn. */
+  useBotAutomationDefault?: boolean;
   stableTurnId?: string;
   /** Trusted dashboard listener execution; never accepted from the public trigger API. */
   messageListenerRun?: import('./message-listener-silence.js').SilentMessageListenerRun;
@@ -848,6 +858,30 @@ async function triggerSessionTurnAdmitted(
   const stableTurnId = internal?.stableTurnId?.trim();
   const triggerId = stableTurnId || `trg_${randomUUID()}`;
   rememberTriggerTurn(triggerId, req.source.type);
+  let executionUser = internal?.executionUser;
+  let trustedCaller = executionUser ? automationTrustedCaller(executionUser) : undefined;
+  let executionUserSource: import('../services/automation-identity.js').AutomationIdentitySource | undefined =
+    executionUser ? 'connector' : undefined;
+  let executionUserTools: import('../services/trigger-user-auth.js').TriggerUserAuthTool[] | undefined;
+  const prepareExecutionIdentity = async (target: DaemonSession): Promise<void> => {
+    if (!executionUser) return;
+    executionUserTools ??= explicitAutomationIdentityTools(getBot(target.larkAppId).config);
+    assertAutomationSession(executionUser, target, executionUserTools);
+    inheritTriggerReplyAnchor(target, triggerId);
+    target.session.replyTargets ??= {};
+    target.session.replyTargets[triggerId] = { ...target.session.replyTargets[triggerId],
+      updatedAt: new Date().toISOString(), senderOpenId: executionUser.openId, automationUser: executionUser,
+      toolIdentityDecision: buildAutomaticTurnDecision({
+        user: executionUser,
+        source: executionUserSource,
+        tools: executionUserTools,
+        policy: normalizeToolIdentityPolicy(getBot(target.larkAppId).config),
+      }),
+      ...(executionUserSource ? { automationIdentitySource: executionUserSource } : {}),
+      ...(executionUserTools ? { automationIdentityTools: executionUserTools } : {}) };
+    sessionStore.updateSession(target.session);
+    await prepareExternalTurnIdentity(target, triggerId);
+  };
   // HTTP opt-in for codex-app native in-flight steer (turn/steer). The flag is
   // pure AUTHORIZATION forwarded to the worker — the live runner decides whether
   // it can actually merge into an active turn (canSteer); when it cannot, the
@@ -922,8 +956,8 @@ async function triggerSessionTurnAdmitted(
     && !req.options?.waitForFinalOutput
     && !req.options?.asyncReturnSessionId
     && req.options?.suppressFinalOutput === true;
-  const loudTurnId = suppressLoudFinal || req.presentation?.liveCard === 'on-start'
-    || req.presentation?.thinking === 'hidden' ? triggerId : undefined;
+  let loudTurnId = suppressLoudFinal || req.presentation?.liveCard === 'on-start'
+    || req.presentation?.thinking === 'hidden' || executionUser ? triggerId : undefined;
   const armLoudFinalSuppression = (target: DaemonSession): void => {
     if (!suppressLoudFinal) return;
     armTriggerFinalSuppression(target, triggerId);
@@ -1302,6 +1336,50 @@ async function triggerSessionTurnAdmitted(
     }
   }
 
+  // No connector-level selection: an automation trigger may use the bot's
+  // explicit Run as default. Resolve it now that the target chat is known, and
+  // freeze it on this exact turn below. A configured but unusable default is
+  // fail-closed (no user, hence governed tools deny) — never fall through to
+  // the trigger's session owner or a host login.
+  if (!executionUser && internal?.useBotAutomationDefault) {
+    const resolved = resolveAutomationIdentity({
+      appId: larkAppId,
+      chatId,
+      config: getBot(larkAppId).config,
+    });
+    if (resolved.failure) {
+      // A configured but unusable identity must abort admission. Continuing
+      // without a user is not a safe fallback: an unsupported capability can
+      // mean the enforcing wrappers are absent entirely, so the worker would
+      // fall through to native host credentials instead of honoring the
+      // operator's selection.
+      const error = `automation_identity_unavailable:${resolved.failure}`;
+      logger.warn(
+        `[trigger] refusing turn for ${larkAppId}/${chatId}: ${error} `
+        + `(source=${resolved.source})`,
+      );
+      return { ok: false, errorCode: 'trigger_failed', error };
+    }
+    if (resolved.user) {
+      executionUser = resolved.user;
+      executionUserSource = resolved.source;
+      executionUserTools = resolved.tools;
+      trustedCaller = automationTrustedCaller(executionUser);
+      logger.info(
+        `[trigger] execution identity source=${resolved.source} user=${executionUser.openId} `
+        + `app=${larkAppId} chat=${chatId}`,
+      );
+      // A bot-default identity is resolved after the presentation decision
+      // above; keep an identity-bearing trigger on the exact-turn path just as
+      // an explicit connector selection is.
+      loudTurnId ??= triggerId;
+    }
+  }
+
+  if (executionUser) {
+    assertAutomationUserAllowed(executionUser, larkAppId, chatId);
+    if (steerRequested) return { ok: false, errorCode: 'bad_request', error: 'run_as_user_cannot_steer_another_turn' };
+  }
   const httpVirtual = isHttpVirtualSession(chatId);
   const requestedHeadlessId = req.source.type === 'headless' && chatId.startsWith('headless_')
     ? chatId.slice('headless_'.length)
@@ -1360,45 +1438,69 @@ async function triggerSessionTurnAdmitted(
     // anywhere in the map. This keeps the guard against eviction/replacement
     // while not rejecting a validly-found session whose canonical key differs
     // from the lookup key.
-    const targetKey = activeSessionKey(target);
-    const stillRegistered = deps.activeSessions.get(targetKey) === target
-      || [...deps.activeSessions.values()].includes(target);
-    if (!stillRegistered || target.session.status !== 'active') {
-      return {
-        ok: false,
-        triggerId,
-        errorCode: 'session_not_found',
-        error: `active session ownership changed before dispatch: ${target.session.sessionId}`,
-      };
-    }
-    const workerIsLive = !!target.worker && !target.worker.killed;
-    if (!workerIsLive && (target.pendingRepo || target.initialStartPending
-      || target.worktreeCreating || target.session.queued
-      || hasProtectedSessionMutationOwnership(target))) {
-      const state = target.pendingRepo
-        ? 'pending_repo'
-        : target.initialStartPending
-          ? 'initial_start_pending'
-          : target.worktreeCreating
-            ? 'worktree_creating'
-            : target.session.queued
-              ? 'queued_backlog'
-              : 'durable_owner';
-      return {
-        ok: false,
-        triggerId,
-        // Pre-delivery rejection: the session exists but cannot accept input
-        // yet (directory choice, first start, worktree setup, queue). A
-        // distinct code keeps this apart from the catch-all `trigger_failed`,
-        // which can also surface POST-delivery bookkeeping faults — callers
-        // use this code to prove input never reached a worker.
-        errorCode: 'session_not_runnable',
-        error: `target session ${target.session.sessionId} is not runnable (${state}); preserving its opening prompt`,
-      };
-    }
+    const existingAdmission = (): {
+      workerIsLive: boolean;
+      rejection?: TriggerResponse;
+    } => {
+      const targetKey = activeSessionKey(target);
+      const stillRegistered = deps.activeSessions.get(targetKey) === target
+        || [...deps.activeSessions.values()].includes(target);
+      if (!stillRegistered || target.session.status !== 'active') {
+        return {
+          workerIsLive: false,
+          rejection: {
+            ok: false,
+            triggerId,
+            errorCode: 'session_not_found',
+            error: `active session ownership changed before dispatch: ${target.session.sessionId}`,
+          },
+        };
+      }
+      const workerIsLive = !!target.worker && !target.worker.killed;
+      if (!workerIsLive && (target.pendingRepo || target.initialStartPending
+        || target.worktreeCreating || target.session.queued
+        || hasProtectedSessionMutationOwnership(target))) {
+        const state = target.pendingRepo
+          ? 'pending_repo'
+          : target.initialStartPending
+            ? 'initial_start_pending'
+            : target.worktreeCreating
+              ? 'worktree_creating'
+              : target.session.queued
+                ? 'queued_backlog'
+                : 'durable_owner';
+        return {
+          workerIsLive,
+          rejection: {
+            ok: false,
+            triggerId,
+            // Pre-delivery rejection: the session exists but cannot accept input
+            // yet (directory choice, first start, worktree setup, queue). A
+            // distinct code keeps this apart from the catch-all `trigger_failed`,
+            // which can also surface POST-delivery bookkeeping faults — callers
+            // use this code to prove input never reached a worker.
+            errorCode: 'session_not_runnable',
+            error: `target session ${target.session.sessionId} is not runnable (${state}); preserving its opening prompt`,
+          },
+        };
+      }
+      return { workerIsLive };
+    };
+
+    // Identity preparation writes the exact-turn snapshot and may publish
+    // credentials. Reject a target that is already stale/reserved before that
+    // side effect, then re-check after the await so an ownership change during
+    // credential preparation still cannot dispatch into the old occupant.
+    const beforeIdentity = existingAdmission();
+    if (beforeIdentity.rejection) return beforeIdentity.rejection;
+    if (executionUser) await prepareExecutionIdentity(target);
+    const afterIdentity = existingAdmission();
+    if (afterIdentity.rejection) return afterIdentity.rejection;
+    const workerIsLive = afterIdentity.workerIsLive;
     const content = buildExistingSessionContent(
       target, prompt, larkAppId, chatId, codexAppText, codexAppApplicationContext, codexAppMessageContext, triggerId,
     );
+    if (trustedCaller) content.trustedCaller = trustedCaller;
     const queuedBehindActivation = workerIsLive
       && hasQueuedActivationAdmissionGate(target);
     const recordAcceptedInput = (): void => {
@@ -1563,6 +1665,7 @@ async function triggerSessionTurnAdmitted(
             const dispatchAttempt = prepareStableDispatch(target, false);
             armFinalOutputSuppression(target, dispatchAttempt);
             const accepted = sendWorkerInput(target, content, triggerId, {
+              ...(trustedCaller ? { trustedCaller } : {}),
               ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
               ...(steerRequested ? { codexAppSteerable: true as const } : {}),
             });
@@ -1604,6 +1707,7 @@ async function triggerSessionTurnAdmitted(
           const dispatchAttempt = prepareStableDispatch(target, false);
           armFinalOutputSuppression(target, dispatchAttempt);
           accepted = sendWorkerInput(target, content, triggerId, {
+              ...(trustedCaller ? { trustedCaller } : {}),
             ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
             // At-most-once: a keyed follow-up delivered to a LIVE worker must be
             // tagged so a CLI crash never replays it onto the auto-restarted CLI
@@ -1664,6 +1768,7 @@ async function triggerSessionTurnAdmitted(
       armFinalOutputSuppression(target, dispatchAttempt);
       armLoudFinalSuppression(target);
       const accepted = sendWorkerInput(target, content, triggerId, {
+              ...(trustedCaller ? { trustedCaller } : {}),
         ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
         ...(internal?.atMostOnce ? { atMostOnce: true } : {}),
         ...(steerRequested ? { codexAppSteerable: true as const } : {}),
@@ -1876,6 +1981,7 @@ async function triggerSessionTurnAdmitted(
     const nowIso = new Date(now).toISOString();
     session.larkAppId = larkAppId;
     session.scope = scope;
+    if (executionUser) { session.ownerOpenId = executionUser.openId; session.ownerUnionId = executionUser.unionId; }
     if (shouldOpenOwnTopic && topicMessage === null) session.externalTriggerTopicless = true;
     if (requestedHeadlessId) {
       session.headless = {
@@ -1944,6 +2050,11 @@ async function triggerSessionTurnAdmitted(
     // Retain the complete opening input until a worker or repo workflow has
     // synchronously accepted it. This is both the route reservation and the
     // retry payload if a write-ahead hook/fork throws before acceptance.
+    if (trustedCaller) {
+      newDs.pendingTrustedCaller = trustedCaller;
+      newDs.pendingSender = { openId: executionUser!.openId, name: executionUser!.name, type: 'user' };
+      newDs.pendingTurnId = triggerId;
+    }
     newDs.pendingPrompt = prompt;
     newDs.pendingCodexAppText = codexAppText;
     newDs.pendingCodexAppApplicationContext = codexAppApplicationContext || undefined;
@@ -1990,6 +2101,18 @@ async function triggerSessionTurnAdmitted(
   }
   const newDs = claim.ds;
   const session = newDs.session;
+  if (executionUser) {
+    try { await prepareExecutionIdentity(newDs); }
+    catch (error) {
+      await withActiveSessionKeyLock(deps.activeSessions, key, () => {
+        if (deps.activeSessions.get(key) === newDs) {
+          deps.activeSessions.delete(key);
+          sessionStore.closeSession(session.sessionId);
+        }
+      });
+      throw error;
+    }
+  }
 
   if (useAutoWt) {
     // The key-lock claim registered pendingRepo before this dynamic import;
@@ -2070,6 +2193,8 @@ async function triggerSessionTurnAdmitted(
       larkToolResume: false,
     },
   );
+  if (trustedCaller) promptInput.trustedCaller = trustedCaller;
+
   // No await from the ownership check through forkWorker. The reservation and
   // opening buffers are released only after synchronous pre-accept succeeds.
   if (deps.activeSessions.get(key) !== newDs
@@ -2378,13 +2503,13 @@ export async function triggerSessionTurn(
       if (!req.options?.turnIdempotencyKey || req.options.asyncReturnSessionId) {
         return triggerSessionTurnAdmitted(req, deps, internal);
       }
-      if (!req.target.sessionId || req.options.waitForFinalOutput || req.options.dryRun || internal) {
+      if (!req.target.sessionId || req.options.waitForFinalOutput || req.options.dryRun || internal?.stableTurnId || internal?.beforeDispatch) {
         return Promise.resolve<TriggerResponse>({ ok: false, errorCode: 'bad_request', error: 'Lark turn idempotency requires an existing session without wait/dryRun/internal dispatch controls' });
       }
       const { turnIdempotencyKey: _key, ...options } = req.options;
       return withLarkTurnIdempotency(req, deps.larkAppId, (triggerId, beforeDispatch) =>
         triggerSessionTurnAdmitted({ ...req, options }, deps, {
-          stableTurnId: triggerId, atMostOnce: true,
+          ...internal, stableTurnId: triggerId, atMostOnce: true,
           beforeDispatch: () => {
             beforeDispatch();
             const target = activeBySessionId(deps.activeSessions, req.target.sessionId!);

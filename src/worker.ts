@@ -57,9 +57,9 @@ import { accessSync, chmodSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync,
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, basename, dirname, delimiter, relative, extname } from 'node:path';
 import { resolveBotmuxWrapperBinDir, prependBotmuxBin } from './core/botmux-wrapper.js';
-import { sessionIdentityBinDir, publishActiveTurn, canonicalPathNearest, GIT_ASKPASS_BASENAME, prepareTurnGitConfigEnv } from './core/cli-identity.js';
+import { sessionIdentityBinDir, publishActiveTurn, canonicalPathNearest, identityShellTransportEnv, prepareTurnGitConfigEnv } from './core/cli-identity.js';
 import { prepareLarkToolEnv, usesLarkToolBinding, cleanupLarkToolBinding, larkToolBindingPath, resolveLarkToolDataDir, resolveIdentityStorageModel, larkToolLoopbackService } from './core/lark-tool-binding.js';
-import { tokenStoreProtection } from './services/trigger-user-auth.js';
+import { tokenStoreProtection, triggerUserAuthApplies } from './services/trigger-user-auth.js';
 import { installAidenCodexShim, writeAidenCodexShellConfigs } from './services/aiden-codex-shim.js';
 import { scanCredentialBearingMcpServers, credentialBearingMcpAdvisory } from './services/credential-bearing-mcp.js';
 import { homedir, tmpdir, userInfo } from 'node:os';
@@ -143,7 +143,7 @@ import { markerBelongsToLiveProcess, readProcessStartIdentity } from './core/ses
 import { CodexAppEngineRootWaitCancelled, parseCodexAppEngineIdentityClaim, verifyCodexAppEngineIdentity, type CodexAppEngineIdentity } from './services/codex-app-engine-identity.js';
 import { cliSurvivesWorkerExit, handsCliPidMarkerToSuccessor } from './core/cli-pid-marker-handoff.js';
 import { assertWorkingDirStaysInRoleLibrary, roleLibraryRoot, roleLibrarySubtree } from './core/role-library.js';
-import { applySessionTempEnv, ensureSessionTempDir } from './core/session-temp.js';
+import { applySessionTempEnv, ensureSessionTempDir, sessionTempRootDir } from './core/session-temp.js';
 // Central no-transport predicate. Aliased because a local `const larkTransportEnabled`
 // (the role-library gate) already binds that name in one function scope.
 import { larkTransportEnabled as sessionLarkTransportEnabled } from './core/types.js';
@@ -1644,18 +1644,22 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
     // RPC shell tools execute here, before the viewer CLI is even spawned.
     const boundLark = !!process.env.SESSION_DATA_DIR && usesLarkToolBinding(cfg, process.env.SESSION_DATA_DIR, isWorkflowWorker());
     if (!boundLark && process.env.SESSION_DATA_DIR) {
-      cleanupLarkToolBinding(process.env.SESSION_DATA_DIR, cfg.sessionId);
+      cleanupLarkToolBinding(process.env.SESSION_DATA_DIR, cfg.sessionId, {
+        preserveDelegations: triggerUserAuthApplies(cfg.triggerUserAuth, 'lark-cli'),
+      });
       delete engineEnv.BOTMUX_LARK_TOOL_BINDING;
     }
-    const identityPolicy = boundLark && cfg.triggerUserAuth
-      ? { ...cfg.triggerUserAuth, tools: cfg.triggerUserAuth.tools.filter(tool => tool !== 'lark-cli') }
-      : cfg.triggerUserAuth;
+    // Wrapper TRANSPORT scope: the per-turn tools plus the fixed bot user's
+    // tools (plan §12.1). The extra tools install the interception needed to
+    // enforce a fixed personal account; they do NOT turn the per-turn sender
+    // policy on — the daemon's per-tool decision picks who executes.
+    const identityPolicy = identityPolicyForSpawn(cfg, boundLark);
     // RPC engines are host-side processes (codexRpcEligible forbids sandboxes),
     // so the loopback proof channel is reachable whenever the binding applies.
     // This decision is the single source the daemon publishes identity from;
     // it is re-sent on every engagement.
     const engineIdentityBinding = !!process.env.SESSION_DATA_DIR
-      && usesLarkToolBinding({ ...cfg, larkToolBinding: true }, process.env.SESSION_DATA_DIR, isWorkflowWorker());
+      && usesLarkToolBinding({ ...cfg, larkToolBinding: true, triggerUserAuth: undefined }, process.env.SESSION_DATA_DIR, isWorkflowWorker());
     const engineIdentityModel = resolveIdentityStorageModel({
       platform: process.platform, binding: engineIdentityBinding,
       sandboxEngaged: false, loopbackShared: true,
@@ -22950,6 +22954,35 @@ function resolveCliExtraArgs(): string[] {
 /** One-shot guard for the tmux version / crash-exit-code degradation self-check. */
 let hasLoggedTmuxVersionSelfCheck = false;
 
+/**
+ * The identity policy a spawn enforces locally (wrapper install, git
+ * attribution): the per-turn sender policy plus the fixed bot user's tools as
+ * pure TRANSPORT. Extra tools extend the wrapped set without turning the
+ * per-turn sender policy on — the daemon's per-tool decision picks who
+ * executes; this only guarantees the interception exists (plan §12.1).
+ */
+export function identityPolicyForSpawn(
+  cfg: {
+    triggerUserAuth?: import('./services/trigger-user-auth.js').TriggerUserAuthConfig;
+    identityTools?: readonly import('./services/trigger-user-auth.js').TriggerUserAuthTool[];
+  },
+  boundLark: boolean,
+): import('./services/trigger-user-auth.js').TriggerUserAuthConfig | undefined {
+  const base = boundLark && cfg.triggerUserAuth
+    ? { ...cfg.triggerUserAuth, tools: cfg.triggerUserAuth.tools.filter(tool => tool !== 'lark-cli') }
+    : cfg.triggerUserAuth;
+  const extra = cfg.identityTools ?? [];
+  if (!extra.length) return base;
+  const tools = new Set(base?.enabled ? base.tools : []);
+  for (const tool of extra) tools.add(tool);
+  return {
+    enabled: true,
+    tools: [...tools],
+    fallback: base?.fallback ?? 'none',
+    credentialSource: base?.credentialSource ?? 'auto',
+  };
+}
+
 async function spawnCli(
   cfg: Extract<DaemonToWorker, { type: 'init' }>,
   opts: {
@@ -25448,8 +25481,11 @@ async function spawnCliBody(
   const perBotInjectEnv = botInjectedEnv(cfg.env, cfg.envPolicy, cfg.protectedMcpPolicy);
   const boundLark = !!process.env.SESSION_DATA_DIR && usesLarkToolBinding(cfg, process.env.SESSION_DATA_DIR, isWorkflowWorker());
   if (!boundLark && process.env.SESSION_DATA_DIR) {
-    cleanupLarkToolBinding(process.env.SESSION_DATA_DIR, cfg.sessionId);
+    cleanupLarkToolBinding(process.env.SESSION_DATA_DIR, cfg.sessionId, {
+        preserveDelegations: triggerUserAuthApplies(cfg.triggerUserAuth, 'lark-cli'),
+      });
   }
+  const identityPolicy = identityPolicyForSpawn(cfg, boundLark);
   // A bwrap sandbox only mounts canonical paths: on a symlinked home/data root
   // (`/home/u` -> `/data00/home/u`) a lexical helper path (GIT_ASKPASS, git
   // credential helper, ZDOTDIR, ...) does not exist inside. The lark-bound
@@ -25509,21 +25545,8 @@ async function spawnCliBody(
   };
   if (cfg.chatType) identityShellEnv.BOTMUX_CHAT_TYPE = cfg.chatType;
   if (cfg.rootMessageId?.startsWith('om_') || isMessageListenerTaskAnchor(cfg.rootMessageId)) identityShellEnv.BOTMUX_ROOT_MESSAGE_ID = cfg.rootMessageId;
-  if ((cfg.triggerUserAuth?.enabled || boundLark) && process.env.SESSION_DATA_DIR) {
-    const dir = sessionIdentityBinDir(identityDataDir!, cfg.sessionId);
-    identityShellEnv.SESSION_DATA_DIR = identityDataDir!;
-    identityShellEnv.BOTMUX_IDENTITY_BIN = dir;
-    identityShellEnv.ZDOTDIR = join(dir, 'shell');
-    identityShellEnv.BASH_ENV = join(dir, 'shell', 'bash_env.sh');
-    // git runs as a shell subprocess too, so askpass needs the same forwarding
-    // or a push carries the machine's identity. Declared only when bytedcli is
-    // governed — that is the exact condition under which installGitAskpass
-    // writes the file, and pointing GIT_ASKPASS at a missing path would break
-    // git prompts rather than fall back.
-    if (cfg.triggerUserAuth?.enabled && cfg.triggerUserAuth.tools.includes('bytedcli')) {
-      identityShellEnv.GIT_ASKPASS = join(dir, GIT_ASKPASS_BASENAME);
-    }
-  }
+  Object.assign(identityShellEnv,
+    identityShellTransportEnv(identityPolicy, identityDataDir, cfg.sessionId, boundLark));
   if (boundLark) {
     identityShellEnv.BOTMUX_LARK_TOOL_BINDING = larkToolBindingPath(identityDataDir!, cfg.sessionId);
     if (process.env.BOTMUX_DAEMON_IPC_PORT) identityShellEnv.BOTMUX_DAEMON_IPC_PORT = process.env.BOTMUX_DAEMON_IPC_PORT;
@@ -25746,9 +25769,6 @@ async function spawnCliBody(
   if (!boundLark) {
     delete childEnv.BOTMUX_LARK_TOOL_BINDING;
   }
-  const identityPolicy = boundLark && cfg.triggerUserAuth
-    ? { ...cfg.triggerUserAuth, tools: cfg.triggerUserAuth.tools.filter(tool => tool !== 'lark-cli') }
-    : cfg.triggerUserAuth;
   // The identity model is the worker's spawn decision, from the resolved
   // sandbox mode (BOTMUX_SANDBOX override and remote bypass included) and the
   // actual spawn's loopback reachability (spawnNetworkShape feeds the bwrap
@@ -25756,7 +25776,7 @@ async function spawnCliBody(
   // daemon publishes identity material per this single source — the daemon
   // never derives sandbox/network facts itself.
   const childIdentityBinding = !!process.env.SESSION_DATA_DIR
-    && usesLarkToolBinding({ ...cfg, larkToolBinding: true }, process.env.SESSION_DATA_DIR, isWorkflowWorker());
+    && usesLarkToolBinding({ ...cfg, larkToolBinding: true, triggerUserAuth: undefined }, process.env.SESSION_DATA_DIR, isWorkflowWorker());
   const childIdentityModel = resolveIdentityStorageModel({
     platform: process.platform,
     binding: childIdentityBinding,
@@ -26043,11 +26063,19 @@ async function spawnCliBody(
     perBotInjectEnv.KIMI_MODEL_THINKING_EFFORT = cfg.reasoningEffort;
   }
   if (cliAdapter.id === 'ebsd') assertEbsdPerBotEnv(perBotInjectEnv);
-  if (boundLark) {
+  // Pane backends rebuild PATH from shell rcfiles and only carry injectEnv
+  // into the final exec. Keep every installed tool wrapper in that carrier,
+  // including sender-auth sessions without an application binding. Direct
+  // tool spawns must retain the same identity route as shell tool calls.
+  if (childEnv.BOTMUX_IDENTITY_BIN) {
     const dir = childEnv.BOTMUX_IDENTITY_BIN!;
-    perBotInjectEnv.PATH = [dir, ...(perBotInjectEnv.PATH ?? childEnv.PATH ?? '').split(':').filter(p => p !== dir)].join(':');
+    // Keep pane rcfile additions when no PATH override was requested. The
+    // terminal backend prepends this identity bin after loading those rcfiles.
+    if (boundLark || perBotInjectEnv.PATH !== undefined) {
+      perBotInjectEnv.PATH = [dir, ...(perBotInjectEnv.PATH ?? childEnv.PATH ?? '').split(':').filter(p => p !== dir)].join(':');
+    }
     perBotInjectEnv.BOTMUX_IDENTITY_BIN = dir;
-    perBotInjectEnv.BOTMUX_LARK_TOOL_BINDING = childEnv.BOTMUX_LARK_TOOL_BINDING!;
+    if (boundLark) perBotInjectEnv.BOTMUX_LARK_TOOL_BINDING = childEnv.BOTMUX_LARK_TOOL_BINDING!;
     perBotInjectEnv.ZDOTDIR = join(dir, 'shell');
     perBotInjectEnv.BASH_ENV = join(dir, 'shell', 'bash_env.sh');
   }
@@ -26428,6 +26456,21 @@ async function spawnCliBody(
     ];
     const mandatoryDenyRegexes: string[] = [];
     const mandatoryReadOnlyPaths: string[] = [];
+    // Every bot/session for this OS account shares this cache parent. Seal it
+    // unconditionally: a session with trigger-user auth disabled must still be
+    // unable to read a credential snapshot left by another session. This
+    // session's own deeper sessionScratchDir grant is re-opened below.
+    mandatoryDenyPaths.push(canonical(sessionTempRootDir()));
+    if (identityPolicy?.enabled && identityPolicy.tools.includes('larkdev')) {
+      // The wrapper injects sender JWTs and uses a fresh LARKDEV_AUTH_DIR. Keep
+      // the machine SDK login outside the sandbox for both sender-auth and
+      // fixed-user assignments, even when workingDir=HOME or an explicit user
+      // allow-list would otherwise reopen it.
+      hostOnlyDenyPaths.push(canonical(join(hostHomeDir, '.larkdev', 'auth')));
+      if (process.env.LARKDEV_AUTH_DIR?.startsWith('/')) {
+        hostOnlyDenyPaths.push(canonical(process.env.LARKDEV_AUTH_DIR));
+      }
+    }
     // Linux: the per-session sandbox tree (`sandboxes/<sid>`) holds the deny-mask
     // cleanup manifest + the mode-000 empty ro-bind SOURCES. If SESSION_DATA_DIR
     // is configured INSIDE the working dir (a custom data dir under a RW-bound
@@ -27018,6 +27061,7 @@ async function spawnCliBody(
       botsConfigPath: cfg.loadedBotsConfigPath ? scratchCanonical(cfg.loadedBotsConfigPath) : undefined,
       homeDir: scratchHome,
       sessionId: cfg.sessionId,
+      sessionScratchDir,
     });
     const scratchDeny = [...new Set<string>([
       ...credentialRules.denyPaths.map(path =>
@@ -27032,6 +27076,7 @@ async function spawnCliBody(
     // This session's own trigger-user identity files (under the sealed
     // cli-identity dir) must stay readable for the governed CLI / relay.
     const scratchReadOnlyCarves = scratchSecrets.readOnlyCarvePaths.map(scratchCanonical);
+    const scratchWritableCarves = scratchSecrets.writableCarvePaths.map(scratchCanonical);
 
     scratchNativeCodexHome = nativeCodexHome;
     scratchNativeTraeHome = nativeTraeHome;
@@ -27092,6 +27137,7 @@ async function spawnCliBody(
         cliBin: sandboxWrapperLaunch?.bin ?? cliAdapter.resolvedBin,
         cliArgs: sandboxWrapperLaunch?.args ?? args,
         denyPaths: scratchDeny,
+        writableCarvePaths: scratchWritableCarves,
         mcpGatewaySocketPath: sessionMcpGatewayHost?.socketPath,
         net: spawnNetworkShape.netEnabled,
       });
@@ -27145,6 +27191,7 @@ async function spawnCliBody(
         mcpGatewaySocketPath: sessionMcpGatewayHost?.socketPath,
         childEnvForce: { CODEX_HOME: nativeCodexHome, TRAE_HOME: nativeTraeHome },
         readOnlyCarvePaths: scratchReadOnlyCarves,
+        writableCarvePaths: scratchWritableCarves,
         useBwrapArgsFile: effectiveBackendType === 'tmux',
       });
       if (!prepared.ok) {
@@ -27366,7 +27413,7 @@ async function spawnCliBody(
     // silently run tool shells as the machine owner, so fail the launch
     // explicitly instead of degrading. Plain aiden-codex sessions (BOTMUX_*
     // collaboration vars only) keep the old best-effort WARN behavior.
-    const aidenCodexIdentityShellEnv = cfg.triggerUserAuth?.enabled || boundLark;
+    const aidenCodexIdentityShellEnv = identityPolicy?.enabled || boundLark;
     const wiring = wrapperLaunchWiring({
       insideSandbox: !!opts.insideSandbox,
       sessionDataDir: process.env.SESSION_DATA_DIR,

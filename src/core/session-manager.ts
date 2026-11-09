@@ -1,6 +1,8 @@
 import { isWorkflowNodeSessionMarker, workflowHandoffInputOptions } from './workflow-node-session.js';
 import { deploymentContinuationCandidate, claimDeploymentContinuation, deploymentContinuationClaimCurrent, setDeploymentContinuation } from '../services/deployment-continuation.js';
 import { canTalk } from '../im/lark/event-dispatcher.js';
+import { assertAutomationSession, freezeAutomationTurnUser, resolveAutomationIdentity } from '../services/automation-identity.js';
+import { automationIdentityTools, explicitAutomationIdentityTools } from '../services/automation-identity-config.js';
 import { isSessionGroup, touchSessionGroup } from '../services/session-groups-store.js';
 import { renderStewardHintBlock } from './decision-board/model.js';
 import { buildZeroPromptInput, zeroPromptInjectionForBot, sessionPromptInjection, type PromptInjection } from './prompt-injection.js';
@@ -89,6 +91,7 @@ import { stagePendingRepoSetup, persistPendingRepoCardMessageId, restorePendingR
 import { announceSessionRow, clearAgentAttention, markSessionActivity, stampHumanActivity, announcePendingRepoSession } from './session-activity.js';
 import { applyFollowActive, followActiveOpenedFreshTopic, recordFollowActiveFreshTopic } from './schedule-follow-active.js';
 import { resolveScheduleModelOverride } from './schedule-model-override.js';
+import { isDelegatedScheduleRun } from './schedule-delegated-runtime.js';
 import { scanMultipleProjects } from '../services/project-scanner.js';
 import { buildRepoSelectCard } from '../im/lark/card-builder.js';
 import { repoPickerScanOptions } from '../global-config.js';
@@ -4605,6 +4608,49 @@ export async function executeScheduledTask(
   // silent-output suppression, this identifies the exact shared-topic reply
   // target when a chat-scope session already has another turn queued.
   const scheduledTurnId = `schedule:${task.id}:${randomUUID()}`;
+  // Delegated authority deliberately strips the creator/current actor: the
+  // signed grant permits only its own tool scopes, not a human execution
+  // identity. A configured bot default must not turn that anonymous run into a
+  // human trusted caller; delegated tools are published separately from the
+  // host authority record.
+  const delegatedRun = isDelegatedScheduleRun(task);
+  // Resolve the execution identity at fire time, once, and freeze it below.
+  // The task's own Run as outranks the bot default and must not be blocked by
+  // an unrelated revoked/invalid default: the shared resolver validates only
+  // the winning candidate. A configured-but-unusable winner fails the fire
+  // closed instead of falling through to the creator.
+  const explicitRunAsUser = delegatedRun ? undefined : task.runAsUser;
+  const automationIdentity = delegatedRun ? undefined : resolveAutomationIdentity({
+    appId: larkAppId,
+    chatId: task.chatId,
+    config: bot.config,
+    ...(explicitRunAsUser
+      ? { explicit: explicitRunAsUser, explicitSource: 'task' as const }
+      : {}),
+  });
+  if (automationIdentity?.failure) {
+    // A distinct prefix lets the scheduler log/alert classify a missing or
+    // revoked execution identity separately from a business/model failure.
+    throw new Error(
+      `automation_identity_unavailable:${automationIdentity.failure} `
+      + `(source=${automationIdentity.source}, task=${task.id})`,
+    );
+  }
+  const effectiveRunAsUser = automationIdentity?.user;
+  const automationIdentitySource: import('../services/automation-identity.js').AutomationIdentitySource =
+    delegatedRun ? 'none'
+      : automationIdentity?.source ?? 'none';
+  const automationTools = delegatedRun ? undefined
+    : automationIdentitySource === 'task'
+      ? explicitAutomationIdentityTools(bot.config)
+      : automationIdentityTools(bot.config);
+  if (effectiveRunAsUser) task = { ...task, runAsUser: effectiveRunAsUser };
+  if (automationIdentitySource !== 'none') {
+    logger.info(
+      `[scheduler] Task "${task.name}" execution identity source=${automationIdentitySource} `
+      + `user=${effectiveRunAsUser?.openId ?? '(creator provenance)'}`,
+    );
+  }
   const scheduledTrustedCaller = trustedCallerForScheduledTask(task, larkAppId);
   const rawTopicTitle = task.topicTitle?.trim();
   const createsOwnTopic = executionPosition === 'new-topic' || executionPosition === 'task';
@@ -4971,7 +5017,23 @@ export async function executeScheduledTask(
         }
         // Identity preparation may reject after a concurrent pause/revocation.
         // Run it before changing the retained conversation's routing or prompt.
-        await runtime?.prepareTurnIdentity?.(existing, scheduledTurnId);
+        // A delegated run has no execution user to freeze: its authority is
+        // the grant, and an empty automation snapshot would only reintroduce a
+        // synthetic "no human" marker into current-actor provenance.
+        const rollbackIdentitySnapshot = delegatedRun ? () => {} : freezeAutomationTurnUser(
+          existing,
+          scheduledTurnId,
+          effectiveRunAsUser ?? null,
+          { source: automationIdentitySource, tools: automationTools },
+        );
+        try {
+          if (!delegatedRun && task.runAsUser) assertAutomationSession(task.runAsUser, existing, automationTools);
+          await runtime?.prepareTurnIdentity?.(existing, scheduledTurnId);
+        } catch (error) {
+          rollbackIdentitySnapshot();
+          throw error;
+        }
+        sessionStore.updateSession(existing.session);
         if (activeSessions.get(key) !== existing || existing.session.status !== 'active') {
           throw new Error(`scheduled continuation lost active session ${existing.session.sessionId}`);
         }
@@ -5080,9 +5142,16 @@ export async function executeScheduledTask(
       // A fresh scheduled session is owned by the authenticated task creator.
       // Persist both ids so an in-turn `botmux schedule add` can create a child
       // task with the same tenant-stable identity instead of degrading to an
-      // ownerOpenId-only legacy task.
-      session.ownerOpenId = scheduledTrustedCaller.requestUserOpenId;
-      session.ownerUnionId = scheduledTrustedCaller.requestUserUnionId;
+      // ownerOpenId-only legacy task. An explicit automation Run as changes
+      // who EXECUTES, not who CONTROLS the session; only an ownerless legacy
+      // task falls back to the execution caller.
+      if (task.ownerOpenId) {
+        session.ownerOpenId = task.ownerOpenId;
+        if (task.ownerUnionId) session.ownerUnionId = task.ownerUnionId;
+      } else {
+        session.ownerOpenId = scheduledTrustedCaller.requestUserOpenId;
+        session.ownerUnionId = scheduledTrustedCaller.requestUserUnionId;
+      }
     }
     if (deferredFreshTopic) {
       session.deferredScheduleRun = {
@@ -5142,6 +5211,14 @@ export async function executeScheduledTask(
     // On rejection there is no worker or activation journal to recover: close
     // its durable row so the next fire can create a fresh candidate.
     try {
+      if (!delegatedRun) {
+        freezeAutomationTurnUser(ds, scheduledTurnId, effectiveRunAsUser ?? null, {
+          source: automationIdentitySource,
+          tools: automationTools,
+        });
+        sessionStore.updateSession(ds.session);
+      }
+      if (!delegatedRun && task.runAsUser) assertAutomationSession(task.runAsUser, ds, automationTools);
       await runtime?.prepareTurnIdentity?.(ds, scheduledTurnId);
     } catch (err) {
       sessionStore.closeSession(session.sessionId);

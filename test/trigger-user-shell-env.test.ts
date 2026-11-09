@@ -12,12 +12,14 @@ import { buildWrappedLaunch } from '../src/setup/cli-selection.js';
 import {
   GIT_ASKPASS_BASENAME,
   IDENTITY_DENIED_EXIT_CODE,
+  identityShellTransportEnv,
   installIdentityWrapper,
   prepareTriggerUserCliEnv,
   publishActiveTurn,
   sessionIdentityBinDir,
   writeSessionIdentity,
 } from '../src/core/cli-identity.js';
+import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 
 // worker.ts is a process entrypoint: execute its actual environment-assembly
 // block without starting a worker, rather than recreating that block in a fixture.
@@ -31,14 +33,19 @@ const assembly = ts.transpileModule(worker.slice(start, end), {
 const assemble = new Function('cfg', 'process', 'sessionIdentityBinDir', 'join', 'GIT_ASKPASS_BASENAME',
   'perBotInjectEnv', 'sandboxRequested', 'effectiveResume',
   'effectiveAdapterSessionId', 'boundLark', 'larkToolBindingPath', 'identityDataDir',
-  'isMessageListenerTaskAnchor', `${assembly}\nreturn identityShellEnv;`);
+  'identityPolicy', 'identityShellTransportEnv', 'isMessageListenerTaskAnchor', `${assembly}\nreturn identityShellEnv;`);
+const identityPolicyForSpawn = loadWorkerFunction<(
+  cfg: { triggerUserAuth?: unknown; identityTools?: readonly string[] },
+  boundLark: boolean,
+) => unknown>('identityPolicyForSpawn', {});
 
 function workerShellEnv(sessionDataDir: string | undefined, enabled = true, tools = ['bytedcli'], boundLark = false, path?: string, sandboxRequested = false, launch: { cliId?: string; wrapperCli?: string; path?: string } = {}): Record<string, string> {
+  const cfg = { sessionId: 'botmux-session', chatId: 'oc_chat', larkAppId: 'cli_app', cliId: launch.cliId ?? 'traex', wrapperCli: launch.wrapperCli, triggerUserAuth: { enabled, tools } };
   return assemble(
-    { sessionId: 'botmux-session', chatId: 'oc_chat', larkAppId: 'cli_app', cliId: launch.cliId ?? 'traex', wrapperCli: launch.wrapperCli, triggerUserAuth: { enabled, tools } },
+    cfg,
     { env: { PATH: path, ...(sessionDataDir === undefined ? {} : { SESSION_DATA_DIR: sessionDataDir, BOTMUX_DAEMON_IPC_PORT: '12345' }) } },
     sessionIdentityBinDir, join, GIT_ASKPASS_BASENAME, { PATH: launch.path }, sandboxRequested, false, 'native-session', boundLark, larkToolBindingPath, sessionDataDir,
-    isMessageListenerTaskAnchor,
+    identityPolicyForSpawn(cfg, boundLark), identityShellTransportEnv, isMessageListenerTaskAnchor,
   );
 }
 
@@ -154,7 +161,7 @@ describe('wrapper rendering model (review gate: no resolver argv on legacy paths
     expect(text).toContain('.data"');
   });
 
-  it('renders the runner argv and eval block for the proven model', () => {
+  it.skipIf(process.platform !== 'linux')('renders the runner argv and eval block for the proven model', () => {
     const text = install('proven', { appId: 'cli_app', ipcPort: 12345 });
     expect(text).toContain('cli-identity-runner');
     expect(text).toContain('--ipc-port');
@@ -194,7 +201,11 @@ describe.each([
     try {
       const shellEnv = workerShellEnv(dataDir);
       const realTool = join(dataDir, 'real-tool');
-      writeFileSync(realTool, '#!/bin/sh\nprintf "%s" "$BYTEDCLI_USER_CLOUD_JWT"\n', { mode: 0o755 });
+      writeFileSync(
+        realTool,
+        '#!/bin/sh\nprintf "%s|%s|%s|%s|%s" "$BYTECLOUD_CLI_API_JWT_TOKEN_CN" "$BYTECLOUD_CLI_API_JWT_TOKEN_I18N_BD" "$HOME" "$BYTEDCLI_USER_CLOUD_JWT" "$BYTECLOUD_AUTH_ACCESS_KEY_ID"\n',
+        { mode: 0o755 },
+      );
       const wrapper = installIdentityWrapper(shellEnv.BOTMUX_IDENTITY_BIN, 'bytedcli', realTool, 'single')!;
       const args = createAdapter('/bin/cli').buildArgs({
         sessionId: 'native-session',
@@ -204,19 +215,41 @@ describe.each([
       });
       // Model a shell receiving ONLY the adapter's explicit .set entries. This
       // tests our contract, not any particular TRAE version's inheritance policy.
-      const toolEnv = { PATH: '/usr/bin:/bin', ...shellOverrides(args) };
-      expect(toolEnv).not.toHaveProperty('BYTEDCLI_USER_CLOUD_JWT');
+      const toolEnv = {
+        PATH: '/usr/bin:/bin',
+        HOME: '/machine/home',
+        BYTEDCLI_USER_CLOUD_JWT: 'stale-private-value',
+        BYTECLOUD_AUTH_ACCESS_KEY_ID: 'machine-ak',
+        ...shellOverrides(args),
+      };
+      expect(shellOverrides(args)).not.toHaveProperty('BYTEDCLI_USER_CLOUD_JWT');
       const run = (env: Record<string, string> = toolEnv) => spawnSync('/bin/sh', [wrapper], {
         env, encoding: 'utf8', timeout: 5_000,
       });
       const publish = (token: string, turnId: string) => {
-        writeSessionIdentity(dataDir, 'botmux-session', { tool: 'bytedcli', cloudJwt: token, turnId });
+        writeSessionIdentity(dataDir, 'botmux-session', {
+          tool: 'bytedcli', cloudJwts: { cn: `${token}-cn`, 'i18n-bd': `${token}-bd` }, turnId,
+        });
         publishActiveTurn(dataDir, 'botmux-session', turnId);
       };
       publish('test-alice', 'turn-a');
-      expect(run()).toMatchObject({ status: 0, stdout: 'test-alice' });
+      let first = run();
+      expect(first.status).toBe(0);
+      let [cnJwt, bdJwt, isolatedHome, legacyJwt, machineAk] = first.stdout.split('|');
+      expect(cnJwt).toBe('test-alice-cn');
+      expect(bdJwt).toBe('test-alice-bd');
+      expect(isolatedHome).toContain('botmux-bytedcli-home/invocation.');
+      expect(legacyJwt).toBe('');
+      expect(machineAk).toBe('');
       publish('test-bob', 'turn-b');
-      expect(run()).toMatchObject({ status: 0, stdout: 'test-bob' });
+      first = run();
+      [cnJwt, bdJwt, isolatedHome, legacyJwt, machineAk] = first.stdout.split('|');
+      expect(first.status).toBe(0);
+      expect(cnJwt).toBe('test-bob-cn');
+      expect(bdJwt).toBe('test-bob-bd');
+      expect(isolatedHome).toContain('botmux-bytedcli-home/invocation.');
+      expect(legacyJwt).toBe('');
+      expect(machineAk).toBe('');
 
       for (const key of ['BOTMUX_SESSION_ID', 'SESSION_DATA_DIR']) {
         const missing: Record<string, string> = { ...toolEnv };

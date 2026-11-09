@@ -11,6 +11,7 @@ import { findRealToolBinary, installLoginShellPathShim, sessionIdentityDataDir, 
 import { resolveEntrySpawn } from './self-spawn.js';
 import { headlessChatId, isHeadlessId } from '../services/headless-session-store.js';
 import { resolveBotmuxWrapperBinDir } from './botmux-wrapper.js';
+import { larkToolBindingEnabled, type TriggerUserAuthConfig } from '../services/trigger-user-auth.js';
 import { clearLarkToolDelegations } from './lark-tool-delegation.js';
 import type { ProtectedLoopbackService } from './protected-http-egress-host.js';
 
@@ -102,14 +103,16 @@ export function larkToolBindingEffective(config: LarkToolBindingFacts, workflow 
     || isRemoteBackendId(config.backendType) || !larkToolIdentityEnabled(config));
 }
 
-/** Ordinary local and headless sessions adopt the lark-cli binding unless explicitly disabled (larkToolBinding === false).
+/** Ordinary local and headless sessions adopt the managed lark-cli binding only
+ * when it is explicitly enabled.
  * Note: _dataDir, resume, forkSession are preserved for caller signature compatibility. */
 export function usesLarkToolBinding(config: LarkToolBindingFacts & {
   sessionId: string; larkAppId: string;
   resume?: boolean; forkSession?: boolean;
   larkToolBinding?: boolean;
+  triggerUserAuth?: TriggerUserAuthConfig;
 }, _dataDir?: string, workflow = false): boolean {
-  return larkToolBindingEffective(config, workflow) && config.larkToolBinding !== false;
+  return larkToolBindingEffective(config, workflow) && larkToolBindingEnabled(config);
 }
 
 /**
@@ -165,13 +168,15 @@ export function identityBindingAllowsProven(input: Parameters<typeof usesLarkToo
 }
 
 /** Clean up managed lark-cli binding files and wrappers when binding is disabled. */
-export function cleanupLarkToolBinding(dataDir: string, sessionId: string): void {
+export function cleanupLarkToolBinding(dataDir: string, sessionId: string, options: { preserveDelegations?: boolean } = {}): void {
   try {
     const rootDir = resolveLarkToolDataDir(dataDir);
     rmSync(larkToolBindingPath(rootDir, sessionId), { force: true });
     rmSync(join(sessionIdentityDataDir(rootDir, sessionId), 'lark-config'), { recursive: true, force: true });
-    clearLarkToolDelegations(dataDir, sessionId);
-    clearLarkToolDelegations(rootDir, sessionId);
+    if (!options.preserveDelegations) {
+      clearLarkToolDelegations(dataDir, sessionId);
+      clearLarkToolDelegations(rootDir, sessionId);
+    }
     const binDir = sessionIdentityBinDir(rootDir, sessionId);
     const wrapperPath = join(binDir, 'lark-cli');
     try {
@@ -187,13 +192,14 @@ export function cleanupLarkToolBinding(dataDir: string, sessionId: string): void
   }
 }
 
-/** Returns whether a session has larkToolBinding enabled (default true) and its binding file is present. */
+/** Whether effective bot-app binding is enabled and its session file exists. */
 export function isLarkToolBound(
-  botConfig: { larkToolBinding?: boolean } | undefined,
+  botConfig: { larkToolBinding?: boolean; triggerUserAuth?: TriggerUserAuthConfig } | undefined,
   dataDir: string,
   sessionId: string,
 ): boolean {
-  return botConfig?.larkToolBinding !== false && hasLarkToolBinding(dataDir, sessionId);
+  return larkToolBindingEnabled(botConfig)
+    && hasLarkToolBinding(dataDir, sessionId);
 }
 
 /**
@@ -208,7 +214,7 @@ export function isLarkToolBound(
  * without the file is a session that runs the legacy wrapper: keep it there.
  */
 export function sessionLarkToolBound(input: {
-  botConfig: { larkToolBinding?: boolean } | undefined;
+  botConfig: { larkToolBinding?: boolean; triggerUserAuth?: TriggerUserAuthConfig } | undefined;
   dataDir: string;
   sessionId: string;
   /** A worker process is running for this session right now. */
@@ -217,7 +223,7 @@ export function sessionLarkToolBound(input: {
   spawnFacts: Parameters<typeof usesLarkToolBinding>[0];
   workflow?: boolean;
 }): boolean {
-  if (input.botConfig?.larkToolBinding === false) return false;
+  if (!larkToolBindingEnabled(input.botConfig)) return false;
   if (hasLarkToolBinding(input.dataDir, input.sessionId)) return true;
   if (input.workerLive) return false;
   return usesLarkToolBinding(input.spawnFacts, input.dataDir, input.workflow ?? false);

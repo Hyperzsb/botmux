@@ -123,6 +123,7 @@ import {
 import { isInputCaptureTerminalRejection } from '../../core/plugins/input-capture/runtime.js';
 import { shouldPersistTriggeredMessage } from '../../services/durable-primary-turn-admission.js';
 import { LARK_CODE_APP_SCOPE_MISSING } from './lark-errors.js';
+import { senderLoginTools } from '../../services/tool-identity-config.js';
 
 function vcMeetingEventPayloadForLog(data: any): string {
   try {
@@ -2623,9 +2624,10 @@ export function canOperate(
 /**
  * Daemon 命令统一闸：canOperate 恒放行；此外，bot 配置的 `canTalkDaemonCommands`
  * 名单内的命令降到 canTalk 判定（oncall / allowedChatGroup / grant / p2pOpen 等
- * 对话放行腿命中即可）。启用 trigger-user auth 时，`/login` 也自动降到 canTalk：
- * talk-only 用户必须能为自己建立该功能要求的凭证，不能先要求 owner 把他提升成
- * operator。功能关闭时 `/login` 仍保持 canOperate，其他命令也不自动扩权。
+ * 对话放行腿命中即可）。发送者有自己可管理的个人工具凭据时，`/login` 也自动
+ * 降到 canTalk：按触发人鉴权用户可为自己登录；按人鉴权关闭时，固定执行用户本人
+ * 仍可建立固定账号凭据。其他用户不能借固定指派替它写凭据，仍保持 canOperate。
+ * 其它命令不自动扩权。
  *
  * 只作用于 daemon.ts 两条路由的 DAEMON_COMMANDS 统一闸；在统一闸之前特判的命令
  * （/vc-auth /term）与 handler 内部自带 owner 闸的命令（/card /insight）
@@ -2663,10 +2665,11 @@ export function canRunDaemonCommand(
     return true;
   }
   const botConfig = getBot(larkAppId).config;
-  const triggerUserLogin = cmd === '/login' && botConfig.triggerUserAuth?.enabled === true;
+  const personalToolLogin = cmd === '/login'
+    && senderLoginTools(botConfig, senderOpenId).length > 0;
   // Commands the schema declares talk-level (e.g. /resume) need only canTalk.
   const talkLevelCommand = commandSpec(cmd)?.permission === 'talk';
-  if (!triggerUserLogin && !talkLevelCommand && !botConfig.canTalkDaemonCommands?.includes(cmd)) return false;
+  if (!personalToolLogin && !talkLevelCommand && !botConfig.canTalkDaemonCommands?.includes(cmd)) return false;
   return botSender
     ? evaluateBotTalk(larkAppId, chatId, senderOpenId, senderUnionId).allowed
     : canTalk(larkAppId, chatId, senderOpenId, senderUnionId, memberUnionId, chatType);

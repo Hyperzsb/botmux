@@ -76,7 +76,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
     tab: 'common',
     titleKey: 'botDefaults.sectionWorkingDir',
     fieldKeys: [
-      'botDefaults.groupWorkingDir', 'botDefaults.autoWorktree', 'botDefaults.autoStartJoin',
+      'botDefaults.groupWorkingDir', 'botDefaults.autoWorktree', 'botDefaults.autoStartJoin', 'botDefaults.autoStartIdentity',
       'botDefaults.autoStartJoinSeed', 'botDefaults.autoStartTopic', 'botDefaults.autoInviteOwnerOnGroupAdd',
       'botDefaults.groupJoinCommand', 'botDefaults.groupJoinCommandField',
       'botDefaults.workingDirField', 'botDefaults.autoStartJoinPrompt',
@@ -136,6 +136,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
   { id: 'sandbox-paths', tab: 'security', titleKey: 'botDefaults.sectionSandboxPaths' },
   { id: 'trigger-user-auth', tab: 'security', titleKey: 'botDefaults.sectionTriggerUserAuth', fieldKeys: ['botDefaults.triggerUserAuthToggle', 'botDefaults.triggerUserAuthDelegateOnMention'] },
   { id: 'lark-tool-binding', tab: 'security', titleKey: 'botDefaults.sectionLarkToolBinding', fieldKeys: ['botDefaults.larkToolBindingToggle'] },
+  { id: 'tool-identity', tab: 'security', titleKey: 'botDefaults.sectionToolIdentity' },
   {
     id: 'grant',
     tab: 'security',
@@ -399,7 +400,7 @@ export type BotDefaultsRow = {
    *  through the daemon's merge on PUT, so the page neither shows nor sends them. */
   triggerUserAuth?: {
     enabled: boolean;
-    tools: Array<'lark-cli' | 'bytedcli'>;
+    tools: Array<'lark-cli' | 'bytedcli' | 'larkdev'>;
     fallback: 'bot-identity' | 'none';
     /** Where the sender's credentials come from: central platform first
      *  (`auto`, default), platform only, or this machine only. */
@@ -412,6 +413,9 @@ export type BotDefaultsRow = {
   } | null;
   /** lark-cli 应用绑定开关（默认开启）。默认开启以当前 Bot 应用凭证调用并支持 --profile 透传；设为 false 显式关闭。 */
   larkToolBinding?: boolean;
+  /** 固定执行用户（plan §4.1）：某工具按人鉴权关闭时的普通会话执行身份 + 自动轮次低优先级默认。 */
+  toolIdentity?: { user: { larkAppId: string; openId: string; unionId: string; name?: string }; tools: string[]; credentialSource?: string; updatedAt?: string } | null;
+  toolIdentityInvalid?: string | null;
   /** Opt-in policy, configured for future sessions; absence retains legacy behavior. */
   sandboxNetworkPolicy?: import('../../core/sandbox-network-policy.js').SandboxNetworkPolicy | null;
   sandboxNetworkPolicyPlatform?: string | null;
@@ -538,6 +542,11 @@ export type BotDefaultsRow = {
   autoStartOnGroupJoin?: boolean;
   autoStartOnGroupJoinPrompt?: string;
   autoStartOnGroupJoinSeed?: string;
+  /** Bot-level automatic-turn Run as default; null = no default. */
+  automationIdentity?: import('../../services/automation-identity-config.js').AutomationIdentityConfig | null;
+  /** Reason a persisted automationIdentity was rejected at load; null = valid/unset. */
+  automationIdentityInvalid?: string | null;
+  automationIdentityTools?: import('../../services/trigger-user-auth.js').TriggerUserAuthTool[];
   /** 内置默认 seed 文案（按 bot locale），供留空时 placeholder 展示。 */
   autoStartOnGroupJoinSeedDefault?: string;
   groupJoinCommandEnabled?: boolean;

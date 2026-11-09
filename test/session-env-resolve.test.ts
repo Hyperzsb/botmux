@@ -103,8 +103,10 @@ describe('resolveSessionEnv', () => {
 
   it('drops identity-wrapper names from the bot env while the wrapper is on', () => {
     const env = { ZDOTDIR: '/mine', GIT_CONFIG_COUNT: '1', OTHER: 'x' };
-    // lark tool binding is on by default for a local bot
-    expect(resolveSessionEnv({ bot: { env }, backendType: 'tmux' }).env).toEqual({ GIT_CONFIG_COUNT: '1', OTHER: 'x' });
+    // lark tool binding is an explicit opt-in; unset keeps the native env.
+    expect(resolveSessionEnv({ bot: { env }, backendType: 'tmux' }).env).toEqual(env);
+    expect(resolveSessionEnv({ bot: { env, larkToolBinding: true }, backendType: 'tmux' }).env)
+      .toEqual({ GIT_CONFIG_COUNT: '1', OTHER: 'x' });
     expect(resolveSessionEnv({ bot: { env, larkToolBinding: false }, backendType: 'tmux' }).env).toEqual(env);
     expect(resolveSessionEnv({ bot: { env, larkToolBinding: false, triggerUserAuth: { enabled: true } }, backendType: 'tmux' }).env)
       .toEqual({ OTHER: 'x' });
@@ -116,7 +118,7 @@ describe('resolveSessionEnv', () => {
     expect(resolveSessionEnv({ bot: { env }, backendType: 'tmux', facts: { unwrapped: true } }).env).toEqual(env);
     expect(resolveSessionEnv({ bot: { env, triggerUserAuth: { enabled: true } }, backendType: 'tmux', facts: { unwrapped: true } }).env).toEqual(env);
     // HTTP virtual chat / external App Server: binding off, trigger-user auth still wraps
-    expect(resolveSessionEnv({ bot: { env }, backendType: 'tmux', facts: { larkBindingOff: true } }).env).toEqual(env);
+    expect(resolveSessionEnv({ bot: { env, larkToolBinding: true }, backendType: 'tmux', facts: { larkBindingOff: true } }).env).toEqual(env);
     expect(resolveSessionEnv({ bot: { env, triggerUserAuth: { enabled: true } }, backendType: 'tmux', facts: { larkBindingOff: true } }).env).toEqual({ OTHER: 'x' });
     expect(botOneShotEnv({}, { env })).toMatchObject(env);
   });
@@ -131,9 +133,20 @@ describe('resolveSessionEnv', () => {
   });
 
   it('lock context follows the bot flags', () => {
-    expect(sessionEnvLockContextForBot({})).toEqual({ identityShell: true, identityGit: false });
-    expect(sessionEnvLockContextForBot({ apiOnly: true })).toEqual({ identityShell: false, identityGit: false });
-    expect(sessionEnvLockContextForBot({ backendType: 'riff' })).toEqual({ identityShell: false, identityGit: false });
+    expect(sessionEnvLockContextForBot({})).toEqual({ identityShell: false, identityGit: false });
+    expect(sessionEnvLockContextForBot({ larkToolBinding: true })).toEqual({ identityShell: true, identityGit: false });
+    expect(sessionEnvLockContextForBot({ apiOnly: true, larkToolBinding: true })).toEqual({ identityShell: false, identityGit: false });
+    expect(sessionEnvLockContextForBot({ backendType: 'riff', larkToolBinding: true })).toEqual({ identityShell: false, identityGit: false });
+  });
+
+  it('locks the shell and Git identity variables installed for a fixed user', () => {
+    const user = { larkAppId: 'cli_a', openId: 'ou_fixed', unionId: 'on_fixed' };
+    expect(sessionEnvLockContextForBot({
+      toolIdentity: { user, tools: ['lark-cli'], credentialSource: 'local' },
+    })).toEqual({ identityShell: true, identityGit: false });
+    expect(sessionEnvLockContextForBot({
+      toolIdentity: { user, tools: ['bytedcli'], credentialSource: 'local' },
+    })).toEqual({ identityShell: true, identityGit: true });
   });
 });
 

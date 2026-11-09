@@ -7,6 +7,7 @@ import { expect, it } from 'vitest';
 import { fakeLarkHelpScript } from './helpers/lark-tool-help.js';
 import { nodeTsRunnerPrefix, spawnNodeTsScript } from './helpers/ts-runner.js';
 import { larkToolPrompt } from '../src/core/lark-tool-binding.js';
+import { escapeXmlTagLikeTokens } from '../src/utils/xml.js';
 const headlessId = 'hl_11111111-1111-4111-8111-111111111111';
 const headlessChat = `headless_${headlessId}`;
 
@@ -40,6 +41,7 @@ it('a real direct Trae worker pins managed tool PATH after the CLI launcher rese
     child.send!({ type:'init', sessionId:randomUUID(), chatId:headlessChat, rootMessageId:headlessChat,
       headless:{id:headlessId,source:'cli'}, workingDir:dataDir, cliId:'traex', cliPathOverride:fakeCli,
       backendType:'pty', prompt:'', larkAppId:'cli_current_app', larkAppSecret:'', sandbox:false,
+      larkToolBinding:true,
       env:{PATH:botBin + ':' + process.env.PATH} });
     const deadline = Date.now()+25000;
     while (!existsSync(output) && child.exitCode === null && Date.now()<deadline) await new Promise(r=>setTimeout(r,50));
@@ -103,7 +105,8 @@ setInterval(()=>{},1000);
     expect(existsSync(output), logs).toBe(true);
     const result = JSON.parse(readFileSync(output, 'utf8'));
     expect(result.status, result.err).toBe(0);
-    const isBound = larkToolBinding !== false;
+    // 绑定为显式 opt-in：未配置（undefined）不安装绑定，只有 true 才安装。
+    const isBound = larkToolBinding === true;
     expect(result.out).toBe(isBound ? 'cli_current_app' : 'cli_wrong');
     expect(result.path.split(':')[0].includes('cli-identity')).toBe(isBound);
     if (headless) {
@@ -117,7 +120,12 @@ setInterval(()=>{},1000);
   }
 }, 35_000);
 
-it.each([false, true])('aligns a real worker system prompt with the managed bot-default lark identity (headless=%s)', async headless => {
+it.each([
+  { personal: false, headless: false },
+  { personal: false, headless: true },
+  { personal: true, headless: false },
+  { personal: true, headless: true },
+])('aligns a real worker prompt with the selected Lark identity (personal=$personal, headless=$headless)', async ({ personal, headless }) => {
   const root = mkdtempSync(join(tmpdir(), 'worker-lark-prompt-'));
   const dataDir = join(root, 'data'); mkdirSync(dataDir);
   const output = join(root, 'prompt-result.json');
@@ -141,26 +149,30 @@ setInterval(()=>{},1000);
       rootMessageId: headless ? headlessChat : 'om_root',
       headless: headless ? { id: headlessId, source: 'cli' } : undefined,
       workingDir: dataDir, cliId: 'pi', cliPathOverride: fakeCli, backendType: 'pty', prompt: '',
-      larkAppId: 'cli_current_app', larkAppSecret: headless ? '' : 'test-only-secret', locale: 'zh', larkToolBinding: true,
-      triggerUserAuth: { enabled: true, tools: ['lark-cli', 'bytedcli'], fallback: 'bot-identity' },
+      larkAppId: 'cli_current_app', larkAppSecret: headless ? '' : 'test-only-secret', locale: 'zh', larkToolBinding: personal ? undefined : true,
+      triggerUserAuth: { enabled: true, tools: personal ? ['lark-cli', 'bytedcli'] : ['bytedcli'], fallback: 'bot-identity' },
       env: { PATH: `${botBin}:${process.env.PATH}` } });
     const deadline = Date.now() + 25_000;
     while (!existsSync(output) && child.exitCode === null && Date.now() < deadline) await new Promise(r => setTimeout(r, 50));
     expect(existsSync(output), logs).toBe(true);
     const { prompt } = JSON.parse(readFileSync(output, 'utf8'));
-    expect(prompt).toContain('lark-cli 固定使用当前机器人的应用 cli_current_app');
-    expect(prompt).toContain('默认以 bot 身份调用');
-    expect(prompt).toContain('--as user');
-    if (headless) {
-      const expectedPolicy = larkToolPrompt('cli_current_app', 'zh', true);
-      const interactivePolicy = larkToolPrompt('cli_current_app', 'zh', false);
-      expect(expectedPolicy).not.toBe(interactivePolicy);
-      expect(prompt).toContain(`<botmux_lark_tool>\n  ${expectedPolicy}\n</botmux_lark_tool>`);
-      expect(prompt).not.toContain(interactivePolicy);
+    if (personal) {
+      expect(prompt).toContain('已为 lark-cli / bytedcli 启用按当前消息发起人身份注入授权');
+      expect(prompt).not.toContain('默认以 bot 身份调用');
+      expect(prompt).not.toContain('lark-cli 固定使用当前机器人的应用');
+    } else {
+      const expectedPolicy = larkToolPrompt('cli_current_app', 'zh', headless);
+      const otherPolicy = larkToolPrompt('cli_current_app', 'zh', !headless);
+      expect(expectedPolicy).not.toBe(otherPolicy);
+      expect(prompt).toContain(`<botmux_lark_tool>\n  ${escapeXmlTagLikeTokens(expectedPolicy)}\n</botmux_lark_tool>`);
+      expect(prompt).not.toContain(escapeXmlTagLikeTokens(otherPolicy));
+      expect(prompt).toContain('lark-cli 固定使用当前机器人的应用 cli_current_app');
+      expect(prompt).toContain('默认以 bot 身份调用');
+      if (headless) expect(prompt).toContain('--as user 不可用');
+      else expect(prompt).toContain('--as user');
+      expect(prompt).toContain('已为 bytedcli 启用按当前消息发起人身份注入授权');
+      expect(prompt).not.toContain('已为 lark-cli / bytedcli 启用');
     }
-    expect(prompt).toContain('已为 bytedcli 启用按当前消息发起人身份注入授权');
-    expect(prompt).not.toContain('已为 lark-cli / bytedcli 启用');
-    expect(prompt).not.toContain('已为 lark-cli 启用按当前消息发起人身份注入授权');
   } finally {
     if (child.connected) child.send!({ type: 'close' });
     const timer = setTimeout(() => child.kill('SIGKILL'), 5000);

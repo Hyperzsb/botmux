@@ -19,13 +19,17 @@ import {
 } from './session-env.js';
 import { sanitizePerBotEnv } from './per-bot-env.js';
 import { sessionEnvFingerprint } from '../services/session-env-stamp.js';
+import { wrapperIdentityTools, type ToolIdentitySetting } from '../services/tool-identity-config.js';
+import type { TriggerUserAuthConfig } from '../services/trigger-user-auth.js';
 
 /** The bot-config fields the overlay depends on. */
 export interface SessionEnvBotInput {
   env?: Record<string, string>;
   envUnset?: string[];
   envPolicy?: EnvPolicy;
-  triggerUserAuth?: { enabled?: boolean };
+  triggerUserAuth?: Partial<TriggerUserAuthConfig>;
+  toolIdentity?: ToolIdentitySetting;
+  toolIdentityInvalid?: string;
   larkToolBinding?: boolean;
   apiOnly?: boolean;
   backendType?: BackendType;
@@ -46,16 +50,23 @@ export interface SessionEnvLaunchFacts {
 
 /**
  * Identity wrappers a launch runs (sessionEnvLock). Mirrors the worker's
- * gates: the lark tool binding is on unless disabled, apiOnly, remote or off
- * for the session (larkBindingOff, see usesLarkToolBinding); trigger-user auth is opt-in.
- * Without launch facts this is the bot-level view the Dashboard edits against.
+ * gates: the lark tool binding is an explicit opt-in (`larkToolBinding: true`,
+ * plan §3.4); trigger-user auth and a fixed-user assignment install the same
+ * shell transport. Without launch facts this is the bot-level view the
+ * Dashboard edits against.
  */
 export function sessionEnvLockContextForBot(bot: SessionEnvBotInput, facts: SessionEnvLaunchFacts = {}): SessionEnvLockContext {
   if (facts.unwrapped) return {};
   const trigger = bot.triggerUserAuth?.enabled === true;
-  const larkBinding = !facts.larkBindingOff && bot.larkToolBinding !== false && bot.apiOnly !== true
+  const wrapperTools = wrapperIdentityTools(bot);
+  const larkBinding = !facts.larkBindingOff && bot.larkToolBinding === true && bot.apiOnly !== true
     && !isRemoteBackendId(bot.backendType ?? 'pty');
-  return { identityShell: trigger || larkBinding, identityGit: trigger };
+  return {
+    identityShell: trigger || wrapperTools.length > 0 || larkBinding,
+    // Preserve the existing trigger-user lock, and cover the fixed bytedcli
+    // assignment whose wrapper installs the same Git askpass transport.
+    identityGit: trigger || wrapperTools.includes('bytedcli'),
+  };
 }
 
 /**

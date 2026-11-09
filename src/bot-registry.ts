@@ -51,6 +51,8 @@ import type { BudgetConfig } from './services/budget-tracker.js';
 import { normalizePricingOverrides } from './services/model-pricing.js';
 import { normalizeCardFooterExtension, type CardFooterExtensionConfig } from './services/card-footer-extension.js';
 import { parseTriggerUserAuthConfig } from './services/trigger-user-auth.js';
+import { parseAutomationIdentityConfig, isInvalidAutomationIdentity } from './services/automation-identity-config.js';
+import { parseToolIdentityConfig, isInvalidToolIdentity } from './services/tool-identity-config.js';
 import { parseBudgetConfig } from './services/budget-tracker.js';
 import { type Brand, sdkDomain, normalizeBrand } from './im/lark/lark-hosts.js';
 import type { BotSkillPolicy, SkillSelector } from './core/skills/types.js';
@@ -1770,6 +1772,38 @@ export interface BotConfig {
    * device login is started. See services/trigger-user-auth.ts.
    */
   triggerUserAuth?: import('./services/trigger-user-auth.js').TriggerUserAuthConfig;
+  /**
+   * Automatic-turn execution identity (Run as) used by group-entry auto-start,
+   * schedules, and webhooks that have no more specific selection. This is
+   * independent of `triggerUserAuth.enabled`: the managed Lark application
+   * binding can enforce `--as user` on its own. An explicitly configured
+   * identity is fail-closed — a revoked or invalid user denies the governed
+   * tools instead of falling back to the bot/owner/host login.
+   * See services/automation-identity.ts and docs/automation-execution-identity.md.
+   */
+  automationIdentity?: import('./services/automation-identity-config.js').AutomationIdentityConfig;
+  /**
+   * Set when `bots.json` contained an `automationIdentity` the loader rejected
+   * (malformed shape, foreign app, unknown tool, ...). Kept as a distinct
+   * invalid state so automatic turns fail closed instead of silently falling
+   * back to the creator or event actor. Cleared by a successful config write.
+   */
+  automationIdentityInvalid?: string;
+  /**
+   * 固定执行用户（plan §4.1 的 fixed bot user）：`toolIdentity.defaultUser`。
+   * 在某工具「按触发人鉴权关闭」时作为该工具普通会话的执行用户，同时也是
+   * 自动轮次的低优先级默认（任务/连接器 Run as 与 automationIdentity 之后）。
+   * See services/tool-identity-config.ts and docs/plans/2026-11-06-tool-identity-policy-refactor.md §4.
+   */
+  toolIdentity?: import('./services/tool-identity-config.js').ToolIdentityDefaultUserConfig;
+  /**
+   * Set when `bots.json` contained a `toolIdentity` the loader rejected
+   * (malformed shape, foreign app, unknown tool, ...). Kept as a distinct
+   * invalid state so a configured-but-broken winning assignment fails closed
+   * instead of silently falling back to another account or the host login.
+   * Cleared by a successful config write.
+   */
+  toolIdentityInvalid?: string;
   /**
    * lark-cli 应用绑定开关（默认开启）。
    * 默认开启（未配置或 true）：会话内 lark-cli 默认以当前 Bot 应用凭证以 bot 身份调用，支持 --as user 与 --profile 透传；
@@ -3829,6 +3863,31 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     } catch (e) {
       throw new Error(`Bot config [${i}]: ${(e as Error).message}`);
     }
+    // Automation identity is optional and is re-validated against the target
+    // app on every use. A malformed entry is ignored with a warning (the bot
+    // keeps running, automation simply has no default) rather than taking a
+    // working bot offline.
+    const automationIdentityParsed = parseAutomationIdentityConfig(entry.automationIdentity, entry.larkAppId);
+    const parsedAutomationSetting = automationIdentityParsed.value;
+    const automationIdentityInvalid = isInvalidAutomationIdentity(parsedAutomationSetting)
+      ? parsedAutomationSetting.invalid : undefined;
+    if (automationIdentityParsed.warning) {
+      logger.warn(`[bot-registry:${entry.larkAppId}] ignoring invalid automationIdentity: ${automationIdentityParsed.warning}`);
+    }
+    const automationIdentity = parsedAutomationSetting && !isInvalidAutomationIdentity(parsedAutomationSetting)
+      ? parsedAutomationSetting : undefined;
+    // The fixed bot user assignment (toolIdentity) parses into the same
+    // unset | valid | invalid tri-state: a rejected entry is retained as a
+    // configured failure so a broken winning assignment fails closed (plan §4.2).
+    const toolIdentityParsed = parseToolIdentityConfig(entry.toolIdentity, entry.larkAppId);
+    const parsedToolIdentitySetting = toolIdentityParsed.value;
+    const toolIdentityInvalid = isInvalidToolIdentity(parsedToolIdentitySetting)
+      ? parsedToolIdentitySetting.invalid : undefined;
+    if (toolIdentityParsed.warning) {
+      logger.warn(`[bot-registry:${entry.larkAppId}] ignoring invalid toolIdentity: ${toolIdentityParsed.warning}`);
+    }
+    const toolIdentity = parsedToolIdentitySetting && !isInvalidToolIdentity(parsedToolIdentitySetting)
+      ? parsedToolIdentitySetting : undefined;
     const codexBrowser = normalizeCodexBrowserConfig(
       entry.codexBrowser,
       `Bot config [${i}].codexBrowser`,
@@ -4328,6 +4387,10 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         : normalizeRemoteRunnerConfig(entry.remoteRunner),
       codexInstancePool,
       ...(triggerUserAuth ? { triggerUserAuth } : {}),
+      ...(automationIdentity ? { automationIdentity } : {}),
+      ...(automationIdentityInvalid ? { automationIdentityInvalid } : {}),
+      ...(toolIdentity ? { toolIdentity } : {}),
+      ...(toolIdentityInvalid ? { toolIdentityInvalid } : {}),
       larkToolBinding: typeof entry.larkToolBinding === 'boolean' ? entry.larkToolBinding : undefined,
       // Wire representation stays backwards compatible: oncall = legacy `true`;
       // only scratch is a string; off serializes as false.

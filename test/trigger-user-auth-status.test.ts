@@ -79,7 +79,10 @@ function larkLogin(openId: string) {
   const dataDir = join(home, '.local', 'share', 'lark-cli');
   mkdirSync(dataDir, { recursive: true });
   mkdirSync(join(home, '.lark-cli'), { recursive: true });
-  writeFileSync(join(home, '.lark-cli', 'config.json'), JSON.stringify({ apps: [] }));
+  writeFileSync(join(home, '.lark-cli', 'config.json'), JSON.stringify({
+    apps: [{ appId: APP, brand: 'feishu', lang: 'zh', users: [] }],
+  }));
+  writeFileSync(join(home, '.botmux-personal-app'), 'v1\n');
   writeFileSync(join(dataDir, `${APP}_${openId}.enc`), ENC);
 }
 
@@ -173,6 +176,6 @@ describe('queryTriggerUserAuthStatus', () => {
     expect(packed).not.toContain(JWT);
     expect(packed).not.toContain('bob-access-token');
     expect(packed).not.toContain('carol-access-token');
-    expect(spawned).toEqual([['auth', 'status', '--json']]);
+    expect(spawned).toEqual([['--site', 'cn', 'auth', 'status', '--json']]);
   });
 });

@@ -33,7 +33,7 @@ import {
   parseBotDefaultsTab,
   type BotDefaultsTab,
 } from '../src/dashboard/web/bot-defaults.js';
-import { BotAgentSection, BotDefaultsTabs, readBotDefaultsDeepLink, resolveBotDefaultsTarget } from '../src/dashboard/web/bot-defaults-page.js';
+import { AutoStartControls, BotAgentSection, BotDefaultsTabs, readBotDefaultsDeepLink, resolveBotDefaultsTarget } from '../src/dashboard/web/bot-defaults-page.js';
 import { dashboardRoutes, findDashboardRoute } from '../src/dashboard/web/dashboard-routes.js';
 import { INSIGHT_TABS } from '../src/dashboard/web/insight-tabs.js';
 import { NAV_ITEMS, NAV_SUBPAGES, PALETTE_UNINDEXED_ROUTES, type NavItem } from '../src/dashboard/web/nav-items.js';
@@ -676,6 +676,32 @@ describe('⌘K reaches the Bot config page, its categories and each bot', () => 
     const doc = (root: FakeEl) => ({ getElementById: (id: string) => root.find(id) }) as unknown as Pick<Document, 'getElementById'>;
     const section = (id: string) => findBotDefaultsSection(id)!;
     const titleOf = (key: string) => new FakeEl('span', ['bd-field-title-text'], zh(key));
+
+    it('lands on the execution identity row rendered by the real auto-start controls', async () => {
+      vi.stubGlobal('fetch', async () => ({ ok: true, json: async () => ({ users: [] }) }));
+      let renderer!: TestRenderer.ReactTestRenderer;
+      await act(async () => {
+        renderer = TestRenderer.create(createElement(AutoStartControls, {
+          bot: { larkAppId: 'cli_identity_deep_link' },
+          putCardPref: async () => ({ ok: true, status: 200, body: { ok: true } }),
+        }));
+      });
+      let identityRow: FakeEl | undefined;
+      const toDom = (node: TestRenderer.ReactTestRendererJSON | string): FakeEl => {
+        if (typeof node === 'string') return new FakeEl('#text', [], node);
+        const element = new FakeEl(node.type, (node.props.className ?? '').split(' ').filter(Boolean), '', node.props.id ?? '');
+        if (node.props['data-field'] === 'automation-identity') identityRow = element;
+        return element.add(...(node.children ?? []).map(toDom));
+      };
+      const tile = new FakeEl('section', ['bd-section'], '', botDefaultsSectionDomId('working-dir'))
+        .add(toDom(renderer.toJSON() as TestRenderer.ReactTestRendererJSON));
+      const result = resolveBotDefaultsTarget({
+        tab: 'common', section: section('working-dir'), field: 'botDefaults.autoStartIdentity',
+      }, doc(tile), zh);
+      expect(identityRow).toBeDefined();
+      expect(result).toEqual({ target: identityRow, block: 'center', missing: null });
+      act(() => renderer.unmount());
+    });
 
     it('lands on the option row inside its section', () => {
       const row = new FakeEl('div', ['bd-mode-group']).add(new FakeEl('h4', ['bd-mode-group-title'], zh('botDefaults.groupRegular')));

@@ -24,9 +24,13 @@ vi.mock('node:child_process', () => ({
     child.stderr = Object.assign(new EventEmitter(), { destroy() {} });
     child.kill = () => {};
     const authorized = existsSync(join(options.env.HOME, 'authorized'));
-    const isDefault = args[0] === 'auth' && args[1] === 'get-bytecloud-jwt-token';
-    const isStatus = args[0] === 'auth' && args[1] === 'status';
-    const isBegin = args[0] === 'auth' && args[1] === 'login' && args.includes('--begin');
+    const authIndex = args.indexOf('auth');
+    const authCommand = authIndex >= 0 ? args[authIndex + 1] : undefined;
+    const siteIndex = args.indexOf('--site');
+    const site = siteIndex >= 0 ? args[siteIndex + 1] : 'cn';
+    const isDefault = authCommand === 'get-bytecloud-jwt-token' && site === 'cn';
+    const isStatus = authCommand === 'status';
+    const isBegin = authCommand === 'login' && args.includes('--begin');
     // A provider request already accepted before a local logout can still
     // finish successfully; later requests observe the deleted authorization.
     const reply = isStatus ? JSON.stringify({ status: 'success', data: { authenticated: authorized } })
@@ -129,7 +133,7 @@ describe('JWT lifecycle adversarial timing probes', () => {
     await vi.advanceTimersByTimeAsync(7000);
     clearInterval(timer);
     await Promise.all(counts);
-    expect(calls.filter(a => a[1] === 'get-bytecloud-jwt-token')).toHaveLength(1);
+    expect(calls.filter(a => a.includes('get-bytecloud-jwt-token') && a.includes('cn'))).toHaveLength(1);
     expect(identity.recallProvenIdentityContent(home, SESSION, TURN, 'bytedcli')).toBeUndefined();
     expect(renewal.trackedBytedcliRenewalCount()).toBe(0);
   });
@@ -142,7 +146,7 @@ describe('JWT lifecycle adversarial timing probes', () => {
     await vi.advanceTimersByTimeAsync(12_000);
     clearInterval(timer);
     expect((await Promise.all(counts)).reduce((a, b) => a + b, 0)).toBe(1);
-    expect(calls.filter(a => a[1] === 'get-bytecloud-jwt-token')).toHaveLength(1);
+    expect(calls.filter(a => a.includes('get-bytecloud-jwt-token') && a.includes('cn'))).toHaveLength(1);
     expect(renewal.trackedBytedcliRenewalCount()).toBe(1);
     expect(await renewal.renewExpiringBytedcliIdentities()).toBe(0);
   });

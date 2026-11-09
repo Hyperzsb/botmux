@@ -27,6 +27,10 @@ vi.mock('../src/utils/user-token.js', async (importOriginal) => ({
 vi.mock('../src/services/bytedcli-auth.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../src/services/bytedcli-auth.js')>()),
   renewBytedcliJwts: vi.fn(async () => null),
+  mintByteCloudUserJwts: vi.fn(async (openId: string) => {
+    const jwts = bytedcliJwts.get(openId);
+    return jwts ? { cn: jwts.cloudJwt } : null;
+  }),
   mintBytedcliJwts: vi.fn(async (openId: string) => bytedcliJwts.get(openId) ?? null),
   beginBytedcliLogin: vi.fn(async () => ({ authUrl: 'https://cloud.example.com/auth', completeToken: 'tok' })),
 }));
@@ -44,7 +48,11 @@ const { execFileSync } = await import('node:child_process');
 const fs = await import('node:fs');
 const nodePath = await import('node:path');
 const nodeOs = await import('node:os');
-const { parseTriggerUserAuthConfig } = await import('../src/services/trigger-user-auth.js');
+const { parseTriggerUserAuthConfig, TRIGGER_USER_AUTH_TOOLS } = await import('../src/services/trigger-user-auth.js');
+const { normalizeToolIdentityPolicy, toolIdentityPublicationEnabled, assertToolIdentitySession } =
+  await import('../src/services/tool-identity-config.js');
+const { selectToolCredential } = await import('../src/core/tool-identity-policy.js');
+const { toolIdentityDecisionFromReplyTarget } = await import('../src/core/tool-identity-decision.js');
 const { resolveDispatchUser, dispatchCallerFromReply } = await import('../src/core/dispatch-user-delegation.js');
 const { pickTurnReplyTarget } = await import('../src/core/reply-target.js');
 const { readDispatchRegistryLoose, revokeWorkflowHandoff, lookupWorkflowHandoff } = await import('../src/core/workflow-handoff-binding.js');
@@ -70,7 +78,7 @@ afterEach(() => cleanupBotRuns());
 const DAEMON_FUNCTIONS = [
   'triggerUserAuthEnabledFor', 'prepareTurnCliIdentity', 'dispatchUserForTurn', 'workflowDelegationRefusalFor',
   'targetUserForDelegation', 'refreshTurnCliIdentity', 'identityPublicationConflicted', 'identityModelForPublication',
-  'workflowHandoffIdentityCheck', 'withdrawWorkflowHandoffIdentity',
+  'assertTurnIdentitySession', 'workflowHandoffIdentityCheck', 'withdrawWorkflowHandoffIdentity',
 ];
 
 /** The production functions, evaluated against `scope` (no daemon import). */
@@ -126,6 +134,11 @@ async function receiver(opts: { self?: boolean; alsoApproved?: string[]; main?: 
   const scope: Record<string, any> = {
     config: { session: { dataDir: world.dataDir } },
     pickTurnReplyTarget, resolveDispatchUser, dispatchCallerFromReply,
+    toolIdentityPublicationEnabled, normalizeToolIdentityPolicy, toolIdentityDecisionFromReplyTarget,
+    selectToolCredential, TRIGGER_USER_AUTH_TOOLS, assertToolIdentitySession,
+    isLarkToolBound: () => false,
+    assertAutomationUserAllowed: () => undefined,
+    noteSenderUnionId: () => undefined,
     getBot: () => ({ config: botConfig(appId, ['bytedcli', 'lark-cli']) }),
     loadOrCreateDispatchReportBindingSecret: () => SECRET,
     // The target app's own contact directory: union_id → ITS open_id.
@@ -462,7 +475,7 @@ function runFileWrapper(dataDir: string, sessionId: string): string {
   const dir = fs.mkdtempSync(nodePath.join(nodeOs.tmpdir(), 'wf-id-wrap-'));
   try {
     const fake = nodePath.join(dir, 'real-bytedcli');
-    fs.writeFileSync(fake, '#!/bin/sh\necho "RAN jwt=${BYTEDCLI_USER_CLOUD_JWT:-none}"\n', { mode: 0o755 });
+    fs.writeFileSync(fake, '#!/bin/sh\necho "RAN jwt=${BYTECLOUD_CLI_API_JWT_TOKEN_CN:-none}"\n', { mode: 0o755 });
     const wrapper = nodePath.join(dir, 'bytedcli');
     fs.writeFileSync(wrapper, renderIdentityWrapper('bytedcli', fake, 'single'), { mode: 0o755 });
     try {

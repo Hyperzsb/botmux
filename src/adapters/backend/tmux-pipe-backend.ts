@@ -1831,7 +1831,7 @@ export class TmuxPipeBackend implements SessionBackend {
       ? { kind: shellKind, script: 'exec "$@"', argv: strictPaneCommand(bin, args, opts) }
       : {
         kind: shellKind,
-        script: shellWrapperScript(resolveBotmuxWrapperBinDir(opts.env ?? process.env), shellKind),
+        script: shellWrapperScript(resolveBotmuxWrapperBinDir(opts.env ?? process.env), shellKind, opts.env?.BOTMUX_IDENTITY_BIN),
         argv: [
           opts.cwd,
           ...buildBotmuxEnvAssignments(

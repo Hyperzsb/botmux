@@ -462,7 +462,7 @@ export function beginReplyTargetTurn(
   replyRootId: string | undefined,
   turnId: string,
   nowIso = new Date().toISOString(),
-  opts?: { quoteOnly?: boolean; substitute?: boolean; senderOpenId?: string; participants?: TurnParticipant[]; participantsIncomplete?: boolean; inThread?: boolean; foldedRootId?: string; sourceMessageId?: string },
+  opts?: { quoteOnly?: boolean; substitute?: boolean; senderOpenId?: string; participants?: TurnParticipant[]; participantsIncomplete?: boolean; inThread?: boolean; foldedRootId?: string; sourceMessageId?: string; lifecycleSynthetic?: boolean },
 ): void {
   if (isLarkChatId(replyRootId)) replyRootId = undefined;
   // #597: the frozen per-turn dispatch context — the authoritative reply target
@@ -528,6 +528,15 @@ export function beginReplyTargetTurn(
   const isChatScope = ds.scope === 'chat';
   const targets = { ...(ds.session.replyTargets ?? {}) };
   targets[turnId] = {
+    ...(targets[turnId]?.automationUser !== undefined ? { automationUser: targets[turnId].automationUser } : {}),
+    ...(targets[turnId]?.toolIdentityDecision !== undefined
+      ? { toolIdentityDecision: targets[turnId].toolIdentityDecision } : {}),
+    ...(targets[turnId]?.automationIdentitySource !== undefined
+      ? { automationIdentitySource: targets[turnId].automationIdentitySource } : {}),
+    ...(targets[turnId]?.automationIdentityTools !== undefined
+      ? { automationIdentityTools: targets[turnId].automationIdentityTools } : {}),
+    ...(targets[turnId]?.lifecycleSynthetic ? { lifecycleSynthetic: true as const } : {}),
+    ...(opts?.lifecycleSynthetic ? { lifecycleSynthetic: true as const } : {}),
     ...(isChatScope && replyRootId ? { rootMessageId: replyRootId } : {}),
     updatedAt: nowIso,
     ...(isChatScope ? { quoteOnly: opts?.quoteOnly, substitute: opts?.substitute } : {}),

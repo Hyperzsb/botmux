@@ -23,6 +23,7 @@ export interface ConnectorTopicMessageExtractor {
 }
 
 export interface ConnectorDefinition {
+  runAsUser?: import('./automation-identity.js').AutomationUser;
   id: string;
   name: string;
   enabled: boolean;

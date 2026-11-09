@@ -2,6 +2,10 @@ import { ModelPinBusyError, modelPinClearError } from './model-pin.js';
 import { isSessionEffortChangeInFlight } from './worker-pool.js';
 import { scheduleActiveRuntimePatch } from './worker-pool.js';
 import { botModelPins, clearModelPins } from './model-pin-store.js';
+import { assertAutomationUserPolicy, listAutomationUsers, resolveAutomationUser, resolveFixedToolUser } from '../services/automation-identity.js';
+import { automationIdentityTools } from '../services/automation-identity-config.js';
+import { managedSessionCapable } from '../services/tool-identity-config.js';
+import { getConnector } from '../services/connector-store.js';
 import { normalizeCodexProfile, scanCodexProfiles, validateCodexProfile, CodexProfileError } from '../services/codex-profiles.js';
 import { REPLY_FOOTER_KEYS, normalizeReplyFooter, type ReplyFooterPreferences } from '../services/reply-footer.js';
 import { resumeStartsFresh } from '../services/resume-fresh-policy.js';
@@ -549,7 +553,7 @@ import { getBotBrand, getBot, getBotClient, getBotOpenId, getOwnerOpenId, loadBo
 import { generateAuthUrl, tryHandleCallbackUrl, getFeedGroupAuthStatus, isUsableOpenId, listAuthorizedUsers, FEED_GROUP_OAUTH_SCOPES, requestUserAuthorization } from '../utils/user-token.js';
 import { queryTriggerUserAuthStatus } from '../services/trigger-user-auth-status.js';
 import { revokeTriggerUserAuth } from '../services/revoke-trigger-user-auth.js';
-import { tokenStoreProtection, triggerUserAuthApplies, credentialSourceOf, type TriggerUserAuthConfig } from '../services/trigger-user-auth.js';
+import { tokenStoreProtection, triggerUserAuthApplies, credentialSourceOf, larkToolBindingEnabled, TRIGGER_USER_AUTH_TOOLS, type TriggerUserAuthConfig, type TriggerUserAuthTool } from '../services/trigger-user-auth.js';
 import { platformCredentialsUrl } from '../platform/credential-grant-client.js';
 import { scanCredentialBearingMcpServers, credentialBearingMcpAdvisory } from '../services/credential-bearing-mcp.js';
 import { clampSessionTagName, defaultSessionTagName } from '../services/feed-group-tagger.js';
@@ -571,6 +575,8 @@ import { sessionAuthRequests } from './session-auth-requests.js';
 import { resolveUserToken } from '../utils/user-token.js';
 import { currentLarkToolDelegation, getLarkToolDelegation } from './lark-tool-delegation.js';
 import { publishDelegationRefusal, retryTransientTurnIdentity, awaitTurnIdentityPublication } from './turn-cli-identity.js';
+import { beginLarkCliLogin, completeLarkCliLogin, larkCliHomeForTurn, larkCliLoginScopes, materializeLarkCliHomeForSession } from '../services/lark-cli-auth.js';
+import type { SessionAuthorization } from './session-auth-requests.js';
 import { platformAuthRequestRedirect, resolveBoundLarkUserCredential } from './lark-tool-platform-credential.js';
 import type { ReplyStyleConfig } from '../im/lark/reply-card-style.js';
 import {
@@ -1593,7 +1599,7 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
     ? record.sessionId : undefined;
   // The Codebase CLI companion mirrors bytedcli's proven identity, so its
   // wrapper uses the same proof channel and tool name.
-  const identityRouteTools = ['lark-cli', 'bytedcli', 'codebase'] as const;
+  const identityRouteTools = ['lark-cli', 'bytedcli', 'larkdev', 'codebase'] as const;
   type IdentityRouteTool = typeof identityRouteTools[number];
   const toolValue = typeof record?.tool === 'string' ? record.tool : '';
   const tool: IdentityRouteTool | '' = (identityRouteTools as readonly string[]).includes(toolValue)
@@ -3449,14 +3455,41 @@ ipcRoute('GET', '/api/sessions/:sessionId/preview', (req, res, params) => {
 
 /** Session-local access key, installed with the tool entry at standard launch.
  * This selects the configured app; it is not a process/turn attestation API. */
-function boundLarkToolRequest(req: IncomingMessage, sessionId: string, appId?: string, botConfig?: { larkToolBinding?: boolean }): boolean {
+function boundLarkToolRequest(req: IncomingMessage, sessionId: string, appId?: string, botConfig?: { larkToolBinding?: boolean; triggerUserAuth?: TriggerUserAuthConfig }): boolean {
   const cfg = botConfig ?? (appId ? (() => { try { return getBot(appId).config; } catch { return undefined; } })() : undefined);
-  if (cfg?.larkToolBinding === false) return false;
+  if (!larkToolBindingEnabled(cfg)) return false;
   try {
     const binding = readLarkToolBinding(larkToolBindingPath(config.session.dataDir, sessionId));
     return binding.appId === appId && binding.sessionId === sessionId
       && req.headers['x-botmux-lark-session'] === binding.accessKey;
   } catch { return false; }
+}
+
+/** Frozen automation tool boundary for the exact execution-identity turn.
+ *  `undefined` = an ordinary human/unscoped turn (no restriction); a defined
+ *  array = automation turn, where a missing snapshot fails closed. Managed Lark
+ *  bypasses `publishTurnCliIdentity`, so this endpoint must enforce the same
+ *  boundary itself. */
+function automationExecutionToolScope(
+  ds: DaemonSession | undefined,
+  identityTurnId: string | undefined,
+): readonly TriggerUserAuthTool[] | undefined {
+  if (!ds || !identityTurnId) return undefined;
+  const entry = ds.session.replyTargets?.[identityTurnId];
+  // A frozen snapshot is identified by either audit source or tool scope. If
+  // a scope exists without source (older/partially written snapshot), still
+  // enforce it; a missing tools array on a known automation turn is fail-closed.
+  if (!entry || (entry.automationIdentitySource === undefined && entry.automationIdentityTools === undefined)) {
+    return undefined;
+  }
+  return entry.automationIdentityTools ?? [];
+}
+function automationToolScopeExcluded(res: ServerResponse, tool: TriggerUserAuthTool): void {
+  jsonRes(res, 403, {
+    ok: false,
+    error: 'automation_tool_scope_excluded',
+    message: `This automation turn's frozen tool scope excludes ${tool}.`,
+  });
 }
 
 ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res, params) => {
@@ -3518,7 +3551,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
     && ds.session.headless.source === 'cli'
     && isHeadlessId(ds.session.headless.id)
     && headlessChatId(ds.session.headless.id) === ds.chatId;
-  let botConfig: { larkToolBinding?: boolean; apiOnly?: boolean } | undefined;
+  let botConfig: { larkToolBinding?: boolean; triggerUserAuth?: TriggerUserAuthConfig; apiOnly?: boolean } | undefined;
   try { botConfig = targetLarkAppId ? getBot(targetLarkAppId).config : undefined; } catch { /* bot missing */ }
   if ((!ds && !detachedScheduled)
     || (ds && ds.session.status !== 'active')
@@ -3588,6 +3621,11 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
     });
   }
   const identityTurnId = liveOrigin?.identityTurnId;
+  const identityTurn = identityTurnId ?? turnId;
+  const initialAutomationScope = automationExecutionToolScope(ds, identityTurn);
+  if (initialAutomationScope !== undefined && !initialAutomationScope.includes('lark-cli')) {
+    return automationToolScopeExcluded(res, 'lark-cli');
+  }
   if (process.platform === 'linux' && !execution && !detachedForUser) {
     return jsonRes(res, 403, { ok: false, error: 'current_execution_unverified' });
   }
@@ -3599,7 +3637,17 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
     return jsonRes(res, 403, { ok: false, error: delegatedError(delegated.denialReason ?? 'target user/tool access unavailable') });
   }
   const sender = delegated?.targetOpenId ?? originSender;
-  if (!sender) return jsonRes(res, 403, { ok: false, error: 'No current requesting user; --as user requires their authorization' });
+  if (!sender) {
+    const automaticTurn = turnId.startsWith('schedule:')
+      || turnId.startsWith('join_') || turnId.startsWith('trg_');
+    return jsonRes(res, 403, {
+      ok: false,
+      error: automaticTurn
+        ? 'This automatic turn has no execution identity. Configure Run as on the task/connector or the bot automation default; a login link cannot create one because no human triggered this turn.'
+        : 'No current requesting user; --as user requires their authorization',
+      ...(automaticTurn ? { errorCode: 'automation_identity_missing' } : {}),
+    });
+  }
   const cached = delegated ? undefined : getIdentity(bot.larkAppId, sender);
   const user = delegated ? { type: 'user' as const, openId: sender }
     : cached?.type === 'user' && ['sender', 'message_api', 'contact_api'].includes(cached.source)
@@ -3625,6 +3673,14 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
     || !stableAfterAwait
     || (!detachedForUser && JSON.stringify(getLarkToolDelegation(config.session.dataDir, params.sessionId, identityTurnId ?? turnId)) !== JSON.stringify(delegated))) {
     return jsonRes(res, 409, { ok: false, error: 'The current requesting user changed; retry the command' });
+  }
+  // Re-check the frozen automation boundary AFTER the asynchronous credential
+  // resolution: the scope must be unchanged and must still include lark-cli, or
+  // a narrower/removed snapshot could leak a token the turn excludes.
+  const currentAutomationScope = automationExecutionToolScope(ds, identityTurn);
+  if (JSON.stringify(currentAutomationScope) !== JSON.stringify(initialAutomationScope)
+    || (currentAutomationScope !== undefined && !currentAutomationScope.includes('lark-cli'))) {
+    return automationToolScopeExcluded(res, 'lark-cli');
   }
   if (!resolved.ok && resolved.reason === 'platform') {
     return jsonRes(res, 403, { ok: false, error: resolved.error, ...(resolved.authorizeUrl ? { authorizeUrl: resolved.authorizeUrl } : {}) });
@@ -3742,6 +3798,12 @@ for (const action of ['auth-request', 'auth-status']) {
       return grant.targetOpenId;
     };
     const identityTurnId = origin.identityTurnId ?? origin.turnId;
+    // `auth-request` / `auth-status` mint or publish lark-cli user material, so
+    // they obey the same frozen automation boundary as the identity endpoint.
+    const initialAutomationScope = automationExecutionToolScope(ds, identityTurnId);
+    if (initialAutomationScope !== undefined && !initialAutomationScope.includes('lark-cli')) {
+      return automationToolScopeExcluded(res, 'lark-cli');
+    }
     const delegated = getLarkToolDelegation(config.session.dataDir, params.sessionId, identityTurnId);
     const callerOpenId = requestingUser();
     if (!callerOpenId) return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
@@ -3757,6 +3819,7 @@ for (const action of ['auth-request', 'auth-status']) {
       && ds.managedTurnOrigin?.turnId === turnId && ds.managedTurnOrigin?.capability === capability
       && (ds.managedTurnOrigin.identityTurnId ?? ds.managedTurnOrigin.turnId) === identityTurnId
       && ds.managedTurnOrigin?.dispatchAttempt === attempt && requestingUser() === callerOpenId
+      && JSON.stringify(automationExecutionToolScope(ds, identityTurnId)) === JSON.stringify(initialAutomationScope)
       && JSON.stringify(getLarkToolDelegation(config.session.dataDir, params.sessionId, identityTurnId)) === JSON.stringify(delegated);
     // An accepted grant outlives its originating turn: the daemon-side poll
     // keeps completing it while the session/app stay valid (isAuthorizationValid),
@@ -3793,7 +3856,7 @@ for (const action of ['auth-request', 'auth-status']) {
         if (!boundTool) {
           const storageModel = identityStorageModelForDaemonSession(ds);
           if (!refreshSessionIdentity(config.session.dataDir, params.sessionId, {
-            tool: 'lark-cli', appId: cfg.larkAppId, userAccessToken: result.token, turnId: identityTurnId,
+            tool: 'lark-cli', ...('home' in result ? { mode: 'user-home' as const, home: result.home } : { appId: cfg.larkAppId, userAccessToken: result.token }), turnId: identityTurnId,
             openId: callerOpenId,
           }, storageModel)) {
             // Material for this turn is gone for good (collected / never
@@ -3833,8 +3896,7 @@ for (const action of ['auth-request', 'auth-status']) {
       const liveIdentityTurnId = liveOrigin!.identityTurnId ?? liveOrigin!.turnId!;
       if (!refreshSessionIdentity(config.session.dataDir, params.sessionId, {
         tool: 'lark-cli',
-        appId: cfg.larkAppId,
-        userAccessToken: result.token,
+        ...('home' in result ? { mode: 'user-home' as const, home: result.home } : { appId: cfg.larkAppId, userAccessToken: result.token }),
         turnId: liveIdentityTurnId,
         openId: request.callerOpenId,
       }, storageModel)) {
@@ -3940,11 +4002,43 @@ for (const action of ['auth-request', 'auth-status']) {
           scopes: request.authorization.scopes, expiresIn: remaining, autoCallback: true });
       }
     }
-    let authorization: Awaited<ReturnType<typeof requestUserAuthorization>>;
+    let authorization: SessionAuthorization;
     try {
-      authorization = await requestUserAuthorization(
-        cfg.larkAppId, appSecret, brand, scopes, callerOpenId, isAuthorizationValid,
-      );
+      if (boundTool) {
+        authorization = await requestUserAuthorization(
+          cfg.larkAppId, appSecret, brand, scopes, callerOpenId, isAuthorizationValid,
+        );
+      } else {
+        // Legacy governed tools use the human's personal app, while the bound
+        // tool retains upstream's explicit bot-app/platform credential flow.
+        // A delegated target open_id is app-scoped; local login state stays
+        // keyed by the verified issuer's credential identity.
+        const credentialOpenId = delegated?.credentialOpenId ?? callerOpenId;
+        const login = await (brand === 'lark'
+          ? beginLarkCliLogin(credentialOpenId, scopes, brand)
+          : beginLarkCliLogin(credentialOpenId, scopes));
+        if (!isCurrent()) return jsonRes(res, 409, { ok: false, error: 'auth_turn_changed' });
+        if (!login) return jsonRes(res, 502, { ok: false, error: 'authorization_request_failed' });
+        if (login.stage === 'app-setup') {
+          return jsonRes(res, 409, { ok: false, error: 'personal_lark_app_required', authUrl: login.authUrl });
+        }
+        authorization = {
+          authUrl: login.authUrl,
+          scopes: login.scopes ?? larkCliLoginScopes(scopes),
+          expiresIn: 9 * 60,
+          poll: async () => {
+            const completed = await completeLarkCliLogin(credentialOpenId);
+            if (completed.state === 'pending') return { status: 'pending' };
+            if (completed.state === 'failed') return { status: 'failed', error: completed.detail ?? 'authorization_failed' };
+            if (!isAuthorizationValid()) return { status: 'failed', error: 'auth_turn_changed' };
+            const sandbox = ds.session.sandbox;
+            const home = sandbox === true || sandbox === 'oncall' || sandbox === 'scratch'
+              ? await materializeLarkCliHomeForSession(credentialOpenId, config.session.dataDir, params.sessionId)
+              : larkCliHomeForTurn(credentialOpenId);
+            return home ? { status: 'ready', home } : { status: 'failed', error: 'authorization_identity_unavailable' };
+          },
+        };
+      }
     } catch {
       return jsonRes(res, 502, { ok: false, error: 'authorization_request_failed' });
     }
@@ -6480,6 +6574,7 @@ function parseSchedulePreconditionWrite(
 }
 
 export interface ScheduleRow {
+  runAsUser?: ScheduledTask['runAsUser'];
   id: string;
   calendar?: string;
   calendarDayType?: import('../services/work-calendar.js').CalendarDayType;
@@ -6679,6 +6774,7 @@ function schedulePreconditionProjection(
 
 function composeScheduleRow(t: ScheduledTask): ScheduleRow {
   return {
+    runAsUser: t.runAsUser,
     calendar: t.calendar,
     calendarDayType: t.calendar ? t.calendarDayType ?? 'workday' : undefined,
     lastCalendarCheck: t.lastCalendarCheck,
@@ -6713,6 +6809,19 @@ function composeScheduleRow(t: ScheduledTask): ScheduleRow {
     feishuChatLink: feishuChatLink(t.chatId, getBotBrand(t.larkAppId)),
   };
 }
+
+ipcRoute('POST', '/api/automation-users/resolve', requireBoundBot(async (req, res) => {
+  try {
+    const body = await readJsonBody(req) as { runAsOpenId?: unknown };
+    const user = await resolveAutomationUser(cachedLarkAppId, body?.runAsOpenId);
+    jsonRes(res, 200, { ok: true, user: user ?? null });
+  } catch (error) { jsonRes(res, 400, { ok: false, error: ipcErrorText(error) }); }
+}, NOT_BOUND_BODY.okFalse));
+
+ipcRoute('GET', '/api/automation-users', requireBoundBot((_req, res) => {
+  try { jsonRes(res, 200, { users: listAutomationUsers(cachedLarkAppId).map(({ openId, name, email }) => ({ openId, name, email })) }); }
+  catch { jsonRes(res, 503, { ok: false, error: 'automation_users_unavailable' }); }
+}, NOT_BOUND_BODY.okFalse));
 
 ipcRoute('GET', '/api/schedules/calendars', requireBoundBot((_req, res) => {
   jsonRes(res, 200, listWorkCalendars(cachedLarkAppId));
@@ -7187,6 +7296,7 @@ ipcRoute('POST', '/api/schedules', requireBoundBot(async (req, res) => {
   // a clear lastError, which is the pre-existing behavior for CLI-created
   // tasks. Adding a flaky gate here would block valid creates.
   try {
+    const runAsUser = await resolveAutomationUser(cachedLarkAppId, b.runAsOpenId);
     // Signed in through the platform with Feishu: that person is the creator.
     // Otherwise (token login, or the person cannot operate this bot) keep the
     // historical attribution to the bot owner below.
@@ -7225,6 +7335,7 @@ ipcRoute('POST', '/api/schedules', requireBoundBot(async (req, res) => {
       // creator is still allowed at every run (scheduled-turn-provenance).
       ownerOpenId,
       ownerUnionId,
+      runAsUser,
       deliver,
       silent,
       followActive: followActive || undefined,
@@ -7251,6 +7362,7 @@ ipcRoute('PATCH', '/api/schedules/:id', async (req, res, p) => {
   }
   const b = body as Record<string, unknown>;
   const updates: {
+    runAsUser?: ScheduledTask['runAsUser'] | null;
     name?: string; prompt?: string; schedule?: string; calendar?: string | null;
     calendarDayType?: import('../services/work-calendar.js').CalendarDayType | null;
     deliver?: 'origin' | 'new-topic'; silent?: boolean;
@@ -7259,6 +7371,10 @@ ipcRoute('PATCH', '/api/schedules/:id', async (req, res, p) => {
     model?: string | null; reasoningEffort?: ScheduleReasoningEffort | null;
     creator?: { openId: string; unionId: string };
   } = {};
+  if (Object.hasOwn(b, 'runAsOpenId')) {
+    try { updates.runAsUser = await resolveAutomationUser(cachedLarkAppId, b.runAsOpenId) ?? null; }
+    catch (error) { return jsonRes(res, 400, { ok: false, error: ipcErrorText(error), field: 'runAsOpenId' }); }
+  }
   const chatTargets = parseScheduleChatTargets(b, false);
   if (chatTargets && !chatTargets.ok) {
     return jsonRes(res, 400, { ok: false, error: 'invalid_field', field: chatTargets.field });
@@ -7468,7 +7584,20 @@ ipcRoute('POST', '/api/trigger', requireBoundBot(async (req, res) => {
         error: 'active session registry unavailable',
       });
     }
-    const result = await triggerSessionTurn(valid.request, { larkAppId: cachedLarkAppId, activeSessions });
+    // Resolve only saved connector policy. Payloads and generic trigger callers
+    // cannot supply an execution user or overwrite the stored selection.
+    const connector = valid.request.source.type === 'webhook' && valid.request.source.connectorId
+      ? getConnector(valid.request.source.connectorId) : undefined;
+    if (connector?.runAsUser && connector.target.botId !== cachedLarkAppId) {
+      return jsonRes(res, 400, { ok: false, errorCode: 'bad_request', error: 'run_as_user_app_mismatch' });
+    }
+    const result = await triggerSessionTurn(valid.request, { larkAppId: cachedLarkAppId, activeSessions },
+      connector?.runAsUser
+        ? { executionUser: connector.runAsUser }
+        // No connector selection: the trigger is automatic, so fall back to the
+        // bot's explicit automation default. A human sender never reaches this
+        // route with an anonymous caller, and this never invents one.
+        : { useBotAutomationDefault: true });
     const status = result.ok
       ? 200
       // An idempotent retry that resolves to a durable `failed` async state is a
@@ -9242,6 +9371,19 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     autoStartOnGroupJoin: cardPrefs.autoStartOnGroupJoin,
     autoStartOnGroupJoinPrompt: cardPrefs.autoStartOnGroupJoinPrompt,
     autoStartOnGroupJoinSeed: cardPrefs.autoStartOnGroupJoinSeed,
+    // Bot-level automatic-turn Run as default (group entry / schedules /
+    // webhooks without a more specific selection). The picker resolves users
+    // through /api/automation-users; this only echoes the saved selection.
+    automationIdentity: (() => { try { return getBot(cachedLarkAppId).config.automationIdentity ?? null; } catch { return null; } })(),
+    automationIdentityInvalid: (() => { try { return getBot(cachedLarkAppId).config.automationIdentityInvalid ?? null; } catch { return null; } })(),
+    toolIdentity: (() => { try { return getBot(cachedLarkAppId).config.toolIdentity ?? null; } catch { return null; } })(),
+    toolIdentityInvalid: (() => { try { return getBot(cachedLarkAppId).config.toolIdentityInvalid ?? null; } catch { return null; } })(),
+    automationIdentityTools: (() => {
+      try {
+        const cfg = getBot(cachedLarkAppId).config;
+        return cfg.automationIdentity?.tools ?? automationIdentityTools(cfg);
+      } catch { return automationIdentityTools({}); }
+    })(),
     // 当前生效的内置默认 seed 文案（按 bot locale），供前端 placeholder 展示。
     autoStartOnGroupJoinSeedDefault: t('daemon.auto_start_join_seed', undefined, localeForBot(cachedLarkAppId)),
     autoStartOnNewTopic: cardPrefs.autoStartOnNewTopic,
@@ -9276,7 +9418,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     p2pMode,
     envelopeInjection,
     triggerUserAuth,
-    larkToolBinding: getBot(cachedLarkAppId).config.larkToolBinding !== false,
+    larkToolBinding: getBot(cachedLarkAppId).config.larkToolBinding === true,
     topicUnavailablePolicy: getBot(cachedLarkAppId).config.topicUnavailablePolicy === 'stop' ? 'stop' : 'legacy',
     replyDelivery,
     replyDeliveryDefault,
@@ -11165,7 +11307,70 @@ ipcRoute('PUT', '/api/bot-trigger-user-auth', requireBoundBot(async (req, res) =
   jsonRes(res, 200, { ok: true, triggerUserAuth: value });
 }));
 
+// PUT /api/bot-automation-identity — bot-level automatic-turn Run as default.
+// Body `{ automationUserOpenId: string | null, automationTools?: string[] }`.
+// The client may only name an observed user's open_id; the daemon resolves the
+// union id itself and validates that this bot can actually enforce the tools.
+// `null`/empty clears the default. Unlike the pre-fix Run as path this does NOT
+// require triggerUserAuth: the managed Lark binding enforces `--as user` by
+// itself; ByteCloud tools still require their trigger-user wrappers.
+ipcRoute('PUT', '/api/bot-automation-identity', requireBoundBot(async (req, res) => {
+  let body: { automationUserOpenId?: unknown; automationTools?: unknown };
+  try { body = await readJsonBody<typeof body>(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'invalid_json' }); }
+  const spec = findConfigField('automationIdentity');
+  if (!spec) return jsonRes(res, 500, { ok: false, error: 'field_unavailable' });
+  if (!Object.hasOwn(body, 'automationUserOpenId')) {
+    return jsonRes(res, 400, { ok: false, error: 'no_valid_fields' });
+  }
+  const raw = body.automationUserOpenId;
+  if (raw !== null && raw !== undefined && typeof raw !== 'string') {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_automation_user' });
+  }
+  if (raw === null || raw === undefined || raw === '') {
+    const r = await applyConfigField(cachedLarkAppId, spec, null);
+    if (!r.ok) return jsonRes(res, 400, r);
+    return jsonRes(res, 200, { ok: true, automationIdentity: null });
+  }
+  try {
+    let tools = body.automationTools;
+    if (tools === undefined) {
+      const bot = getBot(cachedLarkAppId).config;
+      tools = bot.automationIdentity?.tools ?? automationIdentityTools(bot);
+    }
+    if (!Array.isArray(tools) || !tools.length
+      || tools.some(tool => typeof tool !== 'string'
+        || !(TRIGGER_USER_AUTH_TOOLS as readonly string[]).includes(tool))) {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_automation_tools' });
+    }
+    // Throws run_as_requires_managed_tool:<tool> when this bot cannot enforce
+    // one of the requested tools. Saving a selection that would silently do
+    // nothing is worse than refusing it now. Validate the NEW scope before
+    // resolving the user so a stale default tool list cannot block repairing
+    // both fields in one request.
+    assertAutomationUserPolicy(cachedLarkAppId, tools as TriggerUserAuthTool[]);
+    const user = await resolveAutomationUser(cachedLarkAppId, raw, tools as TriggerUserAuthTool[]);
+    if (!user) return jsonRes(res, 400, { ok: false, error: 'invalid_automation_user' });
+    const value = {
+      user,
+      tools: [...new Set(tools as TriggerUserAuthTool[])],
+      updatedAt: new Date().toISOString(),
+    };
+    const coerced = coerceConfigValue(spec, JSON.stringify(value));
+    if (!coerced.ok) return jsonRes(res, 400, { ok: false, error: coerced.reason });
+    const r = await applyConfigField(cachedLarkAppId, spec, coerced.value);
+    if (!r.ok) return jsonRes(res, 400, r);
+    return jsonRes(res, 200, { ok: true, automationIdentity: coerced.value });
+  } catch (error) {
+    return jsonRes(res, 400, {
+      ok: false,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+}));
+
 // PUT /api/bot-lark-tool-binding — lark-cli 固定绑定当前应用开关。Body `{ enabled?: boolean; larkToolBinding?: boolean }`
+// 新契约（plan §3.4）：显式 opt-in。off 是缺省态，落盘时清 key（不物化 false）。
 botConfigPutRoute<{ enabled?: unknown; larkToolBinding?: unknown }>('/api/bot-lark-tool-binding', 'larkToolBinding', {
   normalize: body => {
     if (typeof body !== 'object' || body === null || Array.isArray(body)) return fieldInvalid('no_valid_fields');
@@ -11174,7 +11379,7 @@ botConfigPutRoute<{ enabled?: unknown; larkToolBinding?: unknown }>('/api/bot-la
     if (!on && !off) return fieldInvalid('no_valid_fields');
     return fieldOk(on ? true : false);
   },
-  respond: value => ({ ok: true, larkToolBinding: value !== false }),
+  respond: value => ({ ok: true, larkToolBinding: value === true }),
 });
 
 /**
@@ -11199,6 +11404,63 @@ function effectiveBotSandboxMode(cfg: BotConfig): SandboxMode {
   }
 }
 
+// PUT /api/bot-tool-identity — 固定执行用户（plan §4.1）：某工具按人鉴权关闭时
+// 普通会话的执行身份，同时是自动轮次的低优先级默认。Body `{ toolUserOpenId?, toolTools? }`
+ipcRoute('PUT', '/api/bot-tool-identity', requireBoundBot(async (req, res) => {
+  let body: { toolUserOpenId?: unknown; toolTools?: unknown; credentialSource?: unknown };
+  try { body = await readJsonBody<typeof body>(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'invalid_json' }); }
+  const spec = findConfigField('toolIdentity');
+  if (!spec) return jsonRes(res, 500, { ok: false, error: 'field_unavailable' });
+  if (!Object.hasOwn(body, 'toolUserOpenId')) {
+    return jsonRes(res, 400, { ok: false, error: 'no_valid_fields' });
+  }
+  const raw = body.toolUserOpenId;
+  if (raw !== null && raw !== undefined && typeof raw !== 'string') {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_tool_user' });
+  }
+  if (raw === null || raw === undefined || raw === '') {
+    const r = await applyConfigField(cachedLarkAppId, spec, null);
+    if (!r.ok) return jsonRes(res, 400, r);
+    return jsonRes(res, 200, { ok: true, toolIdentity: null });
+  }
+  try {
+    let tools = body.toolTools;
+    if (tools === undefined) {
+      const bot = getBot(cachedLarkAppId).config;
+      tools = bot.toolIdentity?.tools ?? ['lark-cli'];
+    }
+    if (!Array.isArray(tools) || !tools.length
+      || tools.some(tool => typeof tool !== 'string'
+        || !(TRIGGER_USER_AUTH_TOOLS as readonly string[]).includes(tool))) {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_tool_tools' });
+    }
+    // The fixed assignment needs a managed local session (the wrappers are
+    // installed for its scope at spawn; enforcement per turn is publication).
+    if (!managedSessionCapable(getBot(cachedLarkAppId).config)) {
+      return jsonRes(res, 400, { ok: false, error: 'run_as_requires_managed_local_session' });
+    }
+    const user = await resolveFixedToolUser(cachedLarkAppId, raw, tools as TriggerUserAuthTool[]);
+    if (!user) return jsonRes(res, 400, { ok: false, error: 'invalid_tool_user' });
+    const value = {
+      user,
+      tools: [...new Set(tools as TriggerUserAuthTool[])],
+      credentialSource: body.credentialSource
+        ?? getBot(cachedLarkAppId).config.toolIdentity?.credentialSource ?? 'auto',
+      updatedAt: new Date().toISOString(),
+    };
+    const coerced = coerceConfigValue(spec, JSON.stringify(value));
+    if (!coerced.ok) return jsonRes(res, 400, { ok: false, error: coerced.reason });
+    const r = await applyConfigField(cachedLarkAppId, spec, coerced.value);
+    if (!r.ok) return jsonRes(res, 400, r);
+    return jsonRes(res, 200, { ok: true, toolIdentity: coerced.value });
+  } catch (error) {
+    return jsonRes(res, 400, {
+      ok: false,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+}));
 // GET /api/bot-trigger-user-auth-status — 当前策略 + 已授权人数 + 两条如实的
 // 边界提示（token 存储保护程度、自带凭证的 MCP server）。
 // 只回人数不回名单：谁授权过是成员关系，dashboard 没有理由把它摊给所有能登录的人。

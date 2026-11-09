@@ -21,10 +21,8 @@ import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-const tokens = new Map<string, string>();
 vi.mock('../src/utils/user-token.js', () => ({
-  resolveUserToken: vi.fn(async (appId: string, _secret: string, _brand: string, openId?: string) =>
-    tokens.get(`${appId}|${openId ?? ''}`) ?? null),
+  resolveUserToken: vi.fn(async () => null),
   lookupAuthorizedUserName: vi.fn(() => undefined),
   // cli-identity.ts imports this. vitest tolerates a missing mock export; bun
   // rejects the module at link time. Any new user-token import from
@@ -33,10 +31,11 @@ vi.mock('../src/utils/user-token.js', () => ({
 }));
 
 // bytedcli shells out to the real CLI; here we control who is authorized.
-const bytedcliJwts = new Map<string, { cloudJwt: string; codeJwt?: string }>();
+const byteCloudJwts = new Map<string, Record<string, string>>();
 vi.mock('../src/services/bytedcli-auth.js', () => ({
   renewBytedcliJwts: vi.fn(async () => null),
-  mintBytedcliJwts: vi.fn(async (openId: string) => bytedcliJwts.get(openId) ?? null),
+  mintBytedcliJwts: vi.fn(async () => ({ codeJwt: 'code-alice' })),
+  mintByteCloudUserJwts: vi.fn(async (openId: string) => byteCloudJwts.get(openId) ?? null),
   beginBytedcliLogin: vi.fn(async () => ({
     authUrl: 'https://cloud.example.com/auth?state=auto',
     completeToken: 'tok-auto',
@@ -48,10 +47,18 @@ vi.mock('../src/services/bytedcli-auth.js', () => ({
 const larkHomes = new Map<string, string>();
 const pendingChallenges = new Set<string>();
 const resolveLarkCliHomeForTurn = vi.fn(async (openId: string) => larkHomes.get(openId) ?? null);
+const materializeLarkCliHomeForSession = vi.fn(
+  async (openId: string, _sessionDataDir: string, _sessionId: string) =>
+    resolveLarkCliHomeForTurn(openId),
+);
 vi.mock('../src/services/lark-cli-auth.js', () => ({
   resolveLarkCliHomeForTurn: (openId: string) => resolveLarkCliHomeForTurn(openId),
+  materializeLarkCliHomeForSession: (openId: string, sessionDataDir: string, sessionId: string) =>
+    materializeLarkCliHomeForSession(openId, sessionDataDir, sessionId),
   pendingLarkCliChallenge: vi.fn((openId: string) => pendingChallenges.has(openId) ? { deviceCode: 'dc' } : null),
-  beginLarkCliLogin: vi.fn(async () => ({ authUrl: 'https://example.com/lark-device' })),
+  beginLarkCliLogin: vi.fn(async () => ({
+    authUrl: 'https://example.com/lark-device', stage: 'user-login' as const,
+  })),
 }));
 
 const { publishTurnCliIdentity, trackTurnIdentityPublication } = await import('../src/core/turn-cli-identity.js');
@@ -70,11 +77,11 @@ const SESSION = 'sess-1';
 let dir: string;
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'botmux-turn-identity-'));
-  tokens.clear();
-  bytedcliJwts.clear();
+  byteCloudJwts.clear();
   larkHomes.clear();
   pendingChallenges.clear();
   resolveLarkCliHomeForTurn.mockClear();
+  materializeLarkCliHomeForSession.mockClear();
 });
 afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
 
@@ -102,12 +109,12 @@ function publish(config: any, senderOpenId: string | undefined, turnId = 'turn-d
 
 // Proven identities live in daemon memory; these read them back the way the
 // current-execution route would, keyed by turn exactly as published.
-function identityBody(tool: 'lark-cli' | 'bytedcli', turnId = 'turn-default'): string {
+function identityBody(tool: 'lark-cli' | 'bytedcli' | 'larkdev', turnId = 'turn-default'): string {
   const value = recallProvenIdentityContent(dir, SESSION, turnId, tool);
   if (value === undefined) throw new Error(`no proven ${tool} identity for ${turnId}`);
   return value;
 }
-function published(tool: 'lark-cli' | 'bytedcli', turnId = 'turn-default'): boolean {
+function published(tool: 'lark-cli' | 'bytedcli' | 'larkdev', turnId = 'turn-default'): boolean {
   return recallProvenIdentityContent(dir, SESSION, turnId, tool) !== undefined;
 }
 
@@ -121,6 +128,30 @@ describe('publishTurnCliIdentity — lark-cli per-person HOME (device flow)', ()
     expect(body).toContain("BOTMUX_IDENTITY_MODE='user-home'");
     expect(body).toContain("BOTMUX_IDENTITY_HOME='/homes/alice'");
     expect(body).not.toContain('LARKSUITE_CLI_USER_ACCESS_TOKEN');
+  });
+
+  it('uses the session-frozen sandbox mode when selecting the executable HOME', async () => {
+    larkHomes.set(ALICE, '/homes/alice');
+    await publishTurnCliIdentity({
+      botConfig: { ...botConfig(), sandbox: false },
+      sessionSandbox: 'oncall',
+      sessionDataDir: dir,
+      sessionId: SESSION,
+      senderOpenId: ALICE,
+    });
+    expect(materializeLarkCliHomeForSession).toHaveBeenCalledWith(ALICE, dir, SESSION);
+
+    materializeLarkCliHomeForSession.mockClear();
+    resolveLarkCliHomeForTurn.mockClear();
+    await publishTurnCliIdentity({
+      botConfig: { ...botConfig(), sandbox: 'oncall' },
+      sessionSandbox: 'off',
+      sessionDataDir: dir,
+      sessionId: SESSION,
+      senderOpenId: ALICE,
+    });
+    expect(materializeLarkCliHomeForSession).not.toHaveBeenCalled();
+    expect(resolveLarkCliHomeForTurn).toHaveBeenCalledWith(ALICE);
   });
 
   // F-A end to end at the decision layer: refusal while the link is pending,
@@ -146,26 +177,73 @@ describe('publishTurnCliIdentity — lark-cli per-person HOME (device flow)', ()
     expect(outcomes.find(o => o.tool === 'lark-cli')?.state).toBe('needs-authorization');
     expect(resolveLarkCliHomeForTurn).toHaveBeenCalledWith(BOB);
   });
+
+  it('automatically embeds the first-use personal-app link without requiring /login', async () => {
+    vi.mocked(beginLarkCliLogin).mockResolvedValueOnce({
+      authUrl: 'https://open.feishu.cn/page/cli?user_code=PERSONAL',
+      stage: 'app-setup',
+    });
+    const outcomes = await publish(botConfig(), ALICE);
+    expect(outcomes.find(o => o.tool === 'lark-cli')?.state).toBe('needs-authorization');
+    const body = identityBody('lark-cli');
+    expect(body).toContain('https://open.feishu.cn/page/cli?user_code=PERSONAL');
+    expect(body).toContain('选择之前已经创建的应用');
+    expect(body).not.toContain('发一条 /login');
+  });
+
 });
 
 describe('publishTurnCliIdentity — the sender acts as themselves', () => {
-  it('publishes the sender\'s own token', async () => {
-    tokens.set(`${APP}|${ALICE}`, 'tok-alice');
+  it('publishes only the sender\'s own personal HOME', async () => {
+    larkHomes.set(ALICE, '/homes/alice-personal-app');
     const outcomes = await publish(botConfig(), ALICE);
     expect(outcomes.find(o => o.tool === 'lark-cli')?.state).toBe('user');
     const body = identityBody('lark-cli');
-    expect(body).toContain('tok-alice');
-    expect(body).toContain(APP);
+    expect(body).toContain("BOTMUX_IDENTITY_HOME='/homes/alice-personal-app'");
+    expect(body).not.toContain('LARKSUITE_CLI_USER_ACCESS_TOKEN');
+    expect(body).not.toContain(APP);
+  });
+
+  it.each(['lark-cli', 'bytedcli'] as const)('keeps %s on the selected user and denies missing credentials under legacy bot-identity fallback', async tool => {
+    const config = botConfig({ enabled: true, tools: [tool], fallback: 'bot-identity' });
+    const home = join(dir, 'selected-home');
+    mkdirSync(home);
+    larkHomes.set(ALICE, '/homes/machine-owner');
+    larkHomes.set(BOB, home);
+    byteCloudJwts.set(ALICE, { cn: 'owner-cloud' });
+    byteCloudJwts.set(BOB, { cn: 'selected-cloud' });
+    const runner = join(dir, `selected-runner-${tool}`);
+    const proof = join(dir, `selected-proof-${tool}`);
+    writeFileSync(runner, '#!/bin/sh\ncat "$BOTMUX_TEST_PROOF_FILE"\n', { mode: 0o755 });
+    const wrapper = join(dir, `selected-wrapper-${tool}`);
+    writeFileSync(wrapper, renderIdentityWrapper(tool, '/usr/bin/printenv', 'proven', [runner]));
+    const env = { PATH: '/usr/bin:/bin', SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION, BOTMUX_TEST_PROOF_FILE: proof };
+    const execute = () => spawnSync('/bin/sh', [wrapper, tool === 'bytedcli' ? 'BYTECLOUD_CLI_API_JWT_TOKEN_CN' : 'HOME'], { env, encoding: 'utf8' });
+    await publish(config, BOB);
+    const { publishActiveTurn } = await import('../src/core/cli-identity.js');
+    publishActiveTurn(dir, SESSION, 'turn-default');
+    writeFileSync(proof, identityBody(tool));
+    const selected = execute();
+    expect(selected.status, selected.stderr).toBe(0);
+    expect(selected.stdout.trim()).toBe(tool === 'bytedcli' ? 'selected-cloud' : home);
+    larkHomes.delete(BOB);
+    byteCloudJwts.delete(BOB);
+    await publish(config, BOB);
+    writeFileSync(proof, identityBody(tool));
+    const refused = execute();
+    expect(refused.status).toBe(77);
+    expect(refused.stdout).not.toContain('owner-cloud');
+    expect(refused.stdout).not.toContain('/homes/machine-owner');
   });
 
   it('swaps the acting identity when a different person speaks next', async () => {
-    tokens.set(`${APP}|${ALICE}`, 'tok-alice');
-    tokens.set(`${APP}|${BOB}`, 'tok-bob');
+    larkHomes.set(ALICE, '/homes/alice-personal-app');
+    larkHomes.set(BOB, '/homes/bob-personal-app');
     await publish(botConfig(), ALICE);
     await publish(botConfig(), BOB);
     const body = identityBody('lark-cli');
-    expect(body).toContain('tok-bob');
-    expect(body).not.toContain('tok-alice');
+    expect(body).toContain('/homes/bob-personal-app');
+    expect(body).not.toContain('/homes/alice-personal-app');
   });
 });
 
@@ -174,7 +252,7 @@ describe('publishTurnCliIdentity — the sender acts as themselves', () => {
 // and with the wrong name in the audit trail.
 describe('publishTurnCliIdentity — withholding removes, never inherits', () => {
   it('denies with a device link when the new sender has not authorized', async () => {
-    tokens.set(`${APP}|${ALICE}`, 'tok-alice');
+    larkHomes.set(ALICE, '/homes/alice-personal-app');
     await publish(botConfig(), ALICE);
     expect(published('lark-cli')).toBe(true);
 
@@ -184,7 +262,7 @@ describe('publishTurnCliIdentity — withholding removes, never inherits', () =>
     const outcomes = await publish(botConfig(), BOB);
     expect(outcomes.find(o => o.tool === 'lark-cli')?.state).toBe('needs-authorization');
     const body = identityBody('lark-cli');
-    expect(body).not.toContain('tok-alice');
+    expect(body).not.toContain('/homes/alice-personal-app');
     expect(body).toContain("BOTMUX_IDENTITY_MODE='denied'");
     expect(body).toContain('https://example.com/lark-device');
     expect(body).toContain('[reason=not_authorized]');
@@ -224,16 +302,16 @@ describe('publishTurnCliIdentity — withholding removes, never inherits', () =>
   // trigger user. Reaching for the session creator's or owner's credentials to
   // fill that gap is exactly the borrowing this feature removes.
   it('denies (no link) when the turn has no human sender', async () => {
-    tokens.set(`${APP}|${ALICE}`, 'tok-alice');
+    larkHomes.set(ALICE, '/homes/alice-personal-app');
     await publish(botConfig(), ALICE);
     const outcomes = await publish(botConfig(), undefined);
     expect(outcomes.find(o => o.tool === 'lark-cli')?.state).toBe('needs-authorization');
-    expect(identityBody('lark-cli')).not.toContain('tok-alice');
+    expect(identityBody('lark-cli')).not.toContain('/homes/alice-personal-app');
     expect(identityBody('lark-cli')).toContain('[reason=no_sender]');
   });
 
-  it('reports needs-authorization instead of degrading under fallback: none', async () => {
-    const config = botConfig({ enabled: true, tools: ['lark-cli'], fallback: 'none' });
+  it.each(['none', 'bot-identity'] as const)('reports needs-authorization instead of degrading under fallback: %s', async fallback => {
+    const config = botConfig({ enabled: true, tools: ['lark-cli'], fallback });
     const outcomes = await publish(config, BOB);
     expect(identityBody('lark-cli')).toContain('飞书');
     expect(outcomes.find(o => o.tool === 'lark-cli')?.state).toBe('needs-authorization');
@@ -249,10 +327,10 @@ describe('publishTurnCliIdentity — withholding removes, never inherits', () =>
   // bytedcli authenticates against ByteCloud SSO, a different provider from Lark
   // OAuth — a Lark token cannot become a ByteCloud JWT. It must report "not
   // authorized" rather than quietly using the machine's own SSO session.
-  it('never fabricates a bytedcli identity from a Lark token', async () => {
+  it('never fabricates a bytedcli identity from a personal Lark HOME', async () => {
     // Authorized for Feishu, NOT for ByteCloud — a real and common state, since
     // they are different identity providers with no conversion between them.
-    tokens.set(`${APP}|${ALICE}`, 'tok-alice');
+    larkHomes.set(ALICE, '/homes/alice-personal-app');
     const config = botConfig({ enabled: true, tools: ['lark-cli', 'bytedcli'] });
     const outcomes = await publish(config, ALICE);
     expect(outcomes.find(o => o.tool === 'lark-cli')?.state).toBe('user');
@@ -267,10 +345,13 @@ describe('publishTurnCliIdentity — withholding removes, never inherits', () =>
     // authorize the other provider and hit this same refusal again.
     expect(body).toContain('ByteCloud');
     expect(body).not.toContain('飞书');
-    expect(body).toContain('https://cloud.example.com/auth?state=auto');
-    // Friendly one-time framing: it names the tool/provider and says authorize once.
+    // ByteCloud login cannot be started safely until the caller supplies the
+    // concrete credential site; the refusal therefore gives the site-aware
+    // command instead of minting a default-CN link.
+    expect(body).not.toContain('https://cloud.example.com/auth?state=auto');
     expect(body).toContain('bytedcli');
-    expect(body).toMatch(/只需授权这一次|authorize just once/i);
+    expect(body).toContain('/login bytedcli <site>');
+    expect(body).toContain('/login status <site>');
     // Someone refused for lack of authorization usually has no stored name, so
     // the nameless path is the common one — it must read as a sentence, not
     // print a raw open_id back at the person.
@@ -287,20 +368,21 @@ describe('publishTurnCliIdentity — withholding removes, never inherits', () =>
   });
 
   it('publishes this person\'s own ByteCloud JWTs once they have authorized', async () => {
-    bytedcliJwts.set(ALICE, { cloudJwt: 'cloud-alice', codeJwt: 'code-alice' });
+    byteCloudJwts.set(ALICE, { cn: 'cloud-alice', 'i18n-bd': 'bd-alice' });
     const config = botConfig({ enabled: true, tools: ['bytedcli'] });
     const outcomes = await publish(config, ALICE);
 
     expect(outcomes.find(o => o.tool === 'bytedcli')?.state).toBe('user');
     const body = identityBody('bytedcli');
-    expect(body).toContain("BYTEDCLI_USER_CLOUD_JWT='cloud-alice'");
-    // git attribution rides this one.
-    expect(body).toContain("BYTEDCLI_USER_CODE_JWT='code-alice'");
+    expect(body).toContain("BOTMUX_IDENTITY_MODE='bytedcli-user'");
+    expect(body).toContain("BYTECLOUD_CLI_API_JWT_TOKEN_CN='cloud-alice'");
+    expect(body).toContain("BYTECLOUD_CLI_API_JWT_TOKEN_I18N_BD='bd-alice'");
+    expect(body).not.toContain('BYTEDCLI_USER_CLOUD_JWT');
   });
 
   // Alice authorized, Bob did not. Bob's turn must not inherit her JWT.
   it('never hands one person\'s ByteCloud JWT to another', async () => {
-    bytedcliJwts.set(ALICE, { cloudJwt: 'cloud-alice' });
+    byteCloudJwts.set(ALICE, { cn: 'cloud-alice' });
     const config = botConfig({ enabled: true, tools: ['bytedcli'] });
     await publish(config, ALICE);
     const outcomes = await publish(config, BOB);
@@ -309,6 +391,24 @@ describe('publishTurnCliIdentity — withholding removes, never inherits', () =>
     expect(identityBody('bytedcli'))
       .not.toContain('cloud-alice');
   });
+
+  it('publishes larkdev site JWTs for this sender and clears them for the next', async () => {
+    byteCloudJwts.set(ALICE, {
+      cn: 'alice-cn', 'i18n-tt': 'alice-tt', 'us-ttp': 'alice-us',
+    });
+    const config = botConfig({ enabled: true, tools: ['larkdev'] });
+    const first = await publish(config, ALICE, 'turn-alice');
+    expect(first.find(o => o.tool === 'larkdev')?.state).toBe('user');
+    expect(identityBody('larkdev', 'turn-alice')).toContain("BYTECLOUD_CLI_API_JWT_TOKEN_CN='alice-cn'");
+    expect(identityBody('larkdev', 'turn-alice')).toContain("BYTECLOUD_CLI_API_JWT_TOKEN_US_TTP='alice-us'");
+
+    const second = await publish(config, BOB, 'turn-bob');
+    expect(second.find(o => o.tool === 'larkdev')?.state).toBe('needs-authorization');
+    const denied = identityBody('larkdev', 'turn-bob');
+    expect(denied).not.toContain('alice-cn');
+    expect(denied).toContain('ByteCloud');
+    expect(denied).toContain('/login bytedcli <site>');
+  });
 });
 
 // The identity has to say which turn it is for, or the wrapper cannot tell a
@@ -316,7 +416,7 @@ describe('publishTurnCliIdentity — withholding removes, never inherits', () =>
 // cli-identity.test.ts for what it does with this.
 describe('publishTurnCliIdentity — turn stamping', () => {
   it('stamps the turn on published credentials', async () => {
-    tokens.set(`${APP}|${ALICE}`, 'tok-alice');
+    larkHomes.set(ALICE, '/homes/alice-personal-app');
     await publish(botConfig(), ALICE, 'turn-A');
     expect(identityBody('lark-cli', 'turn-A')).toContain("BOTMUX_IDENTITY_TURN='turn-A'");
   });
@@ -342,9 +442,31 @@ describe('publishTurnCliIdentity — an off policy touches nothing', () => {
   });
 
   it('reports off for a tool outside the selected set', async () => {
-    tokens.set(`${APP}|${ALICE}`, 'tok-alice');
+    larkHomes.set(ALICE, '/homes/alice-personal-app');
     const outcomes = await publish(botConfig({ enabled: true, tools: ['lark-cli'] }), ALICE);
     expect(outcomes.find(o => o.tool === 'bytedcli')?.state).toBe('off');
+  });
+
+  it('clears stale assignment credentials and publishes the excluded tool’s independent sender', async () => {
+    larkHomes.set(ALICE, '/homes/alice');
+    byteCloudJwts.set(ALICE, { cn: 'jwt-alice' });
+    const config = botConfig({ enabled: true, tools: ['lark-cli', 'bytedcli'], fallback: 'none' });
+    const args = {
+      botConfig: config,
+      turnId: 'turn-scope',
+      storageModel: 'proven' as const,
+      sessionDataDir: dir,
+      sessionId: SESSION,
+      senderOpenId: ALICE,
+    };
+    await publishTurnCliIdentity({ ...args, tools: ['lark-cli', 'bytedcli'] });
+    expect(published('bytedcli', 'turn-scope')).toBe(true);
+    // A conflicting narrower scope for the SAME turn must not leave the older
+    // bytedcli credential readable.
+    byteCloudJwts.set(BOB, { cn: 'jwt-bob' });
+    await publishTurnCliIdentity({ ...args, tools: ['lark-cli'], senderOpenId: BOB });
+    expect(identityBody('bytedcli', 'turn-scope')).toContain('jwt-bob');
+    expect(identityBody('bytedcli', 'turn-scope')).not.toContain('jwt-alice');
   });
 
   it('reports off when the field is absent entirely', async () => {
@@ -354,26 +476,23 @@ describe('publishTurnCliIdentity — an off policy touches nothing', () => {
 });
 
 describe('publishTurnCliIdentity — failures fail closed', () => {
-  it('withholds rather than propagating when the token store throws', async () => {
-    const { resolveUserToken } = await import('../src/utils/user-token.js');
-    tokens.set(`${APP}|${ALICE}`, 'tok-alice');
+  it('withholds rather than propagating when the personal HOME resolver throws', async () => {
+    larkHomes.set(ALICE, '/homes/alice-personal-app');
     await publish(botConfig(), ALICE);
     expect(published('lark-cli')).toBe(true);
 
-    vi.mocked(resolveUserToken).mockRejectedValueOnce(new Error('keychain unavailable'));
+    resolveLarkCliHomeForTurn.mockRejectedValueOnce(new Error('personal credential store unavailable'));
     const outcomes = await publish(botConfig(), ALICE);
     // The turn survives, and the stale identity is gone. A store outage lands on
     // the same policy as "never authorized" — a refusal with a link, never a
     // borrowed or machine identity.
     expect(outcomes.find(o => o.tool === 'lark-cli')?.state).toBe('needs-authorization');
-    expect(identityBody('lark-cli')).not.toContain('tok-alice');
+    expect(identityBody('lark-cli')).not.toContain('/homes/alice-personal-app');
   });
 
-  // Without app credentials there is no bot identity to fall back to either —
-  // running as the bot needs the very app id and secret that are missing. So
-  // this degrades to a refusal, not to "run it and see".
-  it('refuses when the bot has no app credentials to pair with the token', async () => {
-    tokens.set(`|${ALICE}`, 'tok');
+  // Missing Bot app credentials must not resurrect the legacy Bot-app token
+  // fallback. With no personal HOME, lark-cli stays denied.
+  it('refuses when the bot has no app credentials and no personal HOME', async () => {
     const outcomes = await publish(
       { larkAppId: '', larkAppSecret: '', brand: 'feishu', triggerUserAuth: parseTriggerUserAuthConfig({ enabled: true, tools: ['lark-cli'] }) } as any,
       ALICE,
@@ -394,10 +513,14 @@ describe('verified cross-bot delegation', () => {
     delegatedIdentity: { ...delegatedIdentity, tools },
   });
   it('uses original user login for CLI identities and stamps the target turn', async () => {
-    bytedcliJwts.set(ALICE, { cloudJwt: 'alice-cloud' });
-    bytedcliJwts.set('ou_source_bot', { cloudJwt: 'wrong-bot' });
+    byteCloudJwts.set(ALICE, { cn: 'alice-cloud' });
+    byteCloudJwts.set('ou_source_bot', { cn: 'wrong-bot' });
     larkHomes.set(ALICE, '/isolated/alice');
-    expect(await delegated()).toEqual([{ tool: 'lark-cli', state: 'user' }, { tool: 'bytedcli', state: 'user' }]);
+    expect(await delegated()).toEqual([
+      { tool: 'lark-cli', state: 'user' },
+      { tool: 'bytedcli', state: 'user' },
+      { tool: 'larkdev', state: 'off' },
+    ]);
     expect(identityBody('lark-cli', 'om_delegated')).toContain('/isolated/alice');
     const env = identityBody('bytedcli', 'om_delegated');
     expect(env).toContain('alice-cloud');
@@ -405,34 +528,37 @@ describe('verified cross-bot delegation', () => {
     expect(env).not.toContain('wrong-bot');
   });
   it('rechecks authorization on retry and clears revoked credentials', async () => {
-    bytedcliJwts.set(ALICE, { cloudJwt: 'revocable' });
+    byteCloudJwts.set(ALICE, { cn: 'revocable' });
     await delegated();
-    bytedcliJwts.delete(ALICE);
+    byteCloudJwts.delete(ALICE);
     await delegated();
     const env = identityBody('bytedcli', 'om_delegated');
     expect(env).not.toContain('revocable');
     expect(env).toContain('report --dispatch-root om_dispatch');
     expect(env).toContain('Do not ask a bot to log in');
   });
-  it('does not forward source-app OAuth as a target-app token', async () => {
-    tokens.set(`cli_source|${ALICE}`, 'source-oauth');
+  it('accepts only the original user\'s personal HOME across apps', async () => {
     await delegated();
-    expect(identityBody('lark-cli', 'om_delegated')).not.toContain('source-oauth');
-    tokens.set(`${APP}|ou_alice_target`, 'target-oauth');
+    expect(identityBody('lark-cli', 'om_delegated')).toContain("BOTMUX_IDENTITY_MODE='denied'");
+    larkHomes.set(ALICE, '/isolated/alice-personal-app');
     await delegated();
-    expect(identityBody('lark-cli', 'om_delegated')).toContain('target-oauth');
+    const body = identityBody('lark-cli', 'om_delegated');
+    expect(body).toContain('/isolated/alice-personal-app');
+    expect(body).not.toContain(APP);
   });
   it('target cannot widen delegated tool permissions', async () => {
-    bytedcliJwts.set(ALICE, { cloudJwt: 'alice-cloud' });
+    byteCloudJwts.set(ALICE, { cn: 'alice-cloud' });
     larkHomes.set(ALICE, '/isolated/alice');
     expect(await delegated('om_narrow', ['bytedcli'])).toEqual([
-      { tool: 'lark-cli', state: 'needs-authorization' }, { tool: 'bytedcli', state: 'user' },
+      { tool: 'lark-cli', state: 'needs-authorization' },
+      { tool: 'bytedcli', state: 'user' },
+      { tool: 'larkdev', state: 'off' },
     ]);
     expect(identityBody('lark-cli', 'om_narrow')).not.toContain('/isolated/alice');
   });
   it('a later direct human turn uses that human and never inherits delegation', async () => {
-    bytedcliJwts.set(ALICE, { cloudJwt: 'alice-cloud' });
-    bytedcliJwts.set(BOB, { cloudJwt: 'bob-cloud' });
+    byteCloudJwts.set(ALICE, { cn: 'alice-cloud' });
+    byteCloudJwts.set(BOB, { cn: 'bob-cloud' });
     await delegated();
     await publish(botConfig({ enabled: true, tools: ['bytedcli'] }), BOB, 'om_bob');
     const env = identityBody('bytedcli', 'om_bob');
@@ -446,7 +572,7 @@ describe('queued identities stay separate from the executing task', () => {
   // here a stub stands in for that daemon channel and cats the body the test
   // published for the currently executing turn. Nothing in the session
   // directory participates in the selection.
-  function installProvenWrapper(tool: 'lark-cli' | 'bytedcli'): { wrapper: string; proofFile: string } {
+  function installProvenWrapper(tool: 'lark-cli' | 'bytedcli' | 'larkdev'): { wrapper: string; proofFile: string } {
     const proofFile = join(dir, `proof-current-${tool}`);
     const runner = join(dir, `fake-runner-${tool}`);
     writeFileSync(runner, '#!/bin/sh\ncat "$BOTMUX_TEST_PROOF_FILE"\n', { mode: 0o755 });
@@ -474,7 +600,7 @@ describe('queued identities stay separate from the executing task', () => {
       } } : {}),
     });
     const run = () => spawnSync('/bin/sh', [wrapper,
-      tool === 'bytedcli' ? 'BYTEDCLI_USER_CLOUD_JWT' : 'LARKSUITE_CLI_USER_ACCESS_TOKEN'], {
+      tool === 'bytedcli' ? 'BYTECLOUD_CLI_API_JWT_TOKEN_CN' : 'HOME'], {
       env: { PATH: '/usr/bin:/bin', SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION, BOTMUX_TEST_PROOF_FILE: proofFile },
       encoding: 'utf8',
     });
@@ -485,24 +611,26 @@ describe('queued identities stay separate from the executing task', () => {
       writeFileSync(proofFile, recallProvenIdentityContent(dir, SESSION, `turn-${user}`, tool)!);
     };
     for (const user of users) {
-      tokens.set(`${APP}|${targetId(user)}`, `credential-${user}`);
-      bytedcliJwts.set(user, { cloudJwt: `credential-${user}` });
+      const home = join(dir, `credential-${user}`);
+      mkdirSync(home);
+      larkHomes.set(user, home);
+      byteCloudJwts.set(user, { cn: `credential-${user}` });
     }
     await prepare(ALICE);
     beginExecuting(ALICE);
     await prepare(BOB);
     await prepare('ou_charlie');
-    expect(run().stdout.trim()).toBe(`credential-${ALICE}`);
+    expect(run().stdout.trim()).toBe(tool === 'lark-cli' ? join(dir, `credential-${ALICE}`) : `credential-${ALICE}`);
     for (const user of users.slice(1)) {
       beginExecuting(user);
       const result = run();
       expect(result.status, result.stderr).toBe(0);
-      expect(result.stdout.trim()).toBe(`credential-${user}`);
+      expect(result.stdout.trim()).toBe(tool === 'lark-cli' ? join(dir, `credential-${user}`) : `credential-${user}`);
     }
-    bytedcliJwts.delete(BOB);
-    tokens.delete(`${APP}|${targetId(BOB)}`);
+    byteCloudJwts.delete(BOB);
+    larkHomes.delete(BOB);
     await prepare(BOB);
-    expect(run().stdout.trim()).toBe('credential-ou_charlie');
+    expect(run().stdout.trim()).toBe(tool === 'lark-cli' ? join(dir, 'credential-ou_charlie') : 'credential-ou_charlie');
     beginExecuting(BOB);
     expect(run().status).toBe(77);
   });
@@ -512,8 +640,8 @@ describe('queued identities stay separate from the executing task', () => {
     const { publishActiveTurn } = await import('../src/core/cli-identity.js');
     const { wrapper, proofFile } = installProvenWrapper(tool);
     const config = botConfig({ enabled: true, tools: [tool] });
-    bytedcliJwts.set(ALICE, { cloudJwt: 'cloud-alice' });
-    bytedcliJwts.set(BOB, { cloudJwt: 'cloud-bob' });
+    byteCloudJwts.set(ALICE, { cn: 'cloud-alice' });
+    byteCloudJwts.set(BOB, { cn: 'cloud-bob' });
     await publishTurnCliIdentity({ botConfig: config, sessionDataDir: dir, sessionId: SESSION,
       senderOpenId: ALICE, turnId: 'turn-a', storageModel: 'proven' });
     await publishTurnCliIdentity({ botConfig: config, sessionDataDir: dir, sessionId: SESSION,
@@ -521,7 +649,7 @@ describe('queued identities stay separate from the executing task', () => {
     publishActiveTurn(dir, SESSION, 'turn-a');
     writeFileSync(proofFile, recallProvenIdentityContent(dir, SESSION, 'turn-a', tool)!);
     const env = { PATH: '/usr/bin:/bin', SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION, BOTMUX_TEST_PROOF_FILE: proofFile };
-    const run = () => spawnSync('/bin/sh', [wrapper, 'BYTEDCLI_USER_CLOUD_JWT'], { env, encoding: 'utf8' });
+    const run = () => spawnSync('/bin/sh', [wrapper, 'BYTECLOUD_CLI_API_JWT_TOKEN_CN'], { env, encoding: 'utf8' });
     expect(run().stdout.trim()).toBe('cloud-alice');
     // The attack from the review: enumerate the turn dirs and repoint the
     // marker at Bob's prepared snapshot. The proven wrapper never reads the
@@ -546,10 +674,15 @@ describe('target daemon consumes signed message authority', () => {
     const { scheduleTimeZone } = await import('../src/utils/timezone.js');
     const source = ts.createSourceFile('daemon.ts', readFileSync('src/daemon.ts', 'utf8'), ts.ScriptTarget.Latest, true);
     const { clearSingleIdentityArtifacts, forgetProvenIdentityContent, removeUngovernedIdentityWrappers } = await import('../src/core/cli-identity.js');
+    const { toolIdentityDecisionFromReplyTarget } = await import('../src/core/tool-identity-decision.js');
+    const { normalizeToolIdentityPolicy, toolIdentityPublicationEnabled, assertToolIdentitySession, isInvalidToolIdentity } = await import('../src/services/tool-identity-config.js');
+    const { selectToolCredential } = await import('../src/core/tool-identity-policy.js');
+    const { isLarkToolBound } = await import('../src/core/lark-tool-binding.js');
+    const { TRIGGER_USER_AUTH_TOOLS } = await import('../src/services/trigger-user-auth.js');
     const code = ['triggerUserAuthEnabledFor', 'prepareTurnCliIdentity',
       'dispatchUserForTurn', 'targetUserForDelegation', 'delegatedScheduleRuntimeDeps',
       'delegatedScheduleCliIdentity', 'prepareScheduledTurnCliIdentity', 'prepareDelegatedScheduledTurnIdentity',
-      'refreshTurnCliIdentity', 'identityPublicationConflicted', 'identityModelForPublication',
+      'refreshTurnCliIdentity', 'assertTurnIdentitySession', 'identityPublicationConflicted', 'identityModelForPublication',
       'handleIdentityDecisionFlip', 'noteTurnReceived'].map(name => {
       const fn = source.statements.find(n => ts.isFunctionDeclaration(n) && n.name?.text === name);
       if (!fn) throw new Error('Missing production handler');
@@ -563,6 +696,7 @@ describe('target daemon consumes signed message authority', () => {
     }, send: async () => 'om_kickoff' });
     const scope = options.scope ?? 'thread';
     const ds: any = { larkAppId: APP, chatId: 'oc_chat', chatType: 'group', scope,
+      initConfig: { identityTools: ['lark-cli', 'bytedcli'] },
       session: { sessionId: SESSION, rootMessageId: scope === 'thread' ? 'om_root' : 'om_shared',
         replyTargets: { om_kickoff: { senderOpenId: 'ou_peer', rootMessageId: 'om_root', updatedAt: new Date().toISOString() } },
       },
@@ -571,6 +705,8 @@ describe('target daemon consumes signed message authority', () => {
       ? { status: 'transient' } : { status: 'resolved', openId: 'ou_alice_target' });
     const scopeValues = {
       config: { session: { dataDir: dir } }, pickTurnReplyTarget, resolveDispatchUser, dispatchCallerFromReply,
+      isLarkToolBound, selectToolCredential, TRIGGER_USER_AUTH_TOOLS, toolIdentityDecisionFromReplyTarget, normalizeToolIdentityPolicy, toolIdentityPublicationEnabled, assertToolIdentitySession, isInvalidToolIdentity,
+      assertAutomationUserAllowed: vi.fn(), assertAutomationSession: vi.fn(),
       getBot: () => ({ config: botConfig({ enabled: true, tools: ['bytedcli'] }) }),
       loadOrCreateDispatchReportBindingSecret: () => secret,
       resolveTargetAppOpenId, evaluateTalk: () => ({ allowed: options.talk !== false }),
@@ -641,6 +777,46 @@ describe('target daemon consumes signed message authority', () => {
       },
     };
   }
+  it.each(['human', 'schedule', 'lifecycle', 'webhook'] as const)('enforces the fixed user on fresh and existing %s turns', async entry => {
+    const h = await targetHarness();
+    const cfg = { ...botConfig({ enabled: false, tools: [] }), toolIdentity: {
+      user: { larkAppId: APP, openId: ALICE, unionId: 'on_alice' }, tools: ['bytedcli'], credentialSource: 'local',
+    } };
+    h.scopeValues.getBot = () => ({ config: cfg });
+    byteCloudJwts.set(ALICE, { cn: 'fixed-execution' });
+    byteCloudJwts.set(BOB, { cn: 'sender-execution' });
+    const turnId = entry === 'schedule' ? firstScheduledTurn : `om_fixed_${entry}`;
+    if (entry === 'schedule') directSchedule(h);
+    h.ds.session.replyTargets[turnId] = { senderOpenId: BOB, updatedAt: new Date().toISOString(),
+      ...(entry === 'schedule' ? { automationUser: cfg.toolIdentity.user, automationIdentitySource: 'automatic_default', automationIdentityTools: ['bytedcli'] } : {}),
+    };
+    for (const live of [false, true]) {
+      h.ds.worker = live ? { killed: false } : undefined;
+      h.ds.initConfig = { identityTools: ['bytedcli'] };
+      await h.prepare(turnId);
+      expect(identityBody('bytedcli', turnId)).toContain('fixed-execution');
+      expect(identityBody('bytedcli', turnId)).not.toContain('sender-execution');
+    }
+    h.ds.initConfig = { identityTools: [] };
+    const publisher = vi.fn();
+    h.scopeValues.publishTurnCliIdentity = publisher;
+    await expect(h.prepare(turnId)).rejects.toThrow('run_as_requires_managed_per_user_session');
+    expect(publisher).not.toHaveBeenCalled();
+  });
+
+  it('does not validate a shadowed fixed Lark user when the installed application binding owns the tool', async () => {
+    const h = await targetHarness();
+    h.scopeValues.getBot = () => ({ config: { ...botConfig({ enabled: false }), larkToolBinding: true, toolIdentity: {
+      user: { larkAppId: APP, openId: ALICE, unionId: 'on_alice' }, tools: ['lark-cli'], credentialSource: 'local',
+    } } });
+    h.scopeValues.isLarkToolBound = () => true;
+    h.scopeValues.assertAutomationUserAllowed.mockImplementation(() => { throw new Error('revoked fixed user'); });
+    h.scopeValues.publishTurnCliIdentity = vi.fn(async () => []);
+    await h.prepare('om_bound');
+    expect(h.scopeValues.assertAutomationUserAllowed).not.toHaveBeenCalled();
+    expect(h.scopeValues.publishTurnCliIdentity).toHaveBeenCalledOnce();
+  });
+
   function directSchedule(h: Awaited<ReturnType<typeof targetHarness>>, patch: Record<string, unknown> = {}) {
     const task = {
       id: 'a1b2c3d4', chatId: 'oc_chat', larkAppId: APP, creatorLarkAppId: APP,
@@ -661,7 +837,7 @@ describe('target daemon consumes signed message authority', () => {
     const home = join(dir, 'alice-home');
     mkdirSync(home);
     larkHomes.set(ALICE, home);
-    bytedcliJwts.set(ALICE, { cloudJwt: 'scheduled-alice' });
+    byteCloudJwts.set(ALICE, { cn: 'scheduled-alice' });
     const { publishActiveTurn, renderIdentityWrapper } = await import('../src/core/cli-identity.js');
     const proofFile = join(dir, `proof-scheduled-${tool}`);
     const runner = join(dir, `fake-scheduled-runner-${tool}`);
@@ -673,16 +849,16 @@ describe('target daemon consumes signed message authority', () => {
       await h.run(turnId);
       publishActiveTurn(dir, SESSION, turnId);
       writeFileSync(proofFile, recallProvenIdentityContent(dir, SESSION, turnId, tool)!);
-      const result = spawnSync('/bin/sh', [wrapper, tool === 'bytedcli' ? 'BYTEDCLI_USER_CLOUD_JWT' : 'HOME'], {
+      const result = spawnSync('/bin/sh', [wrapper, tool === 'bytedcli' ? 'BYTECLOUD_CLI_API_JWT_TOKEN_CN' : 'HOME'], {
         env: wrapperEnv, encoding: 'utf8',
       });
       expect(result.status, result.stderr).toBe(0);
       expect(result.stdout.trim()).toBe(tool === 'bytedcli' ? 'scheduled-alice' : home);
     }
     // Queued messages leave the scheduled execution's selected identity intact.
-    bytedcliJwts.set(BOB, { cloudJwt: 'bob-cloud' });
+    byteCloudJwts.set(BOB, { cn: 'bob-cloud' });
     await publish(botConfig({ enabled: true, tools: [tool] }), BOB, 'om_bob');
-    const stale = spawnSync('/bin/sh', [wrapper, tool === 'bytedcli' ? 'BYTEDCLI_USER_CLOUD_JWT' : 'HOME'], {
+    const stale = spawnSync('/bin/sh', [wrapper, tool === 'bytedcli' ? 'BYTECLOUD_CLI_API_JWT_TOKEN_CN' : 'HOME'], {
       env: wrapperEnv, encoding: 'utf8',
     });
     expect(stale.status, stale.stderr).toBe(0);
@@ -697,7 +873,7 @@ describe('target daemon consumes signed message authority', () => {
     // again — not read a human sender a scheduled turn never has.
     const h = await targetHarness();
     directSchedule(h);
-    bytedcliJwts.set(ALICE, { cloudJwt: 'scheduled-alice' });
+    byteCloudJwts.set(ALICE, { cn: 'scheduled-alice' });
     Object.assign(h.ds.session, { status: 'active' });
     h.ds.worker = { killed: false };
     h.ds.reportedModel = 'single';
@@ -740,7 +916,7 @@ describe('target daemon consumes signed message authority', () => {
     // The real scheduler claims the run (writing lastRunId) before the
     // callback; the post-admission authority fence compares against it.
     task.lastRunId = 'test-run';
-    bytedcliJwts.set(ALICE, { cloudJwt: 'scheduled-alice' });
+    byteCloudJwts.set(ALICE, { cn: 'scheduled-alice' });
     let execute: (task: any, context: any) => Promise<void>;
     let dispatches = 0;
     h.installSchedulerCallback({
@@ -774,8 +950,8 @@ describe('target daemon consumes signed message authority', () => {
   ])('clears previous credentials when the scheduled creator is untrusted: %o', async patch => {
     const h = await targetHarness();
     directSchedule(h, patch);
-    bytedcliJwts.set(ALICE, { cloudJwt: 'old-human' });
-    bytedcliJwts.set(BOB, { cloudJwt: 'unauthorized-human' });
+    byteCloudJwts.set(ALICE, { cn: 'old-human' });
+    byteCloudJwts.set(BOB, { cn: 'unauthorized-human' });
     await publish(botConfig({ enabled: true, tools: ['bytedcli'] }), ALICE, 'om_old');
     await h.run(firstScheduledTurn);
     const env = identityBody('bytedcli', firstScheduledTurn);
@@ -792,8 +968,8 @@ describe('target daemon consumes signed message authority', () => {
       runAsClaim: { openId: ALICE, unionId: 'on_alice', larkAppId: APP, claimedAt: '2026-10-26T02:00:00.000Z' },
     });
     h.scopeValues.canOperate.mockReturnValue(true);
-    bytedcliJwts.set(ALICE, { cloudJwt: 'claimant-alice' });
-    bytedcliJwts.set(BOB, { cloudJwt: 'creator-bob' });
+    byteCloudJwts.set(ALICE, { cn: 'claimant-alice' });
+    byteCloudJwts.set(BOB, { cn: 'creator-bob' });
     await h.run(firstScheduledTurn);
     const env = identityBody('bytedcli', firstScheduledTurn);
     expect(env).toContain('claimant-alice');
@@ -810,7 +986,7 @@ describe('target daemon consumes signed message authority', () => {
   ])('asks the chat for a claimant when a scheduled turn has no usable identity: %o', async (patch, gap) => {
     const h = await targetHarness();
     const { task } = directSchedule(h, patch);
-    bytedcliJwts.set(BOB, { cloudJwt: 'must-not-use-bob' });
+    byteCloudJwts.set(BOB, { cn: 'must-not-use-bob' });
     await h.run(firstScheduledTurn);
     const env = identityBody('bytedcli', firstScheduledTurn);
     expect(env).toContain("BOTMUX_IDENTITY_MODE='denied'");
@@ -823,7 +999,7 @@ describe('target daemon consumes signed message authority', () => {
   it('a creator who still has access gets no claim card', async () => {
     const h = await targetHarness();
     directSchedule(h);
-    bytedcliJwts.set(ALICE, { cloudJwt: 'creator-alice' });
+    byteCloudJwts.set(ALICE, { cn: 'creator-alice' });
     await h.run(firstScheduledTurn);
     expect(identityBody('bytedcli', firstScheduledTurn)).toContain('creator-alice');
     expect(h.scopeValues.noteScheduledIdentityGap).not.toHaveBeenCalled();
@@ -845,7 +1021,7 @@ describe('target daemon consumes signed message authority', () => {
     directSchedule(h);
     h.scopeValues.getDashboardAdminOpenIds = () => [];
     h.scopeValues.canOperate.mockReturnValue(true);
-    bytedcliJwts.set(ALICE, { cloudJwt: 'open-mode-alice' });
+    byteCloudJwts.set(ALICE, { cn: 'open-mode-alice' });
     await h.run(firstScheduledTurn);
     expect(h.scopeValues.canOperate).toHaveBeenCalledWith(APP, 'oc_chat', ALICE, 'on_alice');
     expect(identityBody('bytedcli', firstScheduledTurn)).toContain('open-mode-alice');
@@ -857,7 +1033,7 @@ describe('target daemon consumes signed message authority', () => {
       parsed: { kind: 'once', timestamp: Date.now() }, disabledReason: 'once_completed',
     });
     authority.state = 'completed';
-    bytedcliJwts.set(ALICE, { cloudJwt: 'restored-alice' });
+    byteCloudJwts.set(ALICE, { cn: 'restored-alice' });
     await h.run(firstScheduledTurn);
     expect(identityBody('bytedcli', firstScheduledTurn)).toContain('restored-alice');
     authority.state = 'paused';
@@ -889,7 +1065,7 @@ describe('target daemon consumes signed message authority', () => {
     if (mode === 'live') h.ds.activeInteractiveTurn = { turnId: 'om_human', caller: {
       senderType: 'user', requestLarkAppId: APP, requestUserOpenId: BOB,
     } };
-    bytedcliJwts.set(BOB, { cloudJwt: 'direct-human' });
+    byteCloudJwts.set(BOB, { cn: 'direct-human' });
     await h.run('om_human');
     expect(identityBody('bytedcli', 'om_human')).toContain('direct-human');
     expect(h.resolveTargetAppOpenId).not.toHaveBeenCalled();
@@ -897,8 +1073,8 @@ describe('target daemon consumes signed message authority', () => {
   it('a delegated bot turn still refuses a corrupt delegation store', async () => {
     const h = await targetHarness();
     writeFileSync(join(dir, 'dispatch-user-delegations.json'), 'corrupt-json');
-    bytedcliJwts.set(ALICE, { cloudJwt: 'must-not-leak' });
-    bytedcliJwts.set('ou_peer', { cloudJwt: 'must-not-use-peer' });
+    byteCloudJwts.set(ALICE, { cn: 'must-not-leak' });
+    byteCloudJwts.set('ou_peer', { cn: 'must-not-use-peer' });
     await h.run();
     const env = identityBody('bytedcli', 'om_kickoff');
     expect(env).not.toContain('must-not-');
@@ -911,13 +1087,13 @@ describe('target daemon consumes signed message authority', () => {
     if (evidence === 'quote') {
       h.ds.session.quoteTargetId = 'om_peer'; h.ds.session.quoteTargetSenderIsBot = true;
     }
-    bytedcliJwts.set('ou_peer', { cloudJwt: 'must-not-use-peer' });
+    byteCloudJwts.set('ou_peer', { cn: 'must-not-use-peer' });
     await h.run('om_peer');
     expect(identityBody('bytedcli', 'om_peer')).not.toContain('must-not-use-peer');
   });
   it('reports unavailable member verification without telling the human to log in again', async () => {
     const h = await targetHarness({ memberError: true });
-    bytedcliJwts.set(ALICE, { cloudJwt: 'must-not-leak' });
+    byteCloudJwts.set(ALICE, { cn: 'must-not-leak' });
     await h.run();
     const env = identityBody('bytedcli', 'om_kickoff');
     expect(env).toContain('membership verification is unavailable');
@@ -927,7 +1103,7 @@ describe('target daemon consumes signed message authority', () => {
   });
   it.each(['chat', 'thread'] as const)('publishes original credentials after signed dispatch + cross-app resolution (%s)', async scope => {
     const h = await targetHarness({ scope });
-    bytedcliJwts.set(ALICE, { cloudJwt: 'original-user' });
+    byteCloudJwts.set(ALICE, { cn: 'original-user' });
     await h.run();
     expect(h.resolveTargetAppOpenId).toHaveBeenCalledExactlyOnceWith(APP, 'on_alice');
     expect(identityBody('bytedcli', 'om_kickoff')).toContain('original-user');
@@ -938,7 +1114,7 @@ describe('target daemon consumes signed message authority', () => {
   });
   it.each([{ mapping: 'transient' as const }, { member: false }, { talk: false }])('denies identity when target cannot validate user %j', async options => {
     const h = await targetHarness(options);
-    bytedcliJwts.set(ALICE, { cloudJwt: 'must-not-leak' });
+    byteCloudJwts.set(ALICE, { cn: 'must-not-leak' });
     await h.run();
     const env = identityBody('bytedcli', 'om_kickoff');
     expect(env).not.toContain('must-not-leak');
@@ -949,7 +1125,7 @@ describe('target daemon consumes signed message authority', () => {
   });
   it('never uses root binding for an unrelated later turn', async () => {
     const h = await targetHarness();
-    bytedcliJwts.set(ALICE, { cloudJwt: 'must-not-leak' });
+    byteCloudJwts.set(ALICE, { cn: 'must-not-leak' });
     await h.run('om_unrelated');
     expect(h.resolveTargetAppOpenId).not.toHaveBeenCalled();
     expect(identityBody('bytedcli', 'om_unrelated')).not.toContain('must-not-leak');
@@ -971,7 +1147,7 @@ describe('target daemon consumes signed message authority', () => {
       runEnabled: true, runScopes: ['bytedcli'],
     } });
     h.scopeValues.getDashboardAdminOpenIds = () => ['ou_alice_target'];
-    bytedcliJwts.set(ALICE, { cloudJwt: 'scheduled-original-user' });
+    byteCloudJwts.set(ALICE, { cn: 'scheduled-original-user' });
     await h.run(turnId);
     expect(identityBody('bytedcli', turnId))
       .toContain('scheduled-original-user');
@@ -1034,8 +1210,8 @@ describe('target daemon consumes signed message authority', () => {
 it('does not begin another login when the bytedcli provider fails', async () => {
   const provider = await import('../src/services/bytedcli-auth.js');
   vi.mocked(provider.beginBytedcliLogin).mockClear();
-  vi.mocked(provider.mintBytedcliJwts).mockRejectedValueOnce(new Error('provider unavailable'));
-  writeSessionIdentity(dir, SESSION, { tool: 'bytedcli', cloudJwt: 'old-sender-credential', turnId: 'turn-unavailable' }, 'proven');
+  vi.mocked(provider.mintByteCloudUserJwts).mockRejectedValueOnce(new Error('provider unavailable'));
+  writeSessionIdentity(dir, SESSION, { tool: 'bytedcli', cloudJwts: { cn: 'old-sender-credential' }, turnId: 'turn-unavailable' }, 'proven');
   const result = await publishTurnCliIdentity({
     botConfig: botConfig({ enabled: true, tools: ['bytedcli'] }), sessionDataDir: dir, sessionId: SESSION, senderOpenId: ALICE,
     turnId: 'turn-unavailable', storageModel: 'proven',
@@ -1048,55 +1224,78 @@ it('does not begin another login when the bytedcli provider fails', async () => 
   expect(written).not.toContain('old-sender-credential');
 });
 
-// The governed tools are prepared side by side: a slow tool (a bytedcli mint
-// is several CLI runs) must not hold back the other one, and the turn is still
-// released only once BOTH have published or refused.
-describe('publishTurnCliIdentity — tools are prepared concurrently', () => {
-  const both = () => botConfig({ enabled: true, tools: ['lark-cli', 'bytedcli'] });
-  function deferred<T>() {
-    let resolve!: (v: T) => void;
-    const promise = new Promise<T>(r => { resolve = r; });
-    return { promise, resolve };
-  }
 
-  it('starts the second tool while the first is still resolving, and keeps the outcome order', async () => {
-    const lark = deferred<string | null>();
-    resolveLarkCliHomeForTurn.mockImplementationOnce(() => lark.promise);
+it('keeps valid regional ByteCloud credentials when optional Codebase minting fails', async () => {
+  const provider = await import('../src/services/bytedcli-auth.js');
+  byteCloudJwts.set(ALICE, { 'i18n-bd': 'alice-bd' });
+  vi.mocked(provider.mintBytedcliJwts).mockRejectedValueOnce(new Error('temporary provider failure'));
+  const result = await publish(botConfig({ enabled: true, tools: ['bytedcli'] }), ALICE);
+  expect(result).toContainEqual({ tool: 'bytedcli', state: 'user' });
+  expect(identityBody('bytedcli')).toContain("BYTECLOUD_CLI_API_JWT_TOKEN_I18N_BD='alice-bd'");
+  const companion = recallProvenIdentityContent(dir, SESSION, 'turn-default', 'codebase');
+  expect(companion).toContain("BOTMUX_IDENTITY_MODE='denied'");
+  expect(provider.mintBytedcliJwts).toHaveBeenLastCalledWith(ALICE, 'i18n-bd');
+});
+
+
+describe('fixed-user credential sources', () => {
+  it.each(['lark-cli', 'bytedcli', 'larkdev'].flatMap(tool => ['not_authorized', 'unavailable', 'thrown'].map(state => [tool, state] as const)))('platform-only %s %s never reads local credentials or begins login', async (tool, state) => {
+    const { __setPlatformCredentialDepsForTest } = await import('../src/core/platform-credential-source.js');
     const provider = await import('../src/services/bytedcli-auth.js');
-    const minted = vi.mocked(provider.mintBytedcliJwts);
-    const before = minted.mock.calls.length;
-    bytedcliJwts.set(ALICE, { cloudJwt: 'alice-cloud' });
-    const run = publish(both(), ALICE, 'turn-par');
-    await vi.waitFor(() => expect(minted.mock.calls.length).toBe(before + 1));
-    lark.resolve('/isolated/alice');
-    expect(await run).toEqual([{ tool: 'lark-cli', state: 'user' }, { tool: 'bytedcli', state: 'user' }]);
-    expect(identityBody('lark-cli', 'turn-par')).toContain('/isolated/alice');
-    expect(identityBody('bytedcli', 'turn-par')).toContain('alice-cloud');
+    const mint = vi.mocked(provider.mintByteCloudUserJwts);
+    mint.mockClear();
+    const grant = vi.fn(async () => {
+      if (state === 'thrown') throw new Error('platform disconnected');
+      return { ok: false as const, reason: state === 'unavailable' ? 'network' : 'not_authorized', error: 'fixture' };
+    });
+    const resolveUnionId = vi.fn(async () => { throw new Error('contact API unavailable'); });
+    vi.mocked(beginLarkCliLogin).mockClear();
+    resolveLarkCliHomeForTurn.mockClear();
+    __setPlatformCredentialDepsForTest({ readBinding: () => ({ platformUrl: 'https://platform.example', machineToken: 'fixture', machineId: 'test' }), resolveUnionId, requestGrant: grant as any });
+    byteCloudJwts.set(ALICE, { cn: 'fake-local' });
+    larkHomes.set(ALICE, '/fake-local');
+    const cfg = { ...botConfig({ enabled: false, credentialSource: 'local' }), toolIdentity: {
+      user: { larkAppId: APP, openId: ALICE, unionId: 'on_alice' }, tools: [tool], credentialSource: 'platform',
+    } };
+    try {
+      const outcome = await publish(cfg, BOB);
+      expect(outcome.find(o => o.tool === tool)?.state).not.toBe('user');
+      expect(identityBody(tool as any)).toContain("BOTMUX_IDENTITY_MODE='denied'");
+      expect(identityBody(tool as any)).not.toContain('fake-local');
+      expect(mint).not.toHaveBeenCalled();
+      expect(grant).toHaveBeenCalledOnce();
+      expect(resolveUnionId).not.toHaveBeenCalled();
+      expect(resolveLarkCliHomeForTurn).not.toHaveBeenCalled();
+      expect(beginLarkCliLogin).not.toHaveBeenCalled();
+    } finally { __setPlatformCredentialDepsForTest(null); }
   });
 
-  it('settles the publication only after the slower tool has landed', async () => {
-    const provider = await import('../src/services/bytedcli-auth.js');
-    const slow = deferred<{ cloudJwt: string } | null>();
-    vi.mocked(provider.mintBytedcliJwts).mockImplementationOnce(() => slow.promise);
-    larkHomes.set(ALICE, '/isolated/alice');
-    let settled = false;
-    const run = publish(both(), ALICE, 'turn-slow').then(v => { settled = true; return v; });
-    await vi.waitFor(() => expect(published('lark-cli', 'turn-slow')).toBe(true));
-    await new Promise(r => setTimeout(r, 20));
-    expect(settled).toBe(false);
-    slow.resolve({ cloudJwt: 'late-cloud' });
-    await run;
-    expect(identityBody('bytedcli', 'turn-slow')).toContain('late-cloud');
+  it('local-only fixed user bypasses the platform even when sender policy requires it', async () => {
+    const { __setPlatformCredentialDepsForTest } = await import('../src/core/platform-credential-source.js');
+    const grant = vi.fn(async () => ({ ok: false as const, reason: 'network', error: 'fixture' }));
+    __setPlatformCredentialDepsForTest({ readBinding: () => ({ platformUrl: 'https://platform.example', machineToken: 'fixture', machineId: 'test' }), resolveUnionId: async () => 'on_alice', requestGrant: grant as any });
+    byteCloudJwts.set(ALICE, { cn: 'fixed-local' });
+    try {
+      await publish({ ...botConfig({ enabled: false, credentialSource: 'platform' }), toolIdentity: {
+        user: { larkAppId: APP, openId: ALICE, unionId: 'on_alice' }, tools: ['bytedcli'], credentialSource: 'local',
+      } }, BOB);
+      expect(identityBody('bytedcli')).toContain('fixed-local');
+      expect(grant).not.toHaveBeenCalled();
+    } finally { __setPlatformCredentialDepsForTest(null); }
   });
 
-  it('one tool failing does not change what the other publishes', async () => {
-    const provider = await import('../src/services/bytedcli-auth.js');
-    vi.mocked(provider.mintBytedcliJwts).mockRejectedValueOnce(new Error('provider unavailable'));
-    larkHomes.set(ALICE, '/isolated/alice');
-    expect(await publish(both(), ALICE, 'turn-iso')).toEqual([
-      { tool: 'lark-cli', state: 'user' }, { tool: 'bytedcli', state: 'unavailable' },
-    ]);
-    expect(identityBody('lark-cli', 'turn-iso')).toContain('/isolated/alice');
-    expect(identityBody('bytedcli', 'turn-iso')).toContain('[reason=provider_unavailable]');
+  it('publishes independent sender credentials outside an assignment and freezes tool baselines', async () => {
+    const { normalizeToolIdentityPolicy } = await import('../src/services/tool-identity-config.js');
+    const { buildAutomaticTurnDecision } = await import('../src/core/tool-identity-decision.js');
+    byteCloudJwts.set(ALICE, { cn: 'assignment-local' });
+    byteCloudJwts.set(BOB, { cn: 'sender-local' });
+    const cfg = botConfig({ enabled: true, tools: ['bytedcli'], credentialSource: 'local' });
+    const decision = buildAutomaticTurnDecision({ user: { openId: ALICE }, source: 'task', tools: ['lark-cli'], policy: normalizeToolIdentityPolicy(cfg) });
+    const later = botConfig({ enabled: true, tools: ['bytedcli', 'larkdev'], credentialSource: 'platform' });
+    await publishTurnCliIdentity({ botConfig: later, policy: { ...normalizeToolIdentityPolicy(later), ...decision.baseline },
+      decision, senderOpenId: BOB, turnId: 'frozen-baseline', sessionId: SESSION, sessionDataDir: dir, storageModel: 'proven' });
+    expect(identityBody('bytedcli', 'frozen-baseline')).toContain('sender-local');
+    expect(identityBody('bytedcli', 'frozen-baseline')).not.toContain('assignment-local');
+    expect(published('larkdev', 'frozen-baseline')).toBe(false);
   });
 });

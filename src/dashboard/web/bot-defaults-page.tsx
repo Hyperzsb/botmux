@@ -2,6 +2,7 @@ import { SessionGroupNamingRow } from './session-group-naming-row.js';
 import { DEFAULT_LONG_TASK_REMINDER, normalizeLongTaskReminderConfig } from '../../services/long-task-reminder-policy.js';
 import { FeedbackExtensionPanel } from './feedback-extension-panel.js';
 import { CodexProfilePicker } from './codex-profile-picker.js';
+import { AutomationUserPicker } from './automation-user-picker.js';
 import { REPLY_FOOTER_KEYS, normalizeReplyFooter } from '../../services/reply-footer.js';
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type ComponentProps, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
@@ -1184,6 +1185,7 @@ function BotDefaultsCard(props: {
             ) : null}
             <section className="bd-tile" id={botDefaultsSectionDomId('trigger-user-auth')}><TriggerUserAuthSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile" id={botDefaultsSectionDomId('lark-tool-binding')}><LarkToolBindingSection bot={bot} patchBot={patchBot} /></section>
+            <section className="bd-tile" id={botDefaultsSectionDomId('tool-identity')}><ToolIdentitySection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile" id={botDefaultsSectionDomId('grant')}><GrantSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile" id={botDefaultsSectionDomId('blocked-users')}><BlockedUsersEditor larkAppId={bot.larkAppId} tr={tr} /></section>
             <section className="bd-tile" id={botDefaultsSectionDomId('slash-commands')}><SlashCommandPermissionsSection bot={bot} patchBot={patchBot} /></section>
@@ -3962,7 +3964,7 @@ function WorkingDirSection(props: {
         <button type="button" className="primary" data-action="save-working-dir" disabled={busy} onClick={() => void save()}>{tr('botDefaults.save')}</button>
       </div>
       </AgentManagedLock>
-      <AutoStartControls bot={bot} putCardPref={props.putCardPref} />
+      <AutoStartControls bot={bot} putCardPref={props.putCardPref} patchBot={props.patchBot} />
     </section>
   );
 }
@@ -4043,7 +4045,7 @@ function workingDirState(bot: BotDefaultsRow): { mode: 'off' | 'default' | 'onca
   return { mode, workingDir: bot.defaultWorkingDir || def.workingDir || '' };
 }
 
-export function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patch: CardPrefPatch): Promise<JsonResponse> }) {
+export function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patch: CardPrefPatch): Promise<JsonResponse>; patchBot?: PatchBot }) {
   const tr = useT();
   const { bot, putCardPref } = props;
   const [inviteOwner, setInviteOwner] = useState(bot.autoInviteOwnerOnGroupAdd !== false);
@@ -4056,6 +4058,9 @@ export function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patc
   const [seed, setSeed] = useState(bot.autoStartOnGroupJoinSeed || bot.autoStartOnGroupJoinSeedDefault || '');
   const [joinCmdOn, setJoinCmdOn] = useState(bot.groupJoinCommandEnabled === true);
   const [joinCmd, setJoinCmd] = useState(typeof bot.groupJoinCommand === 'string' ? bot.groupJoinCommand : '');
+  // Bot-level automatic-turn Run as default. Clearing it restores native
+  // group-entry execution unless a fixed bot user is explicitly configured.
+  const [automationUser, setAutomationUser] = useState(bot.automationIdentity?.user?.openId ?? '');
   const [status, setStatus] = useState<StatusMessage>(null);
   // 同一块里有两排按钮，状态提示跟着最后操作的那一排显示。
   const [statusKey, setStatusKey] = useState<string | null>(null);
@@ -4070,6 +4075,7 @@ export function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patc
     setSeed(bot.autoStartOnGroupJoinSeed || bot.autoStartOnGroupJoinSeedDefault || '');
     setJoinCmdOn(bot.groupJoinCommandEnabled === true);
     setJoinCmd(typeof bot.groupJoinCommand === 'string' ? bot.groupJoinCommand : '');
+    setAutomationUser(bot.automationIdentity?.user?.openId ?? '');
   }, [
     bot.larkAppId,
     bot.autoInviteOwnerOnGroupAdd,
@@ -4081,6 +4087,7 @@ export function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patc
     bot.autoStartExcludedChats,
     bot.groupJoinCommandEnabled,
     bot.groupJoinCommand,
+    bot.automationIdentity,
   ]);
 
   async function savePatch(patch: CardPrefPatch, key: string): Promise<void> {
@@ -4092,6 +4099,26 @@ export function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patc
       setBusy: on => setBusy(on ? key : null),
       saved: tr('botDefaults.cardPrefSaved'),
       errorText: res => res.body?.error === 'invalid_auto_start_excluded_chats' ? tr('botDefaults.autoStartExcludedChatsInvalid') : responseErrorText(res),
+    });
+  }
+
+  async function saveAutomationIdentity(): Promise<void> {
+    setStatusKey('automationIdentity');
+    await saveBotField({
+      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/automation-identity`, {
+        automationUserOpenId: automationUser || null,
+      }),
+      strict: false,
+      setStatus,
+      setBusy: on => setBusy(on ? 'automationIdentity' : null),
+      saved: tr('botDefaults.automationIdentitySaved'),
+      onSaved: body => {
+        // Echo the daemon-normalized selection; it resolves the union id and
+        // tool scope server-side, so never trust the local open_id alone.
+        setAutomationUser(body?.automationIdentity?.user?.openId ?? '');
+        props.patchBot?.(bot.larkAppId, { automationIdentity: body?.automationIdentity ?? null });
+      },
+      errorText: res => responseErrorText(res),
     });
   }
 
@@ -4128,6 +4155,21 @@ export function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patc
           void savePatch({ autoStartOnGroupJoin: checked }, 'join');
         }}
       />
+      <div className="bd-row" data-field="automation-identity">
+        <AutomationUserPicker botId={bot.larkAppId} value={automationUser} onChange={setAutomationUser}
+          label={tr('botDefaults.autoStartIdentity')}
+          defaultLabel={bot.toolIdentity ? tr('botDefaults.autoStartFixedIdentity') : tr('botDefaults.autoStartHostIdentity')}
+          help={tr('botDefaults.automationIdentityHelp')} />
+        {bot.automationIdentityInvalid
+          ? <small role="alert">{tr('botDefaults.automationIdentityInvalid', { reason: bot.automationIdentityInvalid })}</small>
+          : null}
+      </div>
+      <div className="actions">
+        <button type="button" className="primary" data-action="save-automation-identity" disabled={busy === 'automationIdentity'} onClick={() => void saveAutomationIdentity()}>
+          {tr('botDefaults.save')}
+        </button>
+        {statusKey === 'automationIdentity' ? <StatusSpan status={status} /> : null}
+      </div>
       <div className="bd-row">
         <label>
           <span>{tr('botDefaults.autoStartJoinPrompt')}</span>
@@ -4274,7 +4316,7 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
     });
   }
 
-  function toggleTool(tool: 'lark-cli' | 'bytedcli', on: boolean): void {
+  function toggleTool(tool: 'lark-cli' | 'bytedcli' | 'larkdev', on: boolean): void {
     const next = on ? [...new Set([...tools, tool])] : tools.filter(t => t !== tool);
     void save({ enabled: true, tools: next, fallback, credentialSource, delegateOnMention });
   }
@@ -4304,7 +4346,7 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
         <>
           <div className="bd-row">
             <span>{tr('botDefaults.triggerUserAuthTools')}</span>
-            {(['lark-cli', 'bytedcli'] as const).map(tool => (
+            {(['lark-cli', 'bytedcli', 'larkdev'] as const).map(tool => (
               <label key={tool} className="bd-inline-check">
                 <input
                   type="checkbox"
@@ -4356,6 +4398,9 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
           {tools.includes('bytedcli') ? (
             <p className="bd-section-note">{tr('botDefaults.triggerUserAuthBytedcliNote')}</p>
           ) : null}
+          {tools.includes('larkdev') ? (
+            <p className="bd-section-note">{tr('botDefaults.triggerUserAuthLarkdevNote')}</p>
+          ) : null}
           {typeof info?.authorizedCount === 'number' ? (
             <p className="bd-section-note" data-trigger-user-auth-authorized="">
               {tr('botDefaults.triggerUserAuthAuthorized', { count: String(info.authorizedCount) })}
@@ -4383,7 +4428,8 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
 function LarkToolBindingSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   const tr = useT();
   const { bot, patchBot } = props;
-  const bound = bot.larkToolBinding !== false;
+  // 绑定为显式 opt-in：未配置显示未绑定（原生宿主行为），不再默认勾选。
+  const bound = bot.larkToolBinding === true;
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<StatusMessage>(null);
 
@@ -4414,6 +4460,57 @@ function LarkToolBindingSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
       />
       <div className="actions">
         <StatusSpan status={status} attr={{ 'data-lark-tool-binding-status': '' }} />
+      </div>
+    </section>
+  );
+}
+
+function ToolIdentitySection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+  const tr = useT();
+  const { bot } = props;
+  // 固定执行用户：与自动默认同一套用户选择器；保存路径由 daemon 解析 union id。
+  const [toolUser, setToolUser] = useState(bot.toolIdentity?.user?.openId ?? '');
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState<StatusMessage>(null);
+
+  useEffect(() => {
+    setToolUser(bot.toolIdentity?.user?.openId ?? '');
+  }, [bot.larkAppId, bot.toolIdentity]);
+
+  async function save(): Promise<void> {
+    await saveBotField({
+      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/tool-identity`, {
+        toolUserOpenId: toolUser || null,
+      }),
+      strict: false,
+      setStatus,
+      setBusy: on => setBusy(on),
+      saved: tr('botDefaults.toolIdentitySaved'),
+      onSaved: body => {
+        // Echo the daemon-normalized selection; it resolves the union id and
+        // tool scope server-side, so never trust the local open_id alone.
+        setToolUser(body?.toolIdentity?.user?.openId ?? '');
+        props.patchBot?.(bot.larkAppId, { toolIdentity: body?.toolIdentity ?? null });
+      },
+      errorText: res => responseErrorText(res),
+    });
+  }
+
+  return (
+    <section className="bd-section">
+      <h3 className="bd-section-title">{tr('botDefaults.sectionToolIdentity')}</h3>
+      <div className="bd-row" data-field="tool-identity">
+        <AutomationUserPicker botId={bot.larkAppId} value={toolUser} onChange={setToolUser} />
+        <small className="schedule-form-help">{tr('botDefaults.toolIdentityHelp')}</small>
+        {bot.toolIdentityInvalid
+          ? <small role="alert">{tr('botDefaults.automationIdentityInvalid', { reason: bot.toolIdentityInvalid })}</small>
+          : null}
+      </div>
+      <div className="actions">
+        <button type="button" className="primary" data-action="save-tool-identity" disabled={busy} onClick={() => void save()}>
+          {tr('botDefaults.save')}
+        </button>
+        <StatusSpan status={status} attr={{ 'data-tool-identity-status': '' }} />
       </div>
     </section>
   );

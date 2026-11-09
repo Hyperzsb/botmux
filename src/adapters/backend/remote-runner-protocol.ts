@@ -118,7 +118,7 @@ export interface RemoteRunnerTrustedCaller {
   requestUserOpenId?: string;
   requestUserUnionId?: string;
   requestLarkAppId?: string;
-  source?: 'schedule_creator' | 'failed_turn_recovery';
+  source?: 'schedule_creator' | 'failed_turn_recovery' | 'automation';
   taskId?: string;
   senderType?: 'user' | 'bot';
   botOwner?: {

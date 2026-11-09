@@ -4,7 +4,7 @@ import { resolveCurrentExecutionIdentity } from './cli/current-execution.js';
 // Governed tools plus the Codebase CLI companion that mirrors bytedcli's
 // identity; kept in sync with CODEBASE_COMPANION_TOOL in core/cli-identity.ts
 // (a compile-entry test pins the runner wiring end to end).
-const IDENTITY_TOOLS = ['lark-cli', 'bytedcli', 'codebase'] as const;
+const IDENTITY_TOOLS = ['lark-cli', 'bytedcli', 'larkdev', 'codebase'] as const;
 
 async function main(): Promise<void> {
   const args = process.argv.slice(2);

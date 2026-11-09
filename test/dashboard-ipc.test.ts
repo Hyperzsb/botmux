@@ -3953,7 +3953,8 @@ describe('lark-cli binding setting survives dashboard refresh', () => {
         expect(response.status).toBe(200);
         return response.json();
       };
-      expect(await readDefaults()).toHaveProperty('larkToolBinding', initial !== false);
+      // 新契约：绑定是显式 opt-in，未配置显示为关闭（原生宿主行为）。
+      expect(await readDefaults()).toHaveProperty('larkToolBinding', initial === true);
 
       for (const enabled of [false, true]) {
         const saved = await fetch(`${base}/api/bot-lark-tool-binding`, {
@@ -3962,8 +3963,9 @@ describe('lark-cli binding setting survives dashboard refresh', () => {
         });
         expect(saved.status).toBe(200);
         expect(await saved.json()).toMatchObject({ ok: true, larkToolBinding: enabled });
-        expect(JSON.parse(readFileSync(configPath, 'utf8'))[0].larkToolBinding !== false).toBe(enabled);
-        expect(getBot(appId).config.larkToolBinding !== false).toBe(enabled);
+        // off 是缺省态：落盘清 key（不物化 false，plan §4.3）。
+        expect(JSON.parse(readFileSync(configPath, 'utf8'))[0].larkToolBinding ?? false).toBe(enabled);
+        expect((getBot(appId).config.larkToolBinding ?? false) === true).toBe(enabled);
         const refreshed = await readDefaults();
         expect(refreshed).toHaveProperty('larkToolBinding', enabled);
         expect(botDefaultsPayload({ larkAppId: appId }, refreshed).larkToolBinding).toBe(enabled);
@@ -6823,6 +6825,52 @@ describe('GET /api/schedules', () => {
       expect(listed).not.toHaveProperty('preconditionFilePath');
       expect(listed).not.toHaveProperty('preconditionRef');
     } finally {
+      if (handle) await handle.close();
+      handle = null;
+      config.session.dataDir = previousDataDir;
+      scheduleStore.setScheduleScope('cli_ipc_test_bot001');
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('automation user IPC and schedule selection', () => {
+  it('lists app-scoped historical users and resolves a selected user without replacing the task creator', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-automation-'));
+    const previousDataDir = config.session.dataDir;
+    const appId = 'cli_automation_ipc';
+    const identities = await import('../src/im/lark/identity-cache.js');
+    try {
+      config.session.dataDir = join(dir, 'data');
+      mkdirSync(config.session.dataDir, { recursive: true });
+      scheduleStore.setScheduleScope(appId);
+      vi.spyOn(sessionStore, 'readBotSessionsStrict').mockReturnValue([]);
+      registerBot({ larkAppId: appId, larkAppSecret: '', cliId: 'codex', apiOnly: true,
+        allowedUsers: ['ou_creator', 'ou_runner'],
+        triggerUserAuth: { enabled: true, tools: ['bytedcli'], fallback: 'bot-identity' } });
+      identities.recordIdentity(appId, { openId: 'ou_runner', type: 'user', interactedAt: 1, unionId: 'on_runner', name: 'Runner' });
+      identities.recordIdentity(appId, { openId: 'ou_mentioned', type: 'user', source: 'mention' });
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+      const users = await (await fetch(`${base}/api/automation-users`)).json();
+      expect(users.users).toEqual([{ openId: 'ou_runner', name: 'Runner' }]);
+      const resolved = await (await fetch(`${base}/api/automation-users/resolve`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ runAsOpenId: 'ou_runner', unionId: 'on_forged' }),
+      })).json();
+      expect(resolved.user).toMatchObject({ larkAppId: appId, openId: 'ou_runner', unionId: 'on_runner' });
+      const response = await fetch(`${base}/api/schedules`, { method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ name: 'Selected identity', schedule: 'every 1h', prompt: 'Check', chatId: 'oc_target', runAsOpenId: 'ou_runner' }) });
+      expect(response.status).toBe(200);
+      const task = (await response.json()).task;
+      expect(task.runAsUser).toMatchObject({ openId: 'ou_runner', unionId: 'on_runner' });
+      expect(scheduleStore.getTask(task.id, appId)?.ownerOpenId).toBe('ou_creator');
+      const clear = await fetch(`${base}/api/schedules/${task.id}`, { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ runAsOpenId: '' }) });
+      expect(clear.status).toBe(200);
+      expect((await clear.json()).task.runAsUser).toBeUndefined();
+    } finally {
+      identities.flushIdentityCacheSync();
       if (handle) await handle.close();
       handle = null;
       config.session.dataDir = previousDataDir;
@@ -13283,5 +13331,87 @@ describe('GET /api/sessions/:sessionId/reply-render-snapshot', () => {
       findSpy.mockReturnValue(undefined);
       expect((await fetch(base)).status).toBe(404);
     } finally { findSpy.mockRestore(); renderSpy.mockRestore(); }
+  });
+});
+
+
+describe('fixed tool identity save and reload', () => {
+  async function withFixedBot(run: (base: string, configPath: string, appId: string) => Promise<void>) {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-fixed-tool-user-'));
+    const previousPath = process.env.BOTS_CONFIG;
+    const previousDataDir = config.session.dataDir;
+    const appId = 'cli_fixed_identity_test';
+    const configPath = join(dir, 'bots.json');
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      config.session.dataDir = dir;
+      writeFileSync(configPath, JSON.stringify([{ larkAppId: appId, larkAppSecret: 'fixture', apiOnly: true,
+        triggerUserAuth: { enabled: false, tools: [] },
+      }]));
+      loadBotConfigs().forEach(c => registerBot(c));
+      const { recordIdentity } = await import('../src/im/lark/identity-cache.js');
+      recordIdentity(appId, { openId: 'ou_fixed', unionId: 'on_fixed', type: 'user', source: 'sender', interactedAt: Date.now() });
+      recordIdentity('cli_foreign', { openId: 'ou_foreign', unionId: 'on_foreign', type: 'user', source: 'sender', interactedAt: Date.now() });
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      await run(`http://127.0.0.1:${handle.port}`, configPath, appId);
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      config.session.dataDir = previousDataDir;
+      if (previousPath === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = previousPath;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+  const putFixed = (base: string, body: unknown) => fetch(`${base}/api/bot-tool-identity`, {
+    method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  });
+
+  it('PUT persists tools and credential source, survives bot reload, GET returns the selection, and clear stays cleared', async () => {
+    await withFixedBot(async (base, configPath, appId) => {
+      for (const credentialSource of ['platform', 'local', 'auto']) {
+        const saved = await putFixed(base, { toolUserOpenId: 'ou_fixed', toolTools: ['lark-cli', 'bytedcli', 'bytedcli'], credentialSource });
+        expect(saved.status, JSON.stringify(await saved.clone().json())).toBe(200);
+        expect(await saved.json()).toMatchObject({ ok: true, toolIdentity: {
+          user: { larkAppId: appId, openId: 'ou_fixed', unionId: 'on_fixed' }, tools: ['lark-cli', 'bytedcli'], credentialSource,
+        } });
+        const persisted = JSON.parse(readFileSync(configPath, 'utf8'))[0];
+        expect(persisted.toolIdentity).toMatchObject({ defaultUser: { openId: 'ou_fixed' }, tools: ['lark-cli', 'bytedcli'], credentialSource });
+        expect(persisted.toolIdentity).not.toHaveProperty('user');
+        registerBot(loadBotConfigs().find(c => c.larkAppId === appId)!);
+        expect(getBot(appId).config.toolIdentityInvalid).toBeUndefined();
+        expect(await (await fetch(`${base}/api/bot-default-oncall`)).json()).toMatchObject({ toolIdentity: {
+          user: { openId: 'ou_fixed' }, tools: ['lark-cli', 'bytedcli'], credentialSource,
+        } });
+      }
+      // Editing just the tool scope preserves the fixed source.
+      await putFixed(base, { toolUserOpenId: 'ou_fixed', toolTools: ['larkdev'], credentialSource: 'local' });
+      await putFixed(base, { toolUserOpenId: 'ou_fixed', toolTools: ['bytedcli'] });
+      expect(getBot(appId).config.toolIdentity).toMatchObject({ credentialSource: 'local', tools: ['bytedcli'] });
+      expect((await putFixed(base, { toolUserOpenId: null })).status).toBe(200);
+      expect(JSON.parse(readFileSync(configPath, 'utf8'))[0]).not.toHaveProperty('toolIdentity');
+      registerBot(loadBotConfigs().find(c => c.larkAppId === appId)!);
+      expect(await (await fetch(`${base}/api/bot-default-oncall`)).json()).toMatchObject({ toolIdentity: null });
+    });
+  });
+
+  it('rejects invalid, unobserved and foreign users, empty/unknown tools and credential sources without saving', async () => {
+    await withFixedBot(async (base, configPath, appId) => {
+      for (const patch of [
+        { toolUserOpenId: {} }, { toolUserOpenId: 'ou_unknown' }, { toolUserOpenId: 'ou_foreign' },
+        { toolTools: [] }, { toolTools: ['unknown'] }, { credentialSource: 'unknown' },
+      ]) {
+        const response = await putFixed(base, { toolUserOpenId: 'ou_fixed', ...patch });
+        expect(response.status).toBe(400);
+        expect(JSON.parse(readFileSync(configPath, 'utf8'))[0]).not.toHaveProperty('toolIdentity');
+      }
+      const { applyConfigField, findConfigField, coerceConfigValue } = await import('../src/services/bot-config-store.js');
+      const spec = findConfigField('toolIdentity')!;
+      const coerced = coerceConfigValue(spec, JSON.stringify({ defaultUser: { larkAppId: 'cli_foreign', openId: 'ou_foreign', unionId: 'on_foreign' } }));
+      expect(coerced.ok).toBe(true);
+      if (coerced.ok) expect((await applyConfigField(appId, spec, coerced.value)).ok).toBe(false);
+      expect(JSON.parse(readFileSync(configPath, 'utf8'))[0]).not.toHaveProperty('toolIdentity');
+    });
   });
 });

@@ -1,122 +1,76 @@
 /**
- * Per-person `lark-cli` authorization via the device-code (QR) flow.
+ * Per-person `lark-cli` application + user authorization.
  *
- * Mirrors `bytedcli-auth.ts`: one HOME directory per person, and the CLI is
- * shelled out to with `HOME` pointed at it. See that file's header for why a
- * HOME beats capturing a token — the same reasoning applies, and lark-cli
- * resolves its config (`~/.lark-cli`) and credentials
- * (`~/.local/share/lark-cli/<appId>_<openId>.enc`) through `os.homedir()`,
- * measured in a scratch HOME (an empty HOME reports `not configured`).
+ * `lark-cli` has two independent identities that must both follow the message
+ * sender:
  *
- * ## Why the lark-cli app instead of the bot app
+ *   1. the OAuth application (app id + secret) that issues a device code;
+ *   2. the human who approves that device code.
  *
- * The previous trigger-user path minted a user token through **the bot's own
- * Feishu app** and injected it as env. That coupled "use lark-cli" to "your
- * account is inside that bot app's availability scope" — a person outside the
- * scope was stopped on the consent screen (`你没有…的使用权限`) before they
- * could ever authorize. The device-code flow runs against lark-cli's own app,
- * which is generally available, so no per-person allowlisting is needed.
+ * A private HOME only isolates (2). Copying one machine/operator application
+ * into every private HOME still makes every sender authorize through the same
+ * app, and people outside that app's availability scope see
+ * "you do not have permission to use this app". Worse, the link visibly carries
+ * another person's application identity.
  *
- * ## What is copied into each HOME (app material) vs. what is not (identity)
+ * The minimal fix keeps the original per-sender HOME contract and runs
+ * `config init` inside that HOME. Its browser page lets the sender select an
+ * application they already created or create one when needed; Botmux must not
+ * force a new application. Only after that per-person selection exists do we
+ * start `auth login` in the same HOME. Nothing is copied from the daemon
+ * operator, a shared bootstrap app, or the receiving Bot's app. A small marker
+ * distinguishes an app selected in-place from an old HOME seeded from shared
+ * machine material; an unmarked HOME is cleared before setup so shared app
+ * credentials can never be accepted as personal state.
  *
- * A fresh HOME cannot initiate device flow on its own: the CLI needs a
- * configured app AND its real client secret (a dummy secret is rejected with
- * `The client secret is invalid`; a hand-written plaintext config is ignored as
- * `not configured`). So each HOME is seeded with three **machine-level** files
- * that are identical for every person:
+ * The resulting layout is:
  *
- *   <home>/.lark-cli/config.json                      minimal app entry, users:[]
- *   <home>/.local/share/lark-cli/master.key           lark-cli credential key
- *   <home>/.local/share/lark-cli/appsecret_<app>.enc  the APP secret (encrypted)
+ *   ~/.botmux/data/lark-cli-home/<sender-open-id>/.lark-cli/config.json
+ *   ~/.botmux/data/lark-cli-home/<sender-open-id>/.local/share/lark-cli/...
  *
- * None of those is a person. The per-person product — the user token — only
- * appears AFTER they scan, at
- * `<home>/.local/share/lark-cli/<appId>_<openId>.enc`, and is never copied
- * between HOMEs. The seed files come from the operator's own lark-cli install;
- * without one there is nothing to seed from and login reports "not configured".
+ * (`Library/Application Support/lark-cli` is also recognized on macOS.)
  */
 import { spawn } from 'node:child_process';
-import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
+import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import xtermHeadless from '@xterm/headless';
+import { sessionTempDir } from '../core/session-temp.js';
+import type { Brand } from '../im/lark/lark-hosts.js';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import { scrubCliIdentityEnv, scrubSessionTurnMarkerEnv } from '../utils/child-env.js';
 import { logger } from '../utils/logger.js';
 import { isUsableOpenId } from '../utils/user-token.js';
 import { cliAuthEpochAllows, readCliAuthEpoch, stampCliAuthEpoch } from './cli-auth-epoch.js';
 
-/** Root under which each authorized person gets their own lark-cli HOME.
- *  Overridable for tests so a run never touches the real data dir. */
+const { Terminal } = xtermHeadless;
+
+/** Root under which every sender owns a complete lark-cli installation. */
+const LARK_CLI_HOME_ROOT_DEFAULT = join(
+  homedir(), '.botmux', 'data', 'lark-cli-home',
+);
 let larkCliHomeRootOverride: string | null = null;
+
 /** @internal test-only */
 export function __setLarkCliHomeRootForTest(root: string | null): void {
   larkCliHomeRootOverride = root;
 }
-/** Override the OPERATOR's HOME that app material is seeded from (test-only; in
- *  production this stays null and resolves to the real `os.homedir()`). */
-let machineHomeOverride: string | null = null;
-/** @internal test-only */
-export function __setMachineHomeForTest(home: string | null): void {
-  machineHomeOverride = home;
-}
-const LARK_CLI_HOME_ROOT_DEFAULT = join(homedir(), '.botmux', 'data', 'lark-cli-home');
 
-/**
- * Resolve the HOME that holds the issuing app for a given person.
- *
- * Device login has no built-in public app: it MUST bind a real self-built app,
- * and that app's availability scope decides who can authorize. The only way to
- * guarantee a person sees a link they can actually approve (rather than a
- * "you do not have permission to use this app" page) is to mint their device
- * code with an app THEY can access — best, an app they created. Resolution:
- *
- *   1. test override (`__setMachineHomeForTest`)
- *   2. BOTMUX_LARK_CLI_ISSUER_HOME (explicit env; shared by everyone)
- *   3. the per-person issuer HOME: ~/.botmux/data/lark-cli-issuer-<openId>,
- *      if provisioned (created via `lark-cli config init --new` with HOME there)
- *   4. the botmux-managed shared issuer HOME (~/.botmux/data/lark-cli-app-bootstrap)
- *   5. the operator's own lark-cli HOME (back-compat)
- *
- * A per-person issuer wins over the shared one so each person's link is bound
- * to an app they own/are scoped into; the shared issuer is only the fallback
- * when nobody has provisioned a personal app.
- */
-function issuerMachineHome(openId?: string): string {
-  if (machineHomeOverride) return machineHomeOverride;
-  const env = process.env.BOTMUX_LARK_CLI_ISSUER_HOME?.trim();
-  if (env) return env;
-  if (openId) {
-    // Defensive: only accept a sane open-id-shaped segment, never a traversal.
-    if (/^[A-Za-z0-9_-]{8,128}$/.test(openId)) {
-      const personal = join(LARK_CLI_HOME_ROOT_DEFAULT, '..', `lark-cli-issuer-${openId}`);
-      if (existsSync(join(personal, '.lark-cli', 'config.json'))) return personal;
-    }
-  }
-  const managed = join(LARK_CLI_HOME_ROOT_DEFAULT, '..', 'lark-cli-app-bootstrap');
-  if (existsSync(join(managed, '.lark-cli', 'config.json'))) return managed;
-  return homedir();
-}
-
-/** Last-resort app id if the issuer HOME has no readable config. Normally the
- *  app id is read from the issuer HOME's lark-cli config (BOTMUX_LARK_CLI_ISSUER_HOME
- *  or the operator HOME); a wrong default here surfaces as a device-login failure,
- *  not a silent mis-issuance. */
-const DEFAULT_LARK_CLI_APP_ID = 'cli_aa8021c36af9dcde';
-
-/** Device-code challenges live about 10 minutes (lark-cli `expires_in: 600`).
- *  Expire ours a little sooner so a resume token we hand back is not refused the
- *  instant it is used. */
+/** Device-code challenges live about 10 minutes. */
 const CHALLENGE_TTL_MS = 9 * 60_000;
-
-/** How long to wait on a lark-cli invocation. The device-code calls are
- *  network-bound; generous enough for a slow network, short enough that a wedged
- *  CLI cannot hold a turn open. */
+/** Bound a normal lark-cli invocation. */
 const LARK_CLI_TIMEOUT_MS = 30_000;
 /** Failed automatic polls must not stall every incoming turn during an outage. */
 const AUTO_POLL_COOLDOWN_MS = 60_000;
+/** `config init` waits for a person to select or create an app in the browser. */
+const APP_SETUP_TIMEOUT_MS = 10 * 60_000;
+/** It should print the setup link promptly; otherwise the process is wedged. */
+const APP_SETUP_URL_TIMEOUT_MS = 30_000;
+const MAX_SETUP_OUTPUT_CHARS = 64 * 1024;
+const SETUP_DIAGNOSTIC_TAIL_CHARS = 2 * 1024;
 
-/** Scopes the CLI needs to do the document/drive/wiki/sheets/IM reads a
- *  triggered task performs. Kept level with the old bot-OAuth DEFAULT_SCOPES so
- *  switching the issuing app does not silently narrow what works. */
+/** Baseline scopes used by trigger-user lark-cli calls. */
 export const LARK_CLI_DEVICE_SCOPES = [
   'offline_access',
   'docx:document:readonly',
@@ -130,13 +84,11 @@ export const LARK_CLI_DEVICE_SCOPES = [
   'im:resource',
 ];
 
-/**
- * This person's private lark-cli HOME.
- *
- * Keyed by open_id so two people on one bot never share auth state. The id is
- * concatenated into a filesystem path, so a non-open-id (a `../`-shaped value)
- * must not redirect it at another directory.
- */
+export function larkCliLoginScopes(extraScopes: readonly string[] = []): string[] {
+  return [...new Set([...LARK_CLI_DEVICE_SCOPES, ...extraScopes])];
+}
+
+/** Preserve the original path-safe, app-scoped sender HOME contract. */
 export function larkCliHomeFor(openId: string): string {
   if (!isUsableOpenId(openId)) {
     throw new Error(`[lark-cli-auth] unusable open_id: ${JSON.stringify(openId)}`);
@@ -147,40 +99,85 @@ export function larkCliHomeFor(openId: string): string {
 function larkCliConfigPath(home: string): string {
   return join(home, '.lark-cli', 'config.json');
 }
-function larkCliDataDir(home: string): string {
-  return join(home, '.local', 'share', 'lark-cli');
+
+function larkCliDataDirs(home: string): string[] {
+  return [
+    join(home, '.local', 'share', 'lark-cli'),
+    join(home, 'Library', 'Application Support', 'lark-cli'),
+  ];
 }
 
-/** Whether this person has ever completed a lark-cli login here. Cheap enough to
- *  call per turn; says nothing about whether the token is still valid (a login
- *  can expire — the call itself reports that). */
-export function hasLarkCliHome(openId: string): boolean {
+function configuredAppId(home: string): string | null {
   try {
-    const home = larkCliHomeFor(openId);
-    // Revoke bumps the epoch before deleting the HOME. A CLI that rewrites
-    // session files afterwards still fails this check until a new login stamps
-    // the current epoch. A missing stamp is valid only at epoch 0.
-    if (!cliAuthEpochAllows(openId, home)) return false;
-    // A seeded-but-never-authorized HOME holds no per-person token yet; only a
-    // real <appId>_<openId>.enc counts as "has logged in".
-    // Count only a token for the app this HOME is configured for: after the
-    // issuer changed, an old app's token is unreadable to lark-cli, and must
-    // not keep the person on the "authorized" path where nobody polls a new
-    // login (a re-seed interrupted mid-way, or an old device code completed
-    // after another topic re-seeded).
-    if (!existsSync(larkCliConfigPath(home))) return false;
-    const seeded = seededAppId(home);
-    const tokens = listUserTokenFiles(home);
-    return seeded === undefined ? tokens.length > 0 : tokens.some(f => f.startsWith(`${seeded}_`));
-  } catch { return false; }
+    const cfg = JSON.parse(readFileSync(larkCliConfigPath(home), 'utf8')) as
+      { apps?: Array<{ appId?: unknown }> };
+    const app = cfg.apps?.find(entry =>
+      typeof entry.appId === 'string' && /^cli_[A-Za-z0-9_]+$/.test(entry.appId));
+    return typeof app?.appId === 'string' ? app.appId : null;
+  } catch {
+    return null;
+  }
+}
+
+function personalAppMarkerPath(home: string): string {
+  return join(home, '.botmux-personal-app');
+}
+
+function markPersonalApp(home: string): boolean {
+  if (!configuredAppId(home)) return false;
+  try {
+    atomicWriteFileSync(personalAppMarkerPath(home), 'v1\n', { mode: 0o600 });
+    return true;
+  } catch (error) {
+    logger.warn(`[lark-cli-auth] could not mark personal app setup: ${error instanceof Error ? error.message : String(error)}`);
+    return false;
+  }
 }
 
 /**
- * This person's lark-cli device-login state, for a status query.
+ * Whether this sender completed Botmux's isolated `config init`.
  *
- * The per-person token file is encrypted, so expiry is not known here — only
- * whether a login exists. Does not seed a HOME, start a device flow, or read
- * the ciphertext.
+ * The legacy marker name says "personal app", but it means an application the
+ * sender personally selected for this HOME; the application may already have
+ * existed before Botmux initiated setup.
+ */
+export function hasPersonalLarkCliApp(openId: string): boolean {
+  try {
+    const home = larkCliHomeFor(openId);
+    return cliAuthEpochAllows(openId, home)
+      && existsSync(personalAppMarkerPath(home))
+      && configuredAppId(home) !== null;
+  }
+  catch { return false; }
+}
+
+function hasConfiguredAppToken(openId: string): boolean {
+  try {
+    const home = larkCliHomeFor(openId);
+    if (!hasPersonalLarkCliApp(openId)) return false;
+    const appId = configuredAppId(home);
+    if (!appId) return false;
+    const prefix = `${appId}_`;
+    return larkCliDataDirs(home).some(dir => {
+      try {
+        return readdirSync(dir).some(name => name.startsWith(prefix) && name.endsWith('.enc'));
+      } catch {
+        return false;
+      }
+    });
+  } catch {
+    return false;
+  }
+}
+
+export function hasLarkCliHome(openId: string): boolean {
+  return hasConfiguredAppToken(openId);
+}
+
+/**
+ * This person's isolated lark-cli login state. The encrypted token does not
+ * expose expiry here, so status is limited to whether the current durable auth
+ * epoch has a token for the app selected in this HOME.
  */
 export function describeLarkCliAuth(openId: string): {
   state: 'authorized' | 'needs-login' | 'unknown';
@@ -193,17 +190,20 @@ export function describeLarkCliAuth(openId: string): {
   }
 }
 
-/** Forget one person's lark-cli HOME entirely. Issuer app homes are not here. */
+/** Forget only this person's personal app and user authorization. */
 export function clearLarkCliAuth(openId: string): void {
+  const setup = appSetups.get(openId);
+  if (setup) {
+    try { setup.child.kill(); } catch { /* best effort */ }
+    appSetups.delete(openId);
+  }
   try { rmSync(larkCliHomeFor(openId), { recursive: true, force: true }); }
-  catch { /* best-effort: absence is the desired state */ }
+  catch { /* absence is the desired state */ }
 }
 
 /**
- * `lark-cli auth logout` revokes the refresh token server-side, then clears
- * local users. Only when a HOME already exists — never mkdir one just to log
- * out. Failure (missing binary, non-zero exit) is reported as false; the
- * caller still deletes the local HOME.
+ * Revoke the current server-side refresh token before the caller removes the
+ * isolated HOME. This never creates a HOME for somebody who did not have one.
  */
 export async function logoutLarkCli(openId: string): Promise<boolean> {
   try {
@@ -215,45 +215,75 @@ export async function logoutLarkCli(openId: string): Promise<boolean> {
   }
 }
 
-function listUserTokenFiles(home: string): string[] {
-  try {
-    return readdirSync(larkCliDataDir(home)).filter(f => /^cli_[A-Za-z0-9]+_ou_[A-Za-z0-9]+\.enc$/.test(f));
-  } catch { return []; }
-}
-
 export interface LarkCliResult {
   ok: boolean;
   stdout: string;
   stderr: string;
 }
 
-/**
- * Test seam: replace the lark-cli invocation. Receives the argv and the HOME the
- * call would use, returns the same shape the real child reports. Production never
- * sets this; tests use it to script the device-flow conversation without lark-cli.
- */
 export type LarkCliRunner = (args: string[], home: string) => Promise<LarkCliResult>;
-let __runnerOverride: LarkCliRunner | null = null;
+let runnerOverride: LarkCliRunner | null = null;
 /** @internal test-only */
 export function __setLarkCliRunnerForTest(runner: LarkCliRunner | null): void {
-  __runnerOverride = runner;
+  runnerOverride = runner;
 }
 
-/** Run `lark-cli` with HOME pointed at one person's directory. PATH and the rest
- *  of the environment are inherited (proxy/site/PATH resolution still needed);
- *  HOME is the whole identity mechanism. */
+/** Test seam for the blocking `config init` setup process. */
+export type LarkCliAppSetupRunner = (
+  home: string,
+  args: readonly string[],
+) => Promise<LarkCliResult>;
+let appSetupRunnerOverride: LarkCliAppSetupRunner | null = null;
+/** @internal test-only */
+export function __setLarkCliAppSetupRunnerForTest(runner: LarkCliAppSetupRunner | null): void {
+  appSetupRunnerOverride = runner;
+}
+
+function isolatedLarkCliEnv(home: string): NodeJS.ProcessEnv {
+  const env = { ...process.env };
+  scrubSessionTurnMarkerEnv(env);
+  scrubCliIdentityEnv(env);
+  // These overrides would silently redirect every personal HOME back to one
+  // machine-wide config/store or inject the receiving Bot's identity. XDG
+  // roots matter too: several CLI/runtime libraries prefer them over HOME.
+  for (const key of [
+    'LARKSUITE_CLI_CONFIG_DIR', 'LARKSUITE_CLI_DATA_DIR',
+    'LARKSUITE_CLI_APP_ID', 'LARKSUITE_CLI_APP_SECRET',
+    'LARKSUITE_CLI_USER_ACCESS_TOKEN', 'FEISHU_USER_ACCESS_TOKEN',
+    'LARKSUITE_CLI_TENANT_ACCESS_TOKEN',
+    'LARKSUITE_CLI_TENANT_ACCESS_TOKEN_SOURCE',
+    'LARKSUITE_CLI_TOKEN_ONLY__',
+    'LARKSUITE_CLI_PROFILE', 'LARKSUITE_CLI_DEFAULT_AS',
+  ]) delete env[key];
+  env.HOME = home;
+  env.XDG_CONFIG_HOME = join(home, '.config');
+  env.XDG_DATA_HOME = join(home, '.local', 'share');
+  env.XDG_STATE_HOME = join(home, '.local', 'state');
+  env.XDG_CACHE_HOME = join(home, '.cache');
+  env.LARKSUITE_CLI_LOG_DIR = join(home, '.local', 'state', 'lark-cli', 'logs');
+  env.LARKSUITE_CLI_NO_UPDATE_NOTIFIER = '1';
+  env.LARKSUITE_CLI_NO_SKILLS_NOTIFIER = '1';
+  return env;
+}
+
+/** @internal test-only */
+export function __isolatedLarkCliEnvForTest(home: string): NodeJS.ProcessEnv {
+  return isolatedLarkCliEnv(home);
+}
+
 async function runAsUser(openId: string, args: string[]): Promise<LarkCliResult> {
   const home = larkCliHomeFor(openId);
-  if (__runnerOverride) return __runnerOverride(args, home);
+  mkdirSync(home, { recursive: true, mode: 0o700 });
+  if (runnerOverride) return runnerOverride(args, home);
   return await new Promise<LarkCliResult>(resolve => {
     let child;
     try {
       child = spawn('lark-cli', args, {
-        env: { ...process.env, HOME: home },
+        env: isolatedLarkCliEnv(home),
         stdio: ['ignore', 'pipe', 'pipe'],
       });
-    } catch (e) {
-      resolve({ ok: false, stdout: '', stderr: e instanceof Error ? e.message : String(e) });
+    } catch (error) {
+      resolve({ ok: false, stdout: '', stderr: error instanceof Error ? error.message : String(error) });
       return;
     }
     let stdout = '';
@@ -268,223 +298,219 @@ async function runAsUser(openId: string, args: string[]): Promise<LarkCliResult>
     const timer = setTimeout(() => {
       child.kill('SIGKILL');
       stderr += '\n[lark-cli-auth] timed out';
+      child.stdout.destroy();
+      child.stderr.destroy();
       finish(false);
     }, LARK_CLI_TIMEOUT_MS);
-    child.stdout.on('data', d => { stdout += String(d); });
-    child.stderr.on('data', d => { stderr += String(d); });
-    // A missing binary lands here, not on a non-zero exit.
-    child.on('error', err => { stderr += `\n${err.message}`; finish(false); });
+    child.stdout.on('data', chunk => { stdout += String(chunk); });
+    child.stderr.on('data', chunk => { stderr += String(chunk); });
+    child.on('error', error => { stderr += `\n${error.message}`; finish(false); });
     child.on('close', code => finish(code === 0));
   });
 }
 
-/**
- * Locate the operator's own lark-cli install to seed app material from.
- *
- * Resolved from the REAL (daemon) HOME at call time, never from the per-person
- * HOME we hand to the child — otherwise the first lookup is circular.
- */
-function machineLarkCliPaths(openId?: string): {
-  config: string; dataDir: string; appId: string;
-  /** False when `appId` is the built-in fallback (config unreadable / no app). */
-  appIdFromConfig: boolean;
-} | null {
-  const root = issuerMachineHome(openId);
-  const config = join(root, '.lark-cli', 'config.json');
-  const dataDir = join(root, '.local', 'share', 'lark-cli');
-  if (!existsSync(config) || !existsSync(dataDir)) return null;
-  let appId = DEFAULT_LARK_CLI_APP_ID;
-  let appIdFromConfig = false;
-  try {
-    const picked = currentIssuerApp(JSON.parse(readFileSync(config, 'utf8')));
-    if (picked) { appId = picked; appIdFromConfig = true; }
-  } catch { /* fall back to the default app id */ }
-  return { config, dataDir, appId, appIdFromConfig };
+const APP_SETUP_URL_RE = /https:\/\/(?:open\.feishu\.cn|open\.larksuite\.com)\/page\/cli\?[^\s<>'"]+/;
+
+function extractAppSetupUrl(output: string): string | null {
+  return output.match(APP_SETUP_URL_RE)?.[0] ?? null;
 }
 
+interface AppSetupProcess {
+  child: Pick<ReturnType<typeof spawn>, 'kill'>;
+  url: Promise<string | null>;
+  durableEpoch: number;
+}
+const appSetups = new Map<string, AppSetupProcess>();
+
+// `--new` is intentionally absent: it skips lark-cli's browser-side mode
+// selection and would create a fresh application every time a new sender HOME
+// is initialized. `--force-init` only permits this isolated HOME to configure
+// an app while running under an Agent host; it does not choose/create an app.
+const APP_SETUP_ARGS = ['config', 'init', '--force-init'] as const;
+
 /**
- * The application lark-cli itself treats as current in a config: the profile
- * selected by `lark-cli profile use` (`currentApp`, a profile name or app id),
- * else the first configured app. Reading only the first app made `/login lark`
- * mint codes for a different application than `lark-cli auth status` showed
- * as soon as the operator switched profiles.
+ * Start one blocking `config init` process and return its browser URL as soon
+ * as it appears. The child stays alive after this function resolves and writes
+ * the application selected in the browser into this sender's HOME.
  */
-export function currentIssuerApp(cfg: unknown): string | undefined {
-  if (!cfg || typeof cfg !== 'object') return undefined;
-  const { apps, currentApp } = cfg as { apps?: unknown; currentApp?: unknown };
-  if (!Array.isArray(apps)) return undefined;
-  const usable = apps.filter((a): a is { appId: string; name?: unknown } =>
-    !!a && typeof a === 'object' && typeof (a as { appId?: unknown }).appId === 'string'
-    && (a as { appId: string }).appId.startsWith('cli_'));
-  if (typeof currentApp === 'string' && currentApp) {
-    const selected = usable.find(a => a.name === currentApp) ?? usable.find(a => a.appId === currentApp);
-    if (selected) return selected.appId;
-    // lark-cli itself refuses this config ("profile not found"); keep issuing
-    // with the first app as before, but leave a trace of the split.
-    logger.warn(`[lark-cli-auth] issuer config selects profile ${JSON.stringify(currentApp)}, which does not exist; using the first app`);
+async function beginPersonalAppSetup(openId: string, brand: Brand): Promise<string | null> {
+  const durableEpoch = readCliAuthEpoch(openId);
+  const existing = appSetups.get(openId);
+  if (existing?.durableEpoch === durableEpoch) return existing.url;
+  if (existing) {
+    try { existing.child.kill(); } catch { /* best effort */ }
+    appSetups.delete(openId);
   }
-  return usable[0]?.appId;
-}
 
-/**
- * Seed a person's HOME with the machine-level app material so device flow can
- * start. Idempotent. Returns false when the operator's lark-cli has no app to
- * seed from (the caller turns that into a clear "lark-cli not set up" message).
- */
-function ensureBootstrapped(openId: string): boolean {
-  const machine = machineLarkCliPaths(openId);
-  if (!machine) return false;
   const home = larkCliHomeFor(openId);
-  const dataDir = larkCliDataDir(home);
-  mkdirSync(join(home, '.lark-cli'), { recursive: true, mode: 0o700 });
-  mkdirSync(dataDir, { recursive: true, mode: 0o700 });
-
-  const secretFile = join(dataDir, `appsecret_${machine.appId}.enc`);
-  const masterKey = join(dataDir, 'master.key');
-  const sourceSecret = join(machine.dataDir, `appsecret_${machine.appId}.enc`);
-  const sourceMasterKey = join(machine.dataDir, 'master.key');
-  // Check the issuer's material BEFORE touching this HOME: a profile without
-  // its secret file must leave the person's existing state (and any device
-  // code still valid on the server) exactly as it was.
-  // The issuer is read fresh on every login, but this HOME was seeded once:
-  // after the operator switches profile (or a personal issuer appears) the
-  // person kept minting codes for the old app. Re-seed when the app changed.
-  const seededApp = seededAppId(home);
-  // Only an app the issuer config actually names may replace a seeded HOME: a
-  // config that is unreadable for a moment (or lists no app) yields the
-  // built-in fallback, which must never wipe a working login.
-  const reseed = seededApp !== undefined && seededApp !== machine.appId && machine.appIdFromConfig;
-  const needsCopy = reseed || !existsSync(secretFile) || !existsSync(masterKey);
-  if (needsCopy && (!existsSync(sourceSecret) || !existsSync(sourceMasterKey))) {
-    logger.warn(`[lark-cli-auth] could not seed app material for ${openId}: issuer ${machine.appId} has no secret or master key`);
-    return false;
+  // Old Botmux versions copied a machine/shared issuer into this same path.
+  // No marker means none of it is trusted: start from an actually empty HOME.
+  try {
+    rmSync(home, { recursive: true, force: true });
+    mkdirSync(home, { recursive: true, mode: 0o700 });
+  } catch (error) {
+    logger.warn(`[lark-cli-auth] personal credential storage initialization failed: ${error instanceof Error ? error.message : String(error)}`);
+    return null;
   }
-  // Everything is staged next to its target first and only then renamed into
-  // place, config last: a copy or write that fails leaves the HOME as it was
-  // (never a new key under the old app's config, which lark-cli can no longer
-  // decrypt and no later login would repair). Only a failing rename itself —
-  // a disk fault — can stop part way; the next login re-seeds from there.
-  const staged: Array<[string, string]> = [];
-  const stage = (target: string, write: (tmp: string) => void) => {
-    const tmp = `${target}.botmux-seed`;
-    write(tmp);
-    staged.push([tmp, target]);
+
+  if (appSetupRunnerOverride) {
+    const result = await appSetupRunnerOverride(home, APP_SETUP_ARGS);
+    if (result.ok && readCliAuthEpoch(openId) === durableEpoch && markPersonalApp(home)) {
+      stampCliAuthEpoch(openId, home);
+    }
+    return extractAppSetupUrl(`${result.stdout}\n${result.stderr}`);
+  }
+
+  let child: ReturnType<typeof spawn>;
+  try {
+    // The daemon may itself run under Bun, whose node-pty ReadStream can close
+    // immediately after an initial EAGAIN. `script` supplies the same OS PTY
+    // without routing its master fd through Bun's tty.ReadStream. Both Linux's
+    // util-linux form and macOS/BSD's argv form are supported.
+    const ptyCommand = `stty rows 30 cols 120; exec lark-cli ${APP_SETUP_ARGS.join(' ')}`;
+    const scriptArgs = process.platform === 'linux'
+      ? ['-qefc', ptyCommand, '/dev/null']
+      : ['-q', '/dev/null', '/bin/sh', '-c', ptyCommand];
+    child = spawn('script', scriptArgs, {
+      cwd: home,
+      env: isolatedLarkCliEnv(home),
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+  } catch (error) {
+    logger.warn(`[lark-cli-auth] could not start personal app setup: ${error instanceof Error ? error.message : String(error)}`);
+    return null;
+  }
+
+  let resolveUrl!: (url: string | null) => void;
+  let urlSettled = false;
+  let output = '';
+  let diagnosticTail = '';
+  let promptStep: 'language' | 'action' | 'platform' | 'waiting' = 'language';
+  const terminal = new Terminal({ cols: 120, rows: 30, allowProposedApi: true });
+  const terminalInput = terminal.onData(data => {
+    try { child.stdin?.write(data); } catch { /* child already exited */ }
+  });
+  const url = new Promise<string | null>(resolve => { resolveUrl = resolve; });
+  const settleUrl = (value: string | null) => {
+    if (urlSettled) return;
+    urlSettled = true;
+    clearTimeout(urlTimer);
+    resolveUrl(value);
   };
-  try {
-    if (reseed || !existsSync(secretFile)) stage(secretFile, tmp => copyFileSync(sourceSecret, tmp));
-    if (reseed || !existsSync(masterKey)) stage(masterKey, tmp => copyFileSync(sourceMasterKey, tmp));
+  const inspect = (chunk: unknown) => {
+    const data = String(chunk);
+    if (output.length < MAX_SETUP_OUTPUT_CHARS) {
+      output += data.slice(0, MAX_SETUP_OUTPUT_CHARS - output.length);
+    }
+    diagnosticTail = `${diagnosticTail}${data}`.slice(-SETUP_DIAGNOSTIC_TAIL_CHARS);
+    const found = extractAppSetupUrl(output);
+    if (found) settleUrl(found);
+    // `config init` without --new deliberately opens lark-cli's native picker.
+    // Botmux only answers its three deterministic preliminaries. The browser
+    // page still owns the meaningful choice: reuse an existing application or
+    // create one. Feeding output through xterm also answers terminal capability
+    // queries emitted by the picker, which a plain pipe cannot do.
+    terminal.write(data, () => {
+      if (promptStep === 'language' && /Language\s*\/\s*语言/i.test(output)) {
+        promptStep = 'action';
+        child.stdin?.write('\r');
+      } else if (promptStep === 'action' && /(?:Select action|选择操作)/i.test(output)) {
+        promptStep = 'platform';
+        child.stdin?.write('\r');
+      } else if (promptStep === 'platform' && /(?:Select platform|选择平台)/i.test(output)) {
+        promptStep = 'waiting';
+        child.stdin?.write(brand === 'lark' ? '\x1b[B\r' : '\r');
+      }
+    });
+  };
+  const urlTimer = setTimeout(() => {
+    const tail = diagnosticTail
+      .replace(/\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))/g, '')
+      .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '')
+      .trim();
+    logger.warn(`[lark-cli-auth] personal app setup timed out waiting for URL at step ${promptStep}; output tail: ${tail || '<empty>'}`);
+    settleUrl(null);
+    try { child.kill(); } catch { /* best effort */ }
+  }, APP_SETUP_URL_TIMEOUT_MS);
+  urlTimer.unref();
+  const hardTimer = setTimeout(() => {
+    try { child.kill(); } catch { /* best effort */ }
+  }, APP_SETUP_TIMEOUT_MS);
+  hardTimer.unref();
 
-    // Minimal app entry: the secret is referenced from the encrypted file lark-cli
-    // itself wrote (source "keychain"), and there are no users until someone
-    // actually scans. Built from the operator's config shape, not hand-invented.
-    if (reseed || !existsSync(larkCliConfigPath(home))) {
-      let appEntry: unknown = null;
-      try {
-        const cfg = JSON.parse(readFileSync(machine.config, 'utf8')) as
-          { apps?: Array<Record<string, unknown>> };
-        const src = cfg.apps?.find(a => a.appId === machine.appId);
-        if (src) {
-          appEntry = {
-            appId: src.appId,
-            appSecret: src.appSecret,
-            brand: src.brand ?? 'feishu',
-            lang: src.lang ?? 'zh',
-            users: [],
-          };
-        }
-      } catch { /* fall through to the minimal literal */ }
-      if (!appEntry) {
-        appEntry = {
-          appId: machine.appId,
-          brand: 'feishu',
-          lang: 'zh',
-          // Without a reference to the encrypted-secret pointer, the CLI treats
-          // this as not configured. The encrypted files were copied above; a
-          // machine lacking a readable source config never reaches this path.
-          users: [],
-        };
-      }
-      const body = JSON.stringify({ apps: [appEntry] }, null, 2);
-      stage(larkCliConfigPath(home), tmp => writeFileSync(tmp, body, { mode: 0o600 }));
+  const entry: AppSetupProcess = { child, url, durableEpoch };
+  appSetups.set(openId, entry);
+  child.stdout?.on('data', inspect);
+  child.stderr?.on('data', inspect);
+  child.on('error', error => {
+    logger.warn(`[lark-cli-auth] personal app setup failed to start: ${error.message}`);
+    settleUrl(null);
+  });
+  child.on('close', code => {
+    clearTimeout(hardTimer);
+    terminalInput.dispose();
+    terminal.dispose();
+    settleUrl(extractAppSetupUrl(output));
+    if (appSetups.get(openId) === entry) appSetups.delete(openId);
+    if (code === 0 && readCliAuthEpoch(openId) === durableEpoch && markPersonalApp(home)) {
+      stampCliAuthEpoch(openId, home);
+      logger.info('[lark-cli-auth] personal lark-cli app setup completed');
+    } else if (!hasPersonalLarkCliApp(openId)) {
+      logger.warn(`[lark-cli-auth] personal app setup ended before completion (exit ${code ?? 'unknown'})`);
     }
-    for (const [tmp, target] of staged) renameSync(tmp, target);
-  } catch (e) {
-    for (const [tmp] of staged) { try { rmSync(tmp, { force: true }); } catch { /* best effort */ } }
-    logger.warn(`[lark-cli-auth] could not seed app material for ${openId}: ${e instanceof Error ? e.message : String(e)}`);
-    return false;
-  }
-  if (reseed) {
-    // Only now that the new material is fully in place: the old app's code and
-    // tokens can no longer be used with it. Leaving the token would make
-    // hasLarkCliHome() report "authorized" for a login the CLI cannot read.
-    logger.info(`[lark-cli-auth] issuer changed for ${openId}: ${seededApp} -> ${machine.appId}; re-seeded`);
-    clearChallenge(openId);
-    for (const f of listUserTokenFiles(home)) {
-      if (!f.startsWith(`${machine.appId}_`)) {
-        try { rmSync(join(dataDir, f), { force: true }); } catch { /* best effort */ }
-      }
-    }
-    try { rmSync(join(dataDir, `appsecret_${seededApp}.enc`), { force: true }); } catch { /* best effort */ }
-  }
-  return true;
+  });
+
+  return url;
 }
 
-/** The app this person's HOME was seeded for (undefined: not seeded yet or
- *  unreadable — the seeding path treats both as "write it"). */
-function seededAppId(home: string): string | undefined {
-  try {
-    const cfg = JSON.parse(readFileSync(larkCliConfigPath(home), 'utf8')) as { apps?: Array<{ appId?: unknown }> };
-    const id = cfg.apps?.[0]?.appId;
-    return typeof id === 'string' ? id : undefined;
-  } catch { return undefined; }
-}
-
-/** Where a started-but-unfinished login's resume token lives — inside that
- *  person's HOME, for the same reasons as bytedcli's challenge. */
 function challengePath(openId: string): string {
   return join(larkCliHomeFor(openId), '.botmux-login-challenge');
 }
 
-/** The resume token + link from an in-progress login if still usable. */
-export function pendingLarkCliChallenge(openId: string): { deviceCode: string; authUrl?: string; createdAt: number; autoPollAfter?: number; appId?: string } | null {
+export interface PendingLarkCliChallenge {
+  deviceCode: string;
+  authUrl?: string;
+  scopes: string[];
+  createdAt: number;
+  autoPollAfter?: number;
+}
+
+export function pendingLarkCliChallenge(openId: string): PendingLarkCliChallenge | null {
   try {
     const raw = JSON.parse(readFileSync(challengePath(openId), 'utf8')) as
-      { deviceCode?: unknown; authUrl?: unknown; createdAt?: unknown; autoPollAfter?: unknown; appId?: unknown };
+      { deviceCode?: unknown; authUrl?: unknown; scopes?: unknown; createdAt?: unknown; autoPollAfter?: unknown };
     if (typeof raw.deviceCode !== 'string' || typeof raw.createdAt !== 'number') return null;
     if (Date.now() - raw.createdAt > CHALLENGE_TTL_MS) return null;
     return {
       deviceCode: raw.deviceCode,
       ...(typeof raw.authUrl === 'string' ? { authUrl: raw.authUrl } : {}),
+      scopes: Array.isArray(raw.scopes) && raw.scopes.every(scope => typeof scope === 'string')
+        ? raw.scopes as string[]
+        : [...LARK_CLI_DEVICE_SCOPES],
       createdAt: raw.createdAt,
       ...(typeof raw.autoPollAfter === 'number' && Number.isFinite(raw.autoPollAfter)
         ? { autoPollAfter: raw.autoPollAfter } : {}),
-      ...(typeof raw.appId === 'string' ? { appId: raw.appId } : {}),
     };
-  } catch { return null; }
-}
-
-function saveChallenge(openId: string, deviceCode: string, authUrl: string, appId: string | undefined): void {
-  try {
-    atomicWriteFileSync(
-      challengePath(openId),
-      JSON.stringify({ deviceCode, authUrl, createdAt: Date.now(), appId }),
-      { mode: 0o600 },
-    );
-  } catch (e) {
-    logger.debug(`[lark-cli-auth] could not persist the login challenge: ${e instanceof Error ? e.message : String(e)}`);
+  } catch {
+    return null;
   }
 }
 
-function clearChallengeIfCurrent(openId: string, deviceCode: string): void {
+function saveChallenge(openId: string, deviceCode: string, authUrl: string, scopes: string[]): void {
   try {
-    const raw = JSON.parse(readFileSync(challengePath(openId), 'utf8')) as { deviceCode?: unknown };
-    if (raw.deviceCode !== deviceCode) return;
-  } catch { return; }
-  clearChallenge(openId);
+    atomicWriteFileSync(
+      challengePath(openId),
+      JSON.stringify({ deviceCode, authUrl, scopes, createdAt: Date.now() }),
+      { mode: 0o600 },
+    );
+  } catch (error) {
+    logger.debug(`[lark-cli-auth] could not persist the login challenge: ${error instanceof Error ? error.message : String(error)}`);
+  }
 }
 
 function clearChallenge(openId: string): void {
-  try { rmSync(challengePath(openId), { force: true }); } catch { /* already gone */ }
+  try { rmSync(challengePath(openId), { force: true }); }
+  catch { /* already absent */ }
 }
 
 function deferAutomaticPoll(openId: string, deviceCode: string): void {
@@ -501,41 +527,38 @@ function deferAutomaticPoll(openId: string, deviceCode: string): void {
 }
 
 export interface LarkCliLoginChallenge {
-  /** The page the person opens to authorize. */
   authUrl: string;
+  /** First bind the app selected by the sender, then authorize through it. */
+  stage: 'app-setup' | 'user-login';
+  scopes?: string[];
 }
 
 /**
- * Start a device-code login for one person and return the link (and a QR can be
- * rendered from it). Non-blocking (`--no-wait`): the CLI returns immediately
- * with a verification_url + device_code instead of holding a turn open, which
- * is the only shape that works when the authorizer is on the other side of a
- * chat.
+ * Start (or resume) the next required step for one sender.
+ *
+ * No selected app -> config-init link. Selected app ready -> user OAuth link. There is
+ * deliberately no shared-app fallback between those states.
  */
-export async function beginLarkCliLogin(openId: string): Promise<LarkCliLoginChallenge | null> {
+export async function beginLarkCliLogin(
+  openId: string,
+  extraScopes: readonly string[] = [],
+  brand: Brand = 'feishu',
+): Promise<LarkCliLoginChallenge | null> {
   const epochAtStart = readCliAuthEpoch(openId);
-  const home = larkCliHomeFor(openId);
-  if (existsSync(home) && !cliAuthEpochAllows(openId, home)) clearLarkCliAuth(openId);
-  if (!ensureBootstrapped(openId)) {
-    logger.warn('[lark-cli-auth] cannot begin login: operator lark-cli has no app to seed from');
-    return null;
+  if (!hasPersonalLarkCliApp(openId)) {
+    const authUrl = await beginPersonalAppSetup(openId, brand);
+    return authUrl ? { authUrl, stage: 'app-setup' } : null;
   }
-  // Reuse a still-fresh, not-yet-completed challenge: several turns in quick
-  // succession from one person who has not authorized must not mint a new code
-  // (and invalidate the link already shown) on every message. A fresh scan
-  // clears the challenge, so after they authorize a new code is correctly made.
+
+  const scopes = larkCliLoginScopes(extraScopes);
   const pending = pendingLarkCliChallenge(openId);
-  // A code minted for another app (left behind by an interrupted re-seed) is
-  // not reused: completing it would land a token this HOME no longer reads.
-  if (pending?.authUrl && !hasLarkCliHome(openId)
-    && (pending.appId === undefined || pending.appId === seededAppId(home))) {
-    return { authUrl: pending.authUrl };
+  if (pending?.authUrl && pending.scopes.length === scopes.length
+    && pending.scopes.every(scope => scopes.includes(scope))) {
+    return { authUrl: pending.authUrl, stage: 'user-login', scopes };
   }
-  // The app this code is minted for, read BEFORE the CLI runs: another topic
-  // may re-seed the HOME while we wait, and the label must stay the issuer's.
-  const mintedForApp = seededAppId(home);
+
   const { ok, stdout, stderr } = await runAsUser(openId, [
-    'auth', 'login', '--no-wait', '--json', '--scope', LARK_CLI_DEVICE_SCOPES.join(' '),
+    'auth', 'login', '--no-wait', '--json', '--scope', scopes.join(' '),
   ]);
   let parsed: Record<string, unknown> | null = null;
   try { parsed = JSON.parse(stdout) as Record<string, unknown>; }
@@ -543,36 +566,49 @@ export async function beginLarkCliLogin(openId: string): Promise<LarkCliLoginCha
   const authUrl = typeof parsed?.verification_url === 'string' ? parsed.verification_url : undefined;
   const deviceCode = typeof parsed?.device_code === 'string' ? parsed.device_code : undefined;
   if (!ok || !authUrl || !deviceCode) {
-    logger.warn(`[lark-cli-auth] could not start a login: ${stderr.trim() || stdout.trim() || 'no output'}`);
+    logger.warn(`[lark-cli-auth] could not start a personal login: ${stderr.trim() || stdout.trim() || 'no output'}`);
     return null;
   }
-  // A revoke (or a newer login) won while the CLI was running. Leave the HOME
-  // alone so that newer login is not deleted.
+  // A revoke won while lark-cli was minting the device code. Do not publish or
+  // persist a challenge that belongs to the invalidated personal HOME.
   if (readCliAuthEpoch(openId) !== epochAtStart) return null;
-  stampCliAuthEpoch(openId, home);
-  saveChallenge(openId, deviceCode, authUrl, mintedForApp);
-  return { authUrl };
+  saveChallenge(openId, deviceCode, authUrl, scopes);
+  return { authUrl, stage: 'user-login', scopes };
 }
 
 export type LarkCliLoginState = 'authorized' | 'pending' | 'failed';
 
-/**
- * Poll a started login once (non-blocking). `pending` is the ordinary "the
- * person has not scanned yet" state, not an error.
- */
+/** Poll a user-login device code once. App setup is completed by its child. */
 export async function completeLarkCliLogin(
   openId: string,
   deviceCode?: string,
 ): Promise<{ state: LarkCliLoginState; detail?: string }> {
+  const durableEpoch = readCliAuthEpoch(openId);
   const code = deviceCode ?? pendingLarkCliChallenge(openId)?.deviceCode;
-  if (!code) return { state: 'failed', detail: 'no active login — please start again' };
-  const { ok, stdout, stderr } = await runAsUser(openId, ['auth', 'login', '--device-code', code, '--json']);
+  if (!code) {
+    return hasConfiguredAppToken(openId)
+      ? { state: 'authorized' }
+      : { state: 'failed', detail: 'no active user login — start again' };
+  }
+  const { ok, stdout, stderr } = await runAsUser(openId, [
+    'auth', 'login', '--device-code', code, '--json',
+  ]);
   let parsed: Record<string, unknown> | null = null;
-  try { parsed = JSON.parse(stdout) as Record<string, unknown>; } catch { parsed = null; }
+  try { parsed = JSON.parse(stdout) as Record<string, unknown>; }
+  catch { parsed = null; }
   if (ok) {
-    // A successful poll means the user token is now on disk under this HOME.
-    if (hasLarkCliHome(openId)) { clearChallenge(openId); return { state: 'authorized' }; }
-    // ok but no token file yet — treat as pending rather than authorized.
+    if (readCliAuthEpoch(openId) !== durableEpoch) {
+      return { state: 'failed', detail: 'login attempt was replaced or revoked' };
+    }
+    if (hasConfiguredAppToken(openId)) {
+      const home = larkCliHomeFor(openId);
+      stampCliAuthEpoch(openId, home);
+      if (!cliAuthEpochAllows(openId, home)) {
+        return { state: 'failed', detail: 'login attempt was replaced or revoked' };
+      }
+      clearChallenge(openId);
+      return { state: 'authorized' };
+    }
     return { state: 'pending' };
   }
   // CLI error envelopes are written to stderr; older runners used stdout.
@@ -590,27 +626,21 @@ export async function completeLarkCliLogin(
   const invalidCode = /device[_ ]code.*(?:invalid|unknown)|invalid.*device[_ ]code/i.test(raw);
   const expired = /expired[_ ]token|(?:device[_ ]code|authorization).*expired/i.test(raw);
   if (denied || invalidCode || expired) {
-    // Only the challenge this poll was about: a newer one (issued meanwhile,
-    // e.g. after the issuer changed) must survive the old code's verdict.
-    clearChallengeIfCurrent(openId, code);
+    clearChallenge(openId);
   } else {
     deferAutomaticPoll(openId, code);
   }
   return { state: 'failed', detail: raw || undefined };
 }
 
-/**
- * Resolve the acting HOME for THIS turn, polling a pending device login once.
- *
- * A browser approval writes nothing locally: only the `--device-code` poll
- * lands the per-person token. Without this poll on the turn path, a person who
- * tapped the link and (as instructed) retried the operation would be refused
- * again until they guessed `/login done`. One poll per turn is the same shape
- * bytedcli already uses; a still-pending or failed poll resolves to null (the
- * caller refuses again). Temporary failures reuse the link and defer automatic
- * polls for one minute; explicit /login done calls complete directly. It never
- * manufactures a HOME, so someone who has not approved stays refused.
- */
+/** The acting HOME for this turn, only after both personal-app and user login. */
+export function larkCliHomeForTurn(openId: string | undefined): string | null {
+  if (!openId) return null;
+  try { return hasLarkCliHome(openId) ? larkCliHomeFor(openId) : null; }
+  catch { return null; }
+}
+
+/** Poll a pending user login once, then publish the HOME only if it is usable. */
 export async function resolveLarkCliHomeForTurn(openId: string | undefined): Promise<string | null> {
   if (!openId) return null;
   try {
@@ -622,7 +652,61 @@ export async function resolveLarkCliHomeForTurn(openId: string | undefined): Pro
     }
     return hasLarkCliHome(openId) ? larkCliHomeFor(openId) : null;
   } catch {
-    // A poll failure must not deny someone whose HOME is already on disk.
     return hasLarkCliHome(openId) ? larkCliHomeFor(openId) : null;
+  }
+}
+
+/**
+ * Materialize the current sender's lark-cli HOME inside one session's existing
+ * writable temp root.
+ *
+ * A sandbox cannot bind a different host directory for every turn after it has
+ * started, and granting the shared `lark-cli-home/` parent would expose every
+ * sender. The daemon therefore keeps the durable personal HOME outside the
+ * sandbox and publishes a session-local copy keyed by the credential owner.
+ * Preparing another person's queued turn must not replace the HOME an active
+ * turn already references. The same person's copy may refresh in place; another
+ * person or session never shares that path. All copies retire with the session.
+ */
+export async function materializeLarkCliHomeForSession(
+  openId: string,
+  sessionDataDir: string,
+  sessionId: string,
+): Promise<string | null> {
+  const source = await resolveLarkCliHomeForTurn(openId);
+  if (!source) return null;
+
+  // Intentionally pay one bounded network verification per sandboxed turn so
+  // a refreshed token is captured before the immutable-at-spawn bind is copied.
+  // A transient verification failure does not discard an otherwise usable
+  // stored login; the copied CLI still enforces its own token state.
+  try { await runAsUser(openId, ['auth', 'status', '--json', '--verify']); }
+  catch { /* best effort; copy the last known personal state */ }
+
+  const root = join(sessionTempDir(sessionDataDir, sessionId), 'lark-cli-home');
+  mkdirSync(root, { recursive: true, mode: 0o700 });
+  const principal = createHash('sha256').update(openId).digest('hex').slice(0, 24);
+  const target = join(root, principal);
+  const staging = join(root, `.next-${randomUUID()}`);
+  const cacheRoot = join(source, '.cache');
+  const stateRoot = join(source, '.local', 'state');
+  const challenge = challengePath(openId);
+  try {
+    rmSync(staging, { recursive: true, force: true });
+    cpSync(source, staging, {
+      recursive: true,
+      force: false,
+      errorOnExist: true,
+      filter: path => path !== cacheRoot && !path.startsWith(`${cacheRoot}/`)
+        && path !== stateRoot && !path.startsWith(`${stateRoot}/`)
+        && path !== challenge,
+    });
+    rmSync(target, { recursive: true, force: true });
+    renameSync(staging, target);
+    return target;
+  } catch (error) {
+    rmSync(staging, { recursive: true, force: true });
+    logger.warn(`[lark-cli-auth] could not materialize isolated session HOME: ${error instanceof Error ? error.message : String(error)}`);
+    return null;
   }
 }

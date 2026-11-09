@@ -89,6 +89,7 @@ export function v3RelayScheduleBotHasAllowlist(bot: {
 
 /** Live view of the claimed session, provided by the daemon's own registry. */
 export interface V3SessionRelaySessionView {
+  scheduledExecutionUser?: import('../../services/automation-identity.js').AutomationUser | null;
   receiver: boolean;
   liveOrigin?: { capability: string; turnId?: string; dispatchAttempt?: number };
   callerOpenId?: string;
@@ -303,6 +304,7 @@ function authenticateRelaySession(input: V3SessionRelayAuthInput): RelayAuthenti
     const auth = authorizeScheduledTurn({
       turnId: liveTurnId,
       loadTask: input.loadScheduledTask,
+      executionUser: current.scheduledExecutionUser,
       sessionLarkAppId: current.larkAppId,
       sessionChatId: current.chatId,
       isOwnerAllowed: gate,

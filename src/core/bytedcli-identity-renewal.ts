@@ -14,6 +14,7 @@
  */
 import { logger } from '../utils/logger.js';
 import { renewBytedcliJwts } from '../services/bytedcli-auth.js';
+import { BYTECLOUD_USER_SITES, type ByteCloudUserSite } from '../utils/bytecloud-sites.js';
 import {
   recallProvenIdentityContent,
   renderIdentityEnv,
@@ -52,7 +53,11 @@ function jwtExpiryMs(jwt: string | undefined): number | undefined {
 
 /** Soonest expiry among the ByteCloud JWTs a wrapper may select. */
 export function bytedcliIdentityExpiryMs(identity: BytedCliIdentity): number | undefined {
-  const expiries = [identity.cloudJwt, ...Object.values(identity.regionalCloudJwts ?? {})]
+  const expiries = [
+    identity.cloudJwt,
+    ...Object.values(identity.cloudJwts ?? {}),
+    ...Object.values(identity.regionalCloudJwts ?? {}),
+  ]
     .map(jwtExpiryMs)
     .filter((v): v is number => v !== undefined);
   return expiries.length ? Math.min(...expiries) : undefined;
@@ -79,6 +84,34 @@ export function forgetBytedcliIdentityRenewals(): void {
   entries.clear();
 }
 
+async function renewPublishedIdentity(
+  entry: RenewalEntry,
+): Promise<Pick<BytedCliIdentity, 'cloudJwt' | 'cloudJwts' | 'codeJwt' | 'regionalCloudJwts'> | null> {
+  const siteEntries = BYTECLOUD_USER_SITES.filter(site => entry.identity.cloudJwts?.[site]);
+  if (!siteEntries.length) {
+    const jwts = await renewBytedcliJwts(entry.credentialOpenId);
+    return jwts ? {
+      cloudJwt: jwts.cloudJwt,
+      ...(jwts.codeJwt ? { codeJwt: jwts.codeJwt } : {}),
+      ...(jwts.regionalCloudJwts ? { regionalCloudJwts: jwts.regionalCloudJwts } : {}),
+    } : null;
+  }
+
+  const cloudJwts: Partial<Record<ByteCloudUserSite, string>> = {};
+  let codeJwt: string | undefined;
+  for (const site of siteEntries) {
+    try {
+      const jwts = await renewBytedcliJwts(entry.credentialOpenId, site);
+      if (!jwts) continue;
+      cloudJwts[site] = jwts.cloudJwt;
+      codeJwt ??= jwts.codeJwt;
+    } catch (error) {
+      logger.debug(`[bytedcli-renewal] could not renew optional site ${site}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  return Object.keys(cloudJwts).length ? { cloudJwts, ...(codeJwt ? { codeJwt } : {}) } : null;
+}
+
 function stillPublished(entry: RenewalEntry): boolean {
   const current = recallProvenIdentityContent(entry.sessionDataDir, entry.sessionId, entry.identity.turnId, 'bytedcli');
   return current !== undefined && current === renderIdentityEnv(publishedIdentityShape(entry.sessionDataDir, entry.sessionId, entry.identity));
@@ -103,7 +136,7 @@ export async function renewExpiringBytedcliIdentities(
     if (expiresAt === undefined || expiresAt - now() > renewBeforeMs) continue;
     inFlight.add(key);
     try {
-      const jwts = await renewBytedcliJwts(entry.credentialOpenId);
+      const jwts = await renewPublishedIdentity(entry);
       if (!jwts) {
         logger.warn(`[bytedcli-renewal] could not renew ${entry.sessionId.slice(0, 8)}/${entry.identity.turnId.slice(0, 12)}; keeping current tokens`);
         continue;
@@ -113,7 +146,10 @@ export async function renewExpiringBytedcliIdentities(
       if (!stillPublished(entry)) { entries.delete(key); continue; }
       const identity: BytedCliIdentity & { turnId: string } = {
         tool: 'bytedcli',
-        cloudJwt: jwts.cloudJwt,
+        ...(jwts.cloudJwt ?? entry.identity.cloudJwt ? { cloudJwt: jwts.cloudJwt ?? entry.identity.cloudJwt } : {}),
+        ...(jwts.cloudJwts || entry.identity.cloudJwts
+          ? { cloudJwts: { ...entry.identity.cloudJwts, ...jwts.cloudJwts } }
+          : {}),
         // Keep material the renewal could not refresh rather than drop it.
         ...(jwts.codeJwt ?? entry.identity.codeJwt ? { codeJwt: jwts.codeJwt ?? entry.identity.codeJwt } : {}),
         ...(jwts.regionalCloudJwts || entry.identity.regionalCloudJwts

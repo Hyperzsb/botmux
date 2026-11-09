@@ -15,19 +15,19 @@ describe('latestLarkToolBindingForRespawn (daemon-side carrier)', () => {
     session: { sessionId: 's1' },
   } as unknown as DaemonSession);
 
-  it('returns true when larkToolBinding is explicitly enabled on the bot or unconfigured (default on)', () => {
+  it('returns true when larkToolBinding is explicitly enabled on the bot', () => {
     vi.spyOn(botRegistry, 'getBot').mockReturnValue({
       config: { larkAppId: 'cli_test', larkToolBinding: true },
     } as any);
     expect(latestLarkToolBindingForRespawn(makeSession())).toBe(true);
+  });
 
+  it('returns null when larkToolBinding is unconfigured or explicitly false (binding is opt-in; worker clears snapshot)', () => {
     vi.spyOn(botRegistry, 'getBot').mockReturnValue({
       config: { larkAppId: 'cli_test' },
     } as any);
-    expect(latestLarkToolBindingForRespawn(makeSession())).toBe(true);
-  });
+    expect(latestLarkToolBindingForRespawn(makeSession())).toBeNull();
 
-  it('returns null when larkToolBinding is explicitly false (worker clears snapshot)', () => {
     vi.spyOn(botRegistry, 'getBot').mockReturnValue({
       config: { larkAppId: 'cli_test', larkToolBinding: false },
     } as any);
@@ -51,7 +51,9 @@ describe('requestSessionRestart live-worker branch carries larkToolBinding', () 
   it.each([
     [{ larkToolBinding: false }, null],
     [{ larkToolBinding: true }, true],
-    [{}, true],
+    [{}, null],
+    [{ triggerUserAuth: { enabled: true, tools: ['lark-cli'], fallback: 'none' } }, null],
+    [{ larkToolBinding: true, triggerUserAuth: { enabled: true, tools: ['lark-cli'], fallback: 'none' } }, true],
   ] as const)('bot config %o → restart IPC larkToolBinding %s', (botConfig, expected) => {
     __testOnly_resetRestartCoordinator();
     vi.spyOn(botRegistry, 'getBot').mockReturnValue({ config: { larkAppId: 'cli_test', ...botConfig } } as any);

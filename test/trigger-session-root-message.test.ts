@@ -52,6 +52,7 @@ vi.mock('../src/services/message-queue.js', () => ({
 }));
 
 const mockForkWorker = vi.fn();
+const mockPrepareExternalTurnIdentity = vi.fn(async (..._args: any[]) => {});
 const mockQueuedTailAdmission = vi.fn();
 const activeKeyLocks = vi.hoisted(() => ({
   byMap: new WeakMap<Map<string, any>, Map<string, Promise<void>>>(),
@@ -63,6 +64,7 @@ vi.mock('../src/core/worker-pool.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/core/worker-pool.js')>();
   return {
   forkWorker: (...args: any[]) => mockForkWorker(...args),
+  prepareExternalTurnIdentity: (...args: any[]) => mockPrepareExternalTurnIdentity(...args),
   sendWorkerInput: (ds: any, payload: any, turnId?: string, opts: any = {}) => {
     if (!ds.worker || ds.worker.killed) return false;
     if (actual.hasQueuedActivationAdmissionGate(ds)) return mockQueuedTailAdmission(ds, payload, turnId, opts);
@@ -250,6 +252,35 @@ describe('triggerSessionTurn rootMessageId target', () => {
     expect(triggerId).toMatch(/^trg_/);
     expect(resolveTurnOrigin({ session: {} } as any, triggerId)).toEqual({ origin: 'trigger', triggerSource: 'webhook' });
     expect(resolveTurnOrigin({ session: {} } as any, 'trg_never_admitted')).toEqual({ origin: 'unknown' });
+  });
+
+  it('prepares a selected user before forking and carries the same caller into the opening input', async () => {
+    const user = { larkAppId: APP, openId: 'ou_selected', unionId: 'on_selected' };
+    mockGetBot.mockReturnValue({ config: { larkAppId: APP, cliId: 'claude-code', workingDir: '/tmp',
+      triggerUserAuth: { enabled: true, tools: ['bytedcli'], fallback: 'none' } },
+      resolvedAllowedUsers: [user.openId], resolvedBlockedUsers: [], botName: 'Bot', botOpenId: 'ou_bot' });
+    const activeSessions = new Map<string, DaemonSession>();
+    const result = await triggerSessionTurn(request(), { larkAppId: APP, activeSessions }, { executionUser: user });
+    expect(result.ok).toBe(true);
+    const ds = activeSessions.get(sessionKey(ROOT, APP))!;
+    expect(ds.session.ownerOpenId).toBe(user.openId);
+    expect(mockPrepareExternalTurnIdentity).toHaveBeenCalledWith(ds, result.triggerId);
+    expect(ds.session.replyTargets?.[result.triggerId!].automationUser).toEqual(user);
+    expect(mockForkWorker.mock.calls.at(-1)?.[1].trustedCaller).toMatchObject({
+      requestUserOpenId: user.openId, requestUserUnionId: user.unionId, source: 'automation',
+    });
+    expect(mockPrepareExternalTurnIdentity.mock.invocationCallOrder.at(-1))
+      .toBeLessThan(mockForkWorker.mock.invocationCallOrder.at(-1)!);
+  });
+
+  it('does not accept an execution identity supplied in the external event data', async () => {
+    const req = request();
+    req.envelope.payload = { runAsOpenId: 'ou_payload', runAsUser: { larkAppId: APP, openId: 'ou_payload', unionId: 'on_payload' } };
+    const activeSessions = new Map<string, DaemonSession>();
+    await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
+    expect(mockPrepareExternalTurnIdentity).not.toHaveBeenCalled();
+    expect(mockForkWorker.mock.calls.at(-1)?.[1].trustedCaller).toBeUndefined();
+    expect(activeSessions.get(sessionKey(ROOT, APP))?.session.ownerOpenId).toBeUndefined();
   });
 
   it('keeps the localized topic seed by default', () => {
@@ -1032,6 +1063,10 @@ describe('triggerSessionTurn rootMessageId target', () => {
 
   it('fails closed for a dormant ledger-only owner instead of reforking over it', async () => {
     const ds = existingDs();
+    const user = { larkAppId: APP, openId: 'ou_selected', unionId: 'on_selected' };
+    mockGetBot.mockReturnValue({ config: { larkAppId: APP, cliId: 'codex-app', workingDir: '/tmp',
+      triggerUserAuth: { enabled: true, tools: ['bytedcli'], fallback: 'none' } },
+      resolvedAllowedUsers: [user.openId], resolvedBlockedUsers: [], botName: 'Bot', botOpenId: 'ou_bot' });
     ds.session.cliId = 'codex-app';
     ds.session.codexAppDispatchLedger = [{
       dispatchId: 'dispatch-owned',
@@ -1044,7 +1079,7 @@ describe('triggerSessionTurn rootMessageId target', () => {
     const res = await triggerSessionTurn(request(), {
       larkAppId: APP,
       activeSessions: new Map([[sessionKey(ROOT, APP), ds]]),
-    });
+    }, { executionUser: user });
 
     expect(res).toMatchObject({
       ok: false,
@@ -1053,6 +1088,8 @@ describe('triggerSessionTurn rootMessageId target', () => {
     });
     expect(mockForkWorker).not.toHaveBeenCalled();
     expect(mockRememberLastCliInput).not.toHaveBeenCalled();
+    expect(mockPrepareExternalTurnIdentity).not.toHaveBeenCalled();
+    expect(ds.session.replyTargets).toBeUndefined();
   });
 
   it('preserves the clean split when an external event reforks a stopped Codex App session', async () => {
@@ -1484,5 +1521,33 @@ describe('triggerSessionTurn suppressFinalOutput (loud connector opt-in)', () =>
     // leaking to the group top level.
     expect(ds.session.replyTargets![turnId]).toMatchObject({ rootMessageId: 'om_shared_topic' });
     expect(resolveSessionReplyTarget(ds, turnId)).toEqual({ mode: 'thread', rootMessageId: 'om_shared_topic' });
+  });
+
+  it('rejects a webhook when its configured identity cannot be enforced instead of running natively', async () => {
+    mockGetBot.mockReturnValue({
+      config: {
+        larkAppId: APP, cliId: 'claude-code', workingDir: '/tmp',
+        // The default was configured earlier, but the bot can no longer
+        // enforce it: the managed binding is off and per-turn auth is unset.
+        larkToolBinding: false,
+        automationIdentity: {
+          user: { larkAppId: APP, openId: 'ou_default', unionId: 'on_default' },
+          tools: ['lark-cli'],
+        },
+      },
+      resolvedAllowedUsers: ['ou_default'], resolvedBlockedUsers: [],
+      botName: 'Bot', botOpenId: 'ou_bot',
+    });
+
+    const result = await triggerSessionTurn(
+      request(),
+      { larkAppId: APP, activeSessions: new Map() },
+      { useBotAutomationDefault: true },
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.errorCode).toBe('trigger_failed');
+    expect(result.error).toContain('automation_identity_unavailable');
+    expect(mockForkWorker).not.toHaveBeenCalled();
   });
 });

@@ -21,6 +21,7 @@ import {
   triggerUserAuthApplies,
   TriggerUserAuthConfigError,
   TRIGGER_USER_AUTH_TOOLS,
+  TRIGGER_USER_AUTH_DEFAULT_TOOLS,
   tokenStoreProtection, credentialSourceOf, delegatesOnMention } from '../src/services/trigger-user-auth.js';
 import { createDashboardTranslator } from '../src/dashboard/web/i18n.js';
 
@@ -33,17 +34,19 @@ describe('parseTriggerUserAuthConfig', () => {
   it('defaults to disabled when the object omits `enabled`', () => {
     expect(parseTriggerUserAuthConfig({})).toEqual({
       enabled: false,
+      tools: [...TRIGGER_USER_AUTH_DEFAULT_TOOLS],
       credentialSource: 'auto',
-      tools: [...TRIGGER_USER_AUTH_TOOLS],
       fallback: 'bot-identity',
     });
   });
 
-  // Enabling without naming tools means the operator asked for the boundary —
-  // apply it everywhere rather than nowhere.
-  it('enabling without `tools` covers every supported tool', () => {
+  // larkdev was added after this config shape shipped. Omission must preserve
+  // the old pair rather than changing live bots during an upgrade.
+  it('enabling without `tools` preserves the legacy two-tool default', () => {
     const config = parseTriggerUserAuthConfig({ enabled: true });
-    expect(config?.tools).toEqual([...TRIGGER_USER_AUTH_TOOLS]);
+    expect(config?.tools).toEqual(['lark-cli', 'bytedcli']);
+    expect(config?.tools).toEqual([...TRIGGER_USER_AUTH_DEFAULT_TOOLS]);
+    expect(config?.tools).not.toContain('larkdev');
   });
 
   it('keeps an explicit single-tool selection and de-duplicates', () => {
@@ -51,6 +54,8 @@ describe('parseTriggerUserAuthConfig', () => {
       .toEqual(['lark-cli']);
     expect(parseTriggerUserAuthConfig({ enabled: true, tools: ['bytedcli', 'bytedcli'] })?.tools)
       .toEqual(['bytedcli']);
+    expect(parseTriggerUserAuthConfig({ enabled: true, tools: ['larkdev'] })?.tools)
+      .toEqual(['larkdev']);
   });
 
   it('defaults the fallback to the bot\'s own identity', () => {

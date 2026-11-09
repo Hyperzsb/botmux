@@ -3,7 +3,7 @@ import { createServer } from 'node:http';
 import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync, chmodSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { larkToolBindingPath, larkToolChildEnv, larkToolPrompt, larkToolPromptFromEnv, parseLarkToolInvocation as parseInvocation, prepareLarkToolEnv, readLarkToolBinding, usesLarkToolBinding, hasLarkToolBinding, cleanupLarkToolBinding, larkToolLoopbackService, sessionLarkToolBound } from '../src/core/lark-tool-binding.js';
+import { larkToolBindingPath, larkToolChildEnv, larkToolPrompt, larkToolPromptFromEnv, parseLarkToolInvocation as parseInvocation, prepareLarkToolEnv, readLarkToolBinding, usesLarkToolBinding, hasLarkToolBinding, cleanupLarkToolBinding, larkToolLoopbackService, sessionLarkToolBound, isLarkToolBound, identityBindingAllowsProven } from '../src/core/lark-tool-binding.js';
 import { sessionIdentityBinDir, sessionIdentityDataDir } from '../src/core/cli-identity.js';
 import { readLarkToolHelp, fakeLarkHelpScript } from './helpers/lark-tool-help.js';
 import { nodeTsRunnerPrefix, spawnSyncTsScript, spawnTsScript } from './helpers/ts-runner.js';
@@ -30,39 +30,86 @@ describe('managed lark-cli binding', () => {
     });
   });
 
-  it('is default ON unless explicitly disabled (larkToolBinding: false); leaves adopt/remote/workflow alone', () => {
+  it('is an explicit opt-in: unset stays native, only true installs; leaves adopt/remote/workflow alone', () => {
     const config = { sessionId: 'session-a', larkAppId: 'cli_current', chatId: 'oc_chat', backendType: 'pty' as const };
-    // Default on
-    expect(usesLarkToolBinding(config, dir)).toBe(true);
+    // 新契约（plan §3.4/§4.3）：未配置即不绑定（原生宿主行为），
+    // 旧的「未配置默认开 / 按人授权反向决定绑定」关系已移除。
+    expect(usesLarkToolBinding(config, dir)).toBe(false);
     expect(usesLarkToolBinding({ ...config, larkToolBinding: true }, dir)).toBe(true);
-    expect(usesLarkToolBinding({ ...config, resume: true }, dir)).toBe(true);
+    expect(usesLarkToolBinding({ ...config, larkToolBinding: true, resume: true }, dir)).toBe(true);
 
     // Explicit off
     expect(usesLarkToolBinding({ ...config, larkToolBinding: false }, dir)).toBe(false);
     expect(usesLarkToolBinding({ ...config, larkToolBinding: false, resume: true }, dir)).toBe(false);
 
     // Filtered backends / modes
-    expect(usesLarkToolBinding({ ...config, adoptMode: true }, dir)).toBe(false);
-    expect(usesLarkToolBinding({ ...config, backendType: 'riff' }, dir)).toBe(false);
-    expect(usesLarkToolBinding({ ...config, apiOnly: true }, dir)).toBe(false);
-    expect(usesLarkToolBinding(config, dir, true)).toBe(false);
+    expect(usesLarkToolBinding({ ...config, larkToolBinding: true, adoptMode: true }, dir)).toBe(false);
+    expect(usesLarkToolBinding({ ...config, larkToolBinding: true, backendType: 'riff' }, dir)).toBe(false);
+    expect(usesLarkToolBinding({ ...config, larkToolBinding: true, apiOnly: true }, dir)).toBe(false);
+    expect(usesLarkToolBinding({ ...config, larkToolBinding: true }, dir, true)).toBe(false);
   });
 
-  it('/login routing: decided from configuration before the first spawn, from the file once a worker runs', () => {
+  it('the per-turn policy no longer decides the binding: both are independent opt-ins', () => {
+    const config = { sessionId: 'personal-session', larkAppId: 'cli_current', chatId: 'oc_chat', backendType: 'pty' as const };
+    const policy = { enabled: true, tools: ['lark-cli'] as const, fallback: 'none' as const };
+    const governed = { ...config, triggerUserAuth: { ...policy, tools: [...policy.tools] } };
+    // 按人授权开启不改变绑定：unset 仍是不绑定。
+    expect(usesLarkToolBinding(governed, dir)).toBe(false);
+    // 显式 opt-in 才提供 bot 应用模式，与按人授权无关。
+    expect(usesLarkToolBinding({ ...governed, larkToolBinding: true }, dir)).toBe(true);
+    expect(usesLarkToolBinding({ ...config, triggerUserAuth: { ...policy, enabled: false }, larkToolBinding: true }, dir)).toBe(true);
+    // Proof of the executing process remains available independently of which
+    // application supplies Lark credentials.
+    expect(identityBindingAllowsProven({ ...config, platform: 'linux', larkToolBinding: true })).toBe(true);
+    prepareLarkToolEnv({ env: { PATH: '/usr/bin:/bin' }, dataDir: dir, sessionId: config.sessionId, appId: config.larkAppId });
+    // 未显式绑定的 bot 不认已存在的绑定文件（显式 false）
+    expect(isLarkToolBound(governed, dir, config.sessionId)).toBe(false);
+    expect(isLarkToolBound({ ...governed, larkToolBinding: true }, dir, config.sessionId)).toBe(true);
+  });
+
+  it('preserves authenticated delegations when replacing a bot binding with personal wrappers', async () => {
+    const { rememberLarkToolDelegation, getLarkToolDelegation } = await import('../src/core/lark-tool-delegation.js');
+    prepareLarkToolEnv({ env: { PATH: '/usr/bin:/bin' }, dataDir: dir, sessionId: 'personal-session', appId: defaults.appId });
+    rememberLarkToolDelegation(dir, 'personal-session', 'turn-a', { tools: ['lark-cli'], credentialOpenId: 'ou_source' });
+    cleanupLarkToolBinding(dir, 'personal-session', { preserveDelegations: true });
+    expect(hasLarkToolBinding(dir, 'personal-session')).toBe(false);
+    expect(getLarkToolDelegation(dir, 'personal-session', 'turn-a')?.credentialOpenId).toBe('ou_source');
+  });
+
+  it('/login routing: follows explicit configuration before the first spawn, then requires the live binding file', () => {
     const sessionId = 'session-login';
     const spawnFacts = { sessionId, larkAppId: 'cli_current', chatId: 'oc_chat', backendType: 'pty' as const };
     const bound = (o: Partial<Parameters<typeof sessionLarkToolBound>[0]> = {}) => sessionLarkToolBound({
       botConfig: {}, dataDir: dir, sessionId, workerLive: false, spawnFacts, ...o,
     });
-    // New topic, no worker, no file yet: same answer the worker will give.
-    expect(bound()).toBe(true);
+    // New topic, no worker, no file yet: same explicit opt-in answer the worker will give.
+    expect(bound()).toBe(false);
+    expect(bound({
+      botConfig: { larkToolBinding: true },
+      spawnFacts: { ...spawnFacts, larkToolBinding: true },
+    })).toBe(true);
     expect(bound({ botConfig: { larkToolBinding: false } })).toBe(false);
-    expect(bound({ spawnFacts: { ...spawnFacts, adoptMode: true } })).toBe(false);
-    expect(bound({ workflow: true })).toBe(false);
+    expect(bound({
+      botConfig: { larkToolBinding: true },
+      spawnFacts: { ...spawnFacts, larkToolBinding: true, adoptMode: true },
+    })).toBe(false);
+    expect(bound({
+      botConfig: { larkToolBinding: true },
+      spawnFacts: { ...spawnFacts, larkToolBinding: true },
+      workflow: true,
+    })).toBe(false);
     // A live worker without the file runs the legacy wrapper.
-    expect(bound({ workerLive: true })).toBe(false);
+    expect(bound({
+      botConfig: { larkToolBinding: true },
+      spawnFacts: { ...spawnFacts, larkToolBinding: true },
+      workerLive: true,
+    })).toBe(false);
     prepareLarkToolEnv({ env: { PATH: '/usr/bin:/bin' }, dataDir: dir, sessionId, appId: defaults.appId });
-    expect(bound({ workerLive: true })).toBe(true);
+    expect(bound({
+      botConfig: { larkToolBinding: true },
+      spawnFacts: { ...spawnFacts, larkToolBinding: true },
+      workerLive: true,
+    })).toBe(true);
     expect(bound({ workerLive: true, botConfig: { larkToolBinding: false } })).toBe(false);
   });
 

@@ -344,6 +344,38 @@ describe('executeScheduledTask — silent thread fire', () => {
     );
   });
 
+  it('defers a creator identity to schedule authority without freezing an empty provenance denial', async () => {
+    const c = BOT.config as any;
+    c.triggerUserAuth = { enabled: true, tools: ['bytedcli'], fallback: 'none' };
+    try {
+      const prepareTurnIdentity = vi.fn(async (session: DaemonSession, turnId: string) => {
+        expect(session.session.replyTargets?.[turnId]?.toolIdentityDecision).toMatchObject({
+          authority: 'automatic',
+          mode: 'host',
+          source: 'none',
+        });
+        expect(session.session.replyTargets?.[turnId]?.toolIdentityDecision).not.toHaveProperty('failure');
+      });
+      await executeScheduledTask(
+        baseTask({
+          rootMessageId: ROOT,
+          scope: 'thread',
+          ownerOpenId: 'ou_creator',
+          ownerUnionId: 'on_creator',
+        }),
+        new Map(),
+        refreshCliVersion,
+        undefined,
+        { prepareTurnIdentity },
+      );
+
+      expect(prepareTurnIdentity).toHaveBeenCalledOnce();
+      expect(forkWorkerMock).toHaveBeenCalledOnce();
+    } finally {
+      delete c.triggerUserAuth;
+    }
+  });
+
   it('posts nothing, anchors at rootMessageId, arms the exact forked turn, wraps the prompt', async () => {
     const active = new Map<string, DaemonSession>();
     await executeScheduledTask(baseTask({ rootMessageId: ROOT, scope: 'thread', silent: true }), active, refreshCliVersion);
@@ -1990,5 +2022,47 @@ describe('task-position restart recovery', () => {
 
     expect(sessionStoreCloseMock).toHaveBeenCalledWith('sess-restore-unmaterialized');
     expect(daemonActiveSessions.size).toBe(0);
+  });
+
+  it('keeps a delegated scheduled turn anonymous despite a configured bot default', async () => {
+    const c = BOT.config as any;
+    c.larkToolBinding = true;
+    c.triggerUserAuth = { enabled: true, tools: ['lark-cli', 'bytedcli'], fallback: 'none' };
+    c.automationIdentity = {
+      user: { larkAppId: APP, openId: 'ou_default', unionId: 'on_default' },
+      tools: ['lark-cli'],
+    };
+    const access = await import('../src/im/lark/event-dispatcher.js');
+    const gate = vi.spyOn(access, 'canOperate').mockReturnValue(true);
+    try {
+      const { authorizeDelegatedScheduleRun } = await import('../src/core/schedule-delegated-runtime.js');
+      const task = baseTask({ ownerOpenId: 'ou_controller', ownerUnionId: 'on_controller' });
+      const auth = await authorizeDelegatedScheduleRun(
+        task,
+        {
+          kind: 'delegated', state: 'active',
+          controlOpenId: 'ou_controller', controlUnionId: 'on_controller',
+          runScopes: [], task,
+        } as any,
+        {
+          runEnabled: true, hostRunScopes: [], triggerUserAuthTools: ['lark-cli', 'bytedcli'],
+          adminOpenIds: ['ou_controller'],
+          resolveTargetOpenId: async () => 'ou_controller',
+          listChatMemberOpenIds: async () => ['ou_controller'],
+        },
+      );
+
+      await executeScheduledTask(auth.task, new Map(), refreshCliVersion);
+
+      // The signed delegated grant is the only authority; a bot automation
+      // default must not manufacture a human trusted caller or frozen user.
+      expect(forkWorkerMock).toHaveBeenCalled();
+      expect(forkedPayload().trustedCaller).toBeUndefined();
+    } finally {
+      delete c.automationIdentity;
+      delete c.triggerUserAuth;
+      delete c.larkToolBinding;
+      gate.mockRestore();
+    }
   });
 });

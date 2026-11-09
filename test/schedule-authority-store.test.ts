@@ -30,6 +30,12 @@ function task(id = 'a1b2c3d4', patch: Partial<ScheduledTask> = {}): ScheduledTas
   };
 }
 
+function v1CanonicalTaskHash(value: ScheduledTask): string {
+  const current = canonicalScheduleInput(value) as Record<string, unknown>;
+  const { runAsUser: _v2Only, ...v1Canonical } = current;
+  return computeInputHash(v1Canonical);
+}
+
 function createLegacyAuthorityDb(path: string): DatabaseSync {
   const db = new DatabaseSync(path);
   db.exec(`
@@ -239,6 +245,93 @@ describe('host-only schedule authority store', () => {
       migrated?.close();
       rmSync(legacyDir, { recursive: true, force: true });
     }
+  });
+
+  it('migrates a run-as task whose canonical hash was rewritten by V1', () => {
+    const downgraded = task('runasv1', {
+      runAsUser: { larkAppId: APP, openId: 'ou_runner', unionId: 'on_runner' },
+    });
+    store.initializeApp(APP, []);
+    store.createDirect(downgraded);
+    store.close();
+
+    const path = scheduleAuthorityDbPath(dataDir);
+    const legacyDb = new DatabaseSync(path);
+    legacyDb.prepare(`
+      UPDATE schedule_authority_tasks SET canonical_hash = ?
+      WHERE app_id = ? AND task_id = ?
+    `).run(v1CanonicalTaskHash(downgraded), APP, downgraded.id);
+    legacyDb.close();
+
+    store = ScheduleAuthorityStore.open(dataDir);
+    expect(store.getRecord(APP, downgraded.id)?.task).toEqual(downgraded);
+
+    const verified = new DatabaseSync(path);
+    const row = verified.prepare(`
+      SELECT canonical_hash FROM schedule_authority_tasks WHERE app_id = ? AND task_id = ?
+    `).get(APP, downgraded.id) as { canonical_hash: string };
+    verified.close();
+    expect(row.canonical_hash).toBe(computeInputHash(canonicalScheduleInput(downgraded)));
+  });
+
+  it('keeps unrelated run-as hash mismatches fail-closed', () => {
+    const corrupted = task('runasbad', {
+      runAsUser: { larkAppId: APP, openId: 'ou_runner', unionId: 'on_runner' },
+    });
+    store.initializeApp(APP, []);
+    store.createDirect(corrupted);
+    store.close();
+
+    const path = scheduleAuthorityDbPath(dataDir);
+    const db = new DatabaseSync(path);
+    const invalidHash = `sha256:${'0'.repeat(64)}`;
+    db.prepare(`
+      UPDATE schedule_authority_tasks SET canonical_hash = ?
+      WHERE app_id = ? AND task_id = ?
+    `).run(invalidHash, APP, corrupted.id);
+    db.close();
+
+    store = ScheduleAuthorityStore.open(dataDir);
+    expect(() => store.getRecord(APP, corrupted.id)).toThrow('schedule_authority_canonical_mismatch');
+
+    const verified = new DatabaseSync(path);
+    const row = verified.prepare(`
+      SELECT canonical_hash FROM schedule_authority_tasks WHERE app_id = ? AND task_id = ?
+    `).get(APP, corrupted.id) as { canonical_hash: string };
+    verified.close();
+    expect(row.canonical_hash).toBe(invalidHash);
+  });
+
+  it('does not bless a V1 hash when the retained run-as identity belongs to another app', () => {
+    const valid = task('runasxapp', {
+      runAsUser: { larkAppId: APP, openId: 'ou_runner', unionId: 'on_runner' },
+    });
+    store.initializeApp(APP, []);
+    store.createDirect(valid);
+    store.close();
+
+    const crossApp = {
+      ...valid,
+      runAsUser: { ...valid.runAsUser!, larkAppId: 'cli_other' },
+    };
+    const path = scheduleAuthorityDbPath(dataDir);
+    const db = new DatabaseSync(path);
+    const legacyHash = v1CanonicalTaskHash(crossApp);
+    db.prepare(`
+      UPDATE schedule_authority_tasks SET task_json = ?, canonical_hash = ?
+      WHERE app_id = ? AND task_id = ?
+    `).run(JSON.stringify(crossApp), legacyHash, APP, valid.id);
+    db.close();
+
+    store = ScheduleAuthorityStore.open(dataDir);
+    expect(() => store.getRecord(APP, valid.id)).toThrow('schedule_authority_canonical_mismatch');
+
+    const verified = new DatabaseSync(path);
+    const row = verified.prepare(`
+      SELECT canonical_hash FROM schedule_authority_tasks WHERE app_id = ? AND task_id = ?
+    `).get(APP, valid.id) as { canonical_hash: string };
+    verified.close();
+    expect(row.canonical_hash).toBe(legacyHash);
   });
 
   it('locks schema inspection so a parallel opener cannot race additive migrations', () => {

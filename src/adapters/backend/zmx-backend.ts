@@ -2374,9 +2374,10 @@ export function buildZmxLaunchFiles(
     .filter(assignment => !/^ZMX_(?:SESSION|SESSION_PREFIX)=/.test(assignment));
   const debugKeepShell = !opts.strictEnv && process.env.BOTMUX_DEBUG_KEEP_SHELL === '1';
   const wrapperBinDir = resolveBotmuxWrapperBinDir(opts.env ?? process.env);
+  const identityBin = opts.strictEnv ? undefined : opts.env?.BOTMUX_IDENTITY_BIN;
   const wrapped = debugKeepShell
-    ? buildDebugKeepShellScript(shellSpec.shell, wrapperBinDir, shellKind)
-    : shellWrapperScript(wrapperBinDir, shellKind);
+    ? buildDebugKeepShellScript(shellSpec.shell, wrapperBinDir, shellKind, identityBin)
+    : shellWrapperScript(wrapperBinDir, shellKind, identityBin);
   const payloadArgv = [opts.cwd, ...envAssignments, bin, ...args];
   const payload = buildZmxPayload(shellKind, payloadArgv);
   const userScript = buildZmxUserScript(shellKind, wrapped);

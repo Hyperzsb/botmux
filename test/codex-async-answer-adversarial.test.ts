@@ -12,14 +12,19 @@ import { ServerResponse, IncomingMessage } from 'node:http';
 import { Socket } from 'node:net';
 import { ActiveTurnAuthority } from '../src/core/active-turn-authority.js';
 import { managedOriginCapabilityPath, replaceManagedOriginCapabilityFile } from '../src/core/managed-origin-capability.js';
+import { toolIdentityDecisionFromReplyTarget } from '../src/core/tool-identity-decision.js';
+import { normalizeToolIdentityPolicy } from '../src/services/tool-identity-config.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 vi.mock('../src/services/bytedcli-auth.js', () => ({
-  mintBytedcliJwts: vi.fn(async (openId: string) => {
+  mintByteCloudUserJwts: vi.fn(async (openId: string) => {
     await new Promise(resolve => setTimeout(resolve, 20));
-    return { cloudJwt: `fake-cloud-${openId}`, codeJwt: `fake-code-${openId}` };
+    return { cn: `fake-cloud-${openId}` };
   }),
+  mintBytedcliJwts: vi.fn(async (openId: string) => (
+    { cloudJwt: `fake-cloud-${openId}`, codeJwt: `fake-code-${openId}` }
+  )),
   beginBytedcliLogin: vi.fn(async () => undefined),
 }));
 
@@ -64,6 +69,8 @@ function daemonScope(): Record<string, any> {
     codexAppCleanInputAcceptedForSession: () => scope.clean, clean: true,
     sendWorkerInput: vi.fn(() => true), beginNewTurn: vi.fn(), rememberLastCliInput: vi.fn(),
     markSessionActivity: vi.fn(), sessionStore: { updateSession: vi.fn() }, logger: { info: vi.fn() },
+    toolIdentityDecisionFromReplyTarget,
+    normalizeToolIdentityPolicy,
   };
   scope.codexAsyncAnswerSteerable = productionFunction('src/services/codex-async-user-input.ts', 'codexAsyncAnswerSteerable', scope);
   scope.codexAsyncAnswerSteerTarget = productionFunction('src/services/codex-async-user-input.ts', 'codexAsyncAnswerSteerTarget', scope);
@@ -204,6 +211,10 @@ describe('correlated async answer adversarial production probes', () => {
       beginReplyTargetTurn, identityPublicationConflicted: () => false,
       identityModelForPublication: () => 'proven', localeForBot: () => 'en',
       triggerUserAuthEnabledFor: () => true, streamingCardDisabledFor: () => false,
+      // This probe targets answer/caller freezing across the async credential
+      // wait. Session transport validation is covered independently and is a
+      // completed precondition here.
+      assertTurnIdentitySession: vi.fn(),
     });
     Object.assign(scope.askSession, { scope: 'thread', activeInteractiveTurn: {
       turnId: 'om_original', caller: { senderType: 'user', requestLarkAppId: 'app', requestUserOpenId: 'ou_other' },

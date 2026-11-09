@@ -1,3 +1,4 @@
+import type { AutomationUser } from '../services/automation-identity.js';
 /**
  * Scheduled-turn authentication shared by the CLI-side provenance resolver
  * (current-turn-provenance) and the daemon-side relay authorizer
@@ -39,7 +40,7 @@ import { botHomePath } from '../adapters/cli/read-isolation.js';
 import { effectiveScheduleChatIds } from '../services/schedule-store.js';
 import { isAutoCompletedSchedule } from '../services/schedule-until-done.js';
 import type { ScheduledTask, TrustedCaller } from '../types.js';
-import { parseScheduleRunAsClaim, scheduledTaskRunAs } from './schedule-run-as.js';
+import { scheduledTaskRunAs } from './schedule-run-as.js';
 import { backgroundAuthorityKey } from './background-execution-policy.js';
 import type { ScheduleAuthorityRecord } from '../services/schedule-authority-store.js';
 
@@ -130,7 +131,20 @@ export function mintScheduledContinuationTurnId(
 export function trustedCallerForScheduledTask(
   task: ScheduledTask,
   larkAppId: string,
+  executionUser?: AutomationUser | null,
 ): TrustedCaller | undefined {
+  if (executionUser !== undefined) task = { ...task, runAsUser: executionUser ?? undefined };
+  if (task.runAsUser) {
+    if (task.runAsUser.larkAppId !== larkAppId) return undefined;
+    return {
+      requestUserOpenId: task.runAsUser.openId,
+      requestUserUnionId: task.runAsUser.unionId,
+      requestLarkAppId: larkAppId,
+      senderType: 'user',
+      source: 'schedule_creator',
+      taskId: task.id,
+    };
+  }
   const runAs = scheduledTaskRunAs(task, larkAppId);
   if (!runAs) return undefined;
   return {
@@ -211,6 +225,7 @@ export type ScheduledTurnAuthError =
   | 'task_not_found'
   | 'task_disabled'
   | 'task_owner_missing'
+  | 'task_identity_missing'
   | 'owner_revoked'
   | 'binding_mismatch';
 
@@ -228,6 +243,7 @@ export interface ScheduledTurnAuth {
  */
 export function authorizeScheduledTurn(input: {
   turnId: string;
+  executionUser?: AutomationUser | null;
   sessionLarkAppId: string;
   sessionChatId: string;
   isOwnerAllowed: (larkAppId: string, ownerOpenId: string) => boolean;
@@ -245,10 +261,12 @@ export function authorizeScheduledTurn(input: {
   if (!taskId) return { error: 'task_not_found' };
   if (!input.sessionLarkAppId || !input.sessionChatId) return { error: 'binding_mismatch' };
 
-  const task = input.loadTask
+  let task = input.loadTask
     ? input.loadTask(input.sessionLarkAppId, taskId)
     : readScheduledTaskForProvenance(input.dataDir, input.sessionLarkAppId, taskId);
   if (!task) return { error: 'task_not_found' };
+  if (task.runAsUser && input.executionUser === undefined) return { error: 'task_identity_missing' };
+  if (input.executionUser !== undefined) task = { ...task, runAsUser: input.executionUser ?? undefined };
   if (task.enabled === false) {
     // A one-shot that ran, or an until-done task closed by its own run, keeps
     // authority for that exact still-live turn.
@@ -259,14 +277,18 @@ export function authorizeScheduledTurn(input: {
     if (!autoCompletedStillLive && !manualStillLive) return { error: 'task_disabled' };
   }
 
-  // A claim from the claim card replaces the creator as the acting identity.
-  // Its open_id was issued to the bot that received the card callback, so it
-  // only binds that bot's turns.
-  const claim = parseScheduleRunAsClaim(task.runAsClaim);
-  if (claim && claim.larkAppId !== (task.larkAppId ?? input.sessionLarkAppId)) {
+  const runAs = task.runAsUser
+    ? {
+        openId: task.runAsUser.openId,
+        larkAppId: task.runAsUser.larkAppId,
+      }
+    : scheduledTaskRunAs(task, input.sessionLarkAppId);
+  // A selected execution user or a claim is app-scoped. Its open_id only has
+  // meaning to the app that issued/validated it.
+  if (runAs && runAs.larkAppId !== input.sessionLarkAppId) {
     return { error: 'binding_mismatch' };
   }
-  const ownerOpenId = claim?.openId
+  const ownerOpenId = runAs?.openId
     ?? (typeof task.ownerOpenId === 'string' ? task.ownerOpenId.trim() : '');
   if (!ownerOpenId) return { error: 'task_owner_missing' };
 
@@ -306,6 +328,8 @@ export function scheduledTurnAuthErrorMessage(code: ScheduledTurnAuthError): str
       return '定时任务不存在或已被删除，拒绝授权当前命令';
     case 'task_disabled':
       return '定时任务已被禁用，拒绝授权当前命令';
+    case 'task_identity_missing':
+      return '定时执行缺少冻结的身份快照，拒绝使用任务当前配置替代；请重新触发任务';
     case 'task_owner_missing':
       return '定时任务缺少创建者身份（ownerOpenId），拒绝授权当前命令；请重新创建该定时任务';
     case 'owner_revoked':

@@ -23,6 +23,8 @@ import { backendSandboxCompatibilityError } from '../adapters/backend/session-ba
 import type { BackendType } from '../adapters/backend/types.js';
 import { resolveSandboxMode } from '../adapters/cli/sandbox-mode.js';
 import { isSessionGroup } from './session-groups-store.js';
+import { parseAutomationIdentityConfig, isInvalidAutomationIdentity } from './automation-identity-config.js';
+import { parseToolIdentityConfig, isInvalidToolIdentity, serializeToolIdentityConfig } from './tool-identity-config.js';
 import type { BotConfig } from '../bot-registry.js';
 import { getBot, getOwnerOpenId, readBotSkillPolicy } from '../bot-registry.js';
 import { republishResolvedAllowedUsersDescriptor, scheduleAllowedUsersResolveRetryFromMutation } from '../bot-registry.js';
@@ -202,8 +204,10 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'codexAuthSync', configKey: 'codexAuthSync', kind: 'enum', effect: 'next-session', clearable: true, enumValues: ['shared', 'isolated'], hint: 'Codex 鉴权策略：shared=保持旧行为（非沙箱直接使用全局 ~/.codex；沙箱冷启动同步全局 auth 到 per-bot CODEX_HOME）｜isolated=无论是否启用沙箱都使用 per-bot CODEX_HOME，绝不复制全局凭证，需在该目录单独执行 codex login --with-api-key' },
   { key: 'credentialsSourceDir', configKey: 'credentialsSourceDir', kind: 'dir', effect: 'next-session', clearable: true, hint: 'CLI 凭证来源目录（如 ~/accounts/acct-b，内按 CLI 分子目录：claude/.credentials.json）：沙箱 bot 每次冷启动从这里复制凭证，而不是用本机共享登录；来源不可用即拒绝启动、绝不回退共享登录；目前仅支持 claude-code；完全未开沙箱的 bot 不生效（仍用全局登录），已开沙箱却无法重定向数据目录（wrapperCli / adapter 不支持 / 缺 SESSION_DATA_DIR）则拒绝启动；token 刷新由外部负责；unset 回共享登录' },
   { key: 'codexInstancePool', configKey: 'codexInstancePool', kind: 'json', effect: 'next-session', clearable: true, hint: '会话级 Codex 实例：显式 defaultInstanceId 与 instances[{id,codexHome,weight}]，weight默认1；scope=ordinary-feishu，strategy=random。仅新会话分配，已有会话保持绑定。使用 botmux codex-instances check 检查本机目录。' },
-  { key: 'triggerUserAuth', configKey: 'triggerUserAuth', kind: 'json', effect: 'next-session', clearable: true, hint: '按触发人身份调用 CLI（默认关闭）：开启后本 bot 调 lark-cli / bytedcli 用「发这条消息的人」自己的授权，而不是本机登录态。JSON 形如 {"enabled":true,"tools":["lark-cli","bytedcli"]}；tools 省略=全部。未授权时 lark-cli / bytedcli 一律拒绝（拒绝消息里会附授权链接，点开后重试即可），不会用 bot 或任何人的身份代跑；fallback 字段仅为兼容旧配置保留，当前不再改变行为。注意 bytedcli 没有 bot 身份，对它 fallback 恒等于失败。可选 credentialSource：auto（默认）：本机未绑定中心化平台时等同 local；已绑定时先向平台取该人的短期凭据（平台保管与续期），取不到则用本机已有的授权，再没有就拒绝并给平台授权链接，已绑定的机器绝不再自动发起本机扫码。platform：只用平台，未绑定或不可达一律拒绝。local：只用本机扫码，不咨询平台。非法取值会被拒绝保存。可选 delegateOnMention（默认 true）：本 bot 在真人直接发起的一轮里用 botmux send --mention 交接给同机 bot 时，对方以这位发起人的身份调用工具；设为 false 关闭。可选 gitHost（如 code.example.com）让该代码平台的 git 推送也按当轮身份鉴权，并把 SSH 远端改写成 HTTPS；可选 gitTokenExchangeUrl（https）作为 bytedcli 取不到 JWT 时的兜底换取端点。下个会话生效；unset 清除（关闭）' },
-  { key: 'larkToolBinding', configKey: 'larkToolBinding', kind: 'boolean', defaultOn: true, effect: 'next-session', clearable: true, hint: 'lark-cli 绑定当前机器人应用身份 on|off（默认 on）：会话内 lark-cli 默认使用当前 bot 凭证并允许 --profile 切换宿主 profile；设为 off 则完全不注入当前 bot 凭据；需 /restart 重启或新建会话生效' },
+  { key: 'triggerUserAuth', configKey: 'triggerUserAuth', kind: 'json', effect: 'next-session', clearable: true, hint: '按触发人身份调用 CLI（默认关闭）：开启后本 bot 调 lark-cli / bytedcli / larkdev 用「发这条消息的人」自己的授权，而不是本机登录态。JSON 形如 {"enabled":true,"tools":["lark-cli","bytedcli","larkdev"]}；为兼容旧配置，tools 省略仍只启用 lark-cli + bytedcli，larkdev 需显式加入。未授权时三个工具一律拒绝，不会用 bot 或任何人的身份代跑；lark-cli 拒绝时附授权链接，ByteCloud 则要求按失败命令的站点执行 /login bytedcli <站点>。fallback 字段仅为兼容旧配置保留，当前不再改变行为。bytedcli / larkdev 复用发送人的 ByteCloud SSO，均没有 bot 身份。可选 credentialSource：auto（默认）：本机未绑定中心化平台时等同 local；已绑定时先向平台取该人的短期凭据（平台保管与续期），取不到则用本机已有的授权，再没有就拒绝并给平台授权链接，已绑定的机器绝不再自动发起本机扫码。platform：只用平台，未绑定或不可达一律拒绝。local：只用本机扫码，不咨询平台。非法取值会被拒绝保存。可选 delegateOnMention（默认 true）：本 bot 在真人直接发起的一轮里用 botmux send --mention 交接给同机 bot 时，对方以这位发起人的身份调用工具；设为 false 关闭。可选 gitHost（如 code.example.com）让该代码平台的 git 推送也按当轮身份鉴权，并把 SSH 远端改写成 HTTPS；可选 gitTokenExchangeUrl（https）作为 bytedcli 取不到 JWT 时的兜底换取端点。下个会话生效；unset 清除（关闭）' },
+  { key: 'larkToolBinding', configKey: 'larkToolBinding', kind: 'boolean', effect: 'next-session', clearable: true, hint: 'lark-cli 绑定当前机器人应用身份 on|off（显式 opt-in；未配置即 off，lark-cli 使用宿主机原生登录态，不安装应用绑定）：设为 on 后会话内 lark-cli 默认使用当前 bot 凭证并允许 --profile 切换宿主 profile；off 则完全不注入当前 bot 凭据；需 /restart 重启或新建会话生效' },
+  { key: 'automationIdentity', configKey: 'automationIdentity', kind: 'json', effect: 'immediate', clearable: true, hint: '自动任务执行身份（Run as）：{"user":{"larkAppId":"cli_…","openId":"ou_…","unionId":"on_…","name":"…"},"tools":["lark-cli"]}。用于没有真人触发者的入群自动开工、定时任务与 Webhook；任务/连接器自己的 Run as 优先。不再要求 triggerUserAuth.enabled：托管 lark-cli 绑定即可执行 --as user；bytedcli/larkdev 仍要求该工具已启用按人鉴权。显式配置但用户被撤权或无法解析时拒绝该身份，绝不回退到操作人或本机登录；unset 清除' },
+  { key: 'toolIdentity', configKey: 'toolIdentity', kind: 'json', effect: 'immediate', clearable: true, hint: '固定执行用户（仅自动轮次的低优先级默认 + 按人鉴权关闭工具的普通会话执行身份）：{"defaultUser":{"larkAppId":"cli_…","openId":"ou_…","unionId":"on_…","name":"…"},"tools":["lark-cli"],"credentialSource":"auto"}。某工具按触发人鉴权关闭时，普通会话该工具以该用户身份执行；自动轮次里优先级为 任务 Run as → automationIdentity → 本字段。显式配置但不可用时该工具拒绝调用（不回退宿主登录）；unset 清除' },
   { key: 'backendType', configKey: 'backendType', kind: 'enum', effect: 'next-session', clearable: true, enumValues: ['pty', 'tmux', 'herdr', 'zellij', 'zmx', 'riff', 'mojo', 'remote-runner'], hint: '会话后端类型：pty=本地 PTY 子进程（默认）｜tmux=tmux 会话｜herdr=herdr 终端复用｜zellij=zellij 多路复用｜zmx=ZMX >=0.7.0 纯文本持久会话（无 Web TUI）｜riff=远程 riff agent 服务｜mojo=远程 mojo agent（headless mojo CLI）｜remote-runner=外置 provider；选 riff 时需配置 riff 字段，mojo/remoteRunner 字段可选；unset 回 pty' },
   { key: 'riff', configKey: 'riff', kind: 'json', effect: 'next-session', clearable: true, hint: 'riff 后端配置 JSON（baseUrl/agent/model/jwt 等），仅 backendType=riff 时生效；多用户共享主机上，用 jwtHome 指向该 bot 归属用户的 home（绝对路径）以读到他自己的 ByteCloud 登录态；unset 清除' },
   { key: 'mojo', configKey: 'mojo', kind: 'json', effect: 'next-session', clearable: true, hint: 'mojo 后端配置 JSON，仅 backendType=mojo 时生效，全部可选：cloud/localDaemon/baseUrl/ppeEnv/workspaceId/agentId/idleTimeoutSec/stream/systemPrompt/jwt/jwtEnv/env；model 与二进制路径请用顶层 model / cliPathOverride（写在此处会被拒绝）；unset 清除' },
@@ -464,6 +468,13 @@ async function applyConfigFieldInternal(
     try { value = normalizeFeedbackPresentation(value); }
     catch (error) { return { ok: false, reason: `invalid_feedback_presentation: ${error instanceof Error ? error.message : String(error)}` }; }
   }
+  if (spec.configKey === 'toolIdentity' && value !== null) {
+    const parsed = parseToolIdentityConfig(value, larkAppId);
+    if (!parsed.value || isInvalidToolIdentity(parsed.value)) {
+      return { ok: false, reason: `invalid_tool_identity: ${parsed.warning ?? 'invalid_json'}` };
+    }
+    value = parsed.value;
+  }
   if (spec.configKey === 'envPolicy' && value !== null) {
     try { value = normalizeEnvPolicy(value); } catch { return { ok: false, reason: 'invalid_env_policy' }; }
   }
@@ -660,7 +671,9 @@ async function applyConfigFieldInternal(
       } else if (effective === true) entry[spec.configKey] = true;
       else delete entry[spec.configKey];
     } else if (spec.kind === 'json') {
-      entry[spec.configKey] = effective as any;
+      entry[spec.configKey] = spec.configKey === 'toolIdentity'
+        ? serializeToolIdentityConfig(effective as import('./tool-identity-config.js').ToolIdentityDefaultUserConfig)
+        : effective as any;
     } else {
       entry[spec.configKey] = effective;
     }
@@ -708,6 +721,15 @@ async function applyConfigFieldInternal(
     (bot.config as any)[spec.configKey] = effective;
   } else {
     (bot.config as any)[spec.configKey] = effective;
+  }
+  // Any accepted write replaces the rejected-load state: a previously invalid
+  // automationIdentity must not keep failing automatic turns after the operator
+  // saves a valid selection or clears it.
+  if (spec.configKey === 'automationIdentity') {
+    (bot.config as any).automationIdentityInvalid = undefined;
+  }
+  if (spec.configKey === 'toolIdentity') {
+    (bot.config as any).toolIdentityInvalid = undefined;
   }
   if (spec.configKey === 'cliId' && !isConfigurableReasoningCliId(bot.config.cliId)) {
     bot.config.reasoningEffort = undefined;
@@ -1055,7 +1077,7 @@ export type CoerceResult =
   | { ok: true; value: unknown }
   // A few reasons carry detail (e.g. which keys were rejected), so this is a
   // union of literals plus those prefixed forms rather than a closed literal set.
-  | { ok: false; reason: 'invalid_bool' | 'invalid_enum' | 'invalid_cli' | 'invalid_dir' | 'invalid_number' | 'invalid_json' | 'invalid_env' | 'reserved_env' | 'empty' | 'too_long' | `invalid_mojo_config: ${string}` | `invalid_herdr_config: ${string}` | `invalid_remote_runner_config: ${string}` | `invalid_trigger_user_auth: ${string}` | `invalid_no_progress_notify: ${string}` | `invalid_prompt_cache: ${string}` | `invalid_steward: ${string}` | `invalid_feedback_presentation: ${string}` };
+  | { ok: false; reason: 'invalid_bool' | 'invalid_enum' | 'invalid_cli' | 'invalid_dir' | 'invalid_number' | 'invalid_json' | 'invalid_env' | 'reserved_env' | 'empty' | 'too_long' | `invalid_mojo_config: ${string}` | `invalid_herdr_config: ${string}` | `invalid_remote_runner_config: ${string}` | `invalid_trigger_user_auth: ${string}` | `invalid_no_progress_notify: ${string}` | `invalid_prompt_cache: ${string}` | `invalid_steward: ${string}` | `invalid_feedback_presentation: ${string}` | `invalid_automation_identity: ${string}` | `invalid_tool_identity: ${string}` };
 
 /** herdr 块全部可写字段；与 normalizeHerdrBackendConfig 接受的键必须一致（有 parity 测试）。 */
 export const HERDR_FIELD_NAMES = ['sessionName', 'placement', 'workspace', 'tab', 'splitDirection', 'chatTypes'] as const;
@@ -1191,6 +1213,24 @@ export function coerceConfigValue(spec: ConfigFieldSpec, raw: unknown): CoerceRe
         if (spec.configKey === 'noProgressNotify') {
           try { return { ok: true, value: normalizeNoProgressNotifyPolicy(parsed) }; }
           catch (error) { return { ok: false, reason: `invalid_no_progress_notify: ${error instanceof Error ? error.message : String(error)}` }; }
+        }
+        if (spec.configKey === 'automationIdentity') {
+          const automation = parseAutomationIdentityConfig(parsed);
+          if (isInvalidAutomationIdentity(automation.value)) {
+            return { ok: false, reason: `invalid_automation_identity: ${automation.value.invalid}` };
+          }
+          return automation.value
+            ? { ok: true, value: automation.value }
+            : { ok: false, reason: `invalid_automation_identity: ${automation.warning ?? 'invalid_json'}` };
+        }
+        if (spec.configKey === 'toolIdentity') {
+          const toolIdentity = parseToolIdentityConfig(parsed);
+          if (isInvalidToolIdentity(toolIdentity.value)) {
+            return { ok: false, reason: `invalid_tool_identity: ${toolIdentity.value.invalid}` };
+          }
+          return toolIdentity.value
+            ? { ok: true, value: toolIdentity.value }
+            : { ok: false, reason: `invalid_tool_identity: ${toolIdentity.warning ?? 'invalid_json'}` };
         }
         if (spec.configKey === 'skills') {
           const policy = readBotSkillPolicy(parsed);

@@ -43,6 +43,11 @@ function sessionTempRoot(): string {
   return join(hub, createHash('sha256').update(resolve(sessionTempCacheRoot())).digest('hex').slice(0, 8));
 }
 
+/** Real shared cache root sealed from per-session scratch workers. */
+export function sessionTempRootDir(): string {
+  return sessionTempCacheRoot();
+}
+
 /**
  * Make `/tmp/bm<uid>` exist and be private to this uid.
  *

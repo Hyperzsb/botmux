@@ -5,6 +5,10 @@ import { controllerForSession } from './core/session-controller.js';
 import { sessionContractStore } from './services/session-contract-store.js';
 import { recordDeploymentContinuation, cancelDeploymentContinuation } from './services/deployment-continuation.js';
 import { deploymentContinuationAuthority } from './core/deployment-continuation-authority.js';
+import { selectToolCredential } from './core/tool-identity-policy.js';
+import { assertAutomationSession, assertAutomationUserAllowed, automationTrustedCaller, freezeAutomationTurnUser, resolveAutomationIdentity } from './services/automation-identity.js';
+import { toolIdentityDecisionFromReplyTarget } from './core/tool-identity-decision.js';
+import { normalizeToolIdentityPolicy, toolIdentityPublicationEnabled, assertToolIdentitySession } from './services/tool-identity-config.js';
 import { shareVcMeetingSummary } from './services/vc-meeting-summary-share.js';
 import { getChatRoutingFacts, isCurrentBotInChat, resolveUnionIdFromOpenIdStrict } from './im/lark/client.js';
 import { handleSandboxSendRouteRequest, SANDBOX_SEND_ROUTE_AUTHORIZE_ROUTE } from './core/sandbox-send-route.js';
@@ -292,17 +296,21 @@ function resolveScheduleRunLogErrorDetails(
   precondition: ScheduledTaskPreconditionObservation['precondition'],
   error: unknown,
 ): ScheduleRunLogErrorDetails {
+  const message = error instanceof Error ? error.message : String(error);
+  // Missing/revoked automation identity is an admission failure, not a model
+  // dispatch or precondition error. Keep it distinguishable in the run log and
+  // consecutive-failure alert.
+  if (message.startsWith('automation_identity_unavailable:')) {
+    return { errorCode: 'automation_identity_unavailable', error: message };
+  }
   if (precondition !== 'error') {
-    return {
-      errorCode: 'model_dispatch_error',
-      error: error instanceof Error ? error.message : String(error),
-    };
+    return { errorCode: 'model_dispatch_error', error: message };
   }
   return {
     errorCode: error instanceof SchedulePreconditionError
       ? error.code
       : 'precondition_error',
-    error: error instanceof Error ? error.message : String(error),
+    error: message,
   };
 }
 
@@ -627,7 +635,7 @@ import { listSecretaryWatches } from './services/group-secretary-watch-store.js'
 import { publishTurnCliIdentity, trackTurnIdentityPublication, type DelegatedCliIdentity } from './core/turn-cli-identity.js';
 import { clearSingleIdentityArtifacts, forgetProvenIdentityContent } from './core/cli-identity.js';
 import { BYTEDCLI_RENEWAL_SWEEP_MS, renewExpiringBytedcliIdentities } from './core/bytedcli-identity-renewal.js';
-import type { IdentityStorageModel } from './core/lark-tool-binding.js';
+import { isLarkToolBound, type IdentityStorageModel } from './core/lark-tool-binding.js';
 import { getLarkToolDelegation } from './core/lark-tool-delegation.js';
 import { noteInboundSenderUnionId, noteSenderUnionId } from './core/platform-credential-source.js';
 import { validateRoleLibraryPath } from './core/role-library.js';
@@ -643,7 +651,7 @@ import {
 } from './services/durable-primary-turn-admission.js';
 import { computeInputHash } from './utils/canonical-input-hash.js';
 import { matchingScheduleBotGrant, botScheduleAuthority, assertScheduleBotGrantActive } from './core/schedule-bot-grant.js';
-import { authorizeDelegatedScheduleRun, authorizeScheduleSelfManage } from './core/schedule-delegated-runtime.js';
+import { authorizeDelegatedScheduleRun, authorizeScheduleSelfManage, DELEGATED_SCHEDULE_REQUIRED_IDENTITY_TOOLS } from './core/schedule-delegated-runtime.js';
 import { assertScheduledAuthorityCurrent, isManualScheduleRun, isManualScheduledTurn, parseScheduledTurnId, readScheduledTaskFromAuthority } from './core/scheduled-turn-provenance.js';
 import {
   prepareScheduledRecoveryRun,
@@ -822,6 +830,7 @@ import { createLiveV3BotEligibilityProbe, liveV3NodeExecutorPolicy, v3BotDisplay
 import { buildV3BlockedCardForRun, type V3BlockedReassignDeps } from './im/lark/v3-blocked-reassign.js';
 import { v3MainTopicAvailability, v3OpensTopicSessions } from './workflows/v3/node-executor-mode.js';
 import { createWorkflowNodeDaemon, workflowNodePinnedStart } from './core/workflow-node-daemon.js';
+import { V3_HANDOFF_IDENTITY_TOOLS } from './workflows/v3/run-envelope.js';
 import { WORKFLOW_INITIATOR_UNION_ROUTE, WORKFLOW_WORKING_DIR_OPERATOR_ROUTE, createWorkflowWorkingDirOperatorWiring } from './core/workflow-working-dir-operator.js';
 import { ensureBotChatGrantMatrix } from './cli/exact-chat-grant-client.js';
 import { isProcessAlive as isWorkflowWorkerAlive } from './core/session-liveness.js';
@@ -4444,7 +4453,7 @@ export async function noteTurnReceived(
 /** Whether this session's bot opted into trigger-user CLI auth. Synchronous so a
  *  bot that has not opted in adds no await boundary to the turn path at all. */
 function triggerUserAuthEnabledFor(ds: DaemonSession): boolean {
-  try { return getBot(ds.larkAppId).config.triggerUserAuth?.enabled === true; }
+  try { return toolIdentityPublicationEnabled(getBot(ds.larkAppId).config); }
   catch { return false; }
 }
 
@@ -4650,14 +4659,71 @@ async function handleIdentityDecisionFlip(
   }
 }
 
+/** Validate only winning per-tool selections, using the same selector as publication. */
+function assertTurnIdentitySession(
+  ds: DaemonSession,
+  botConfig: import('./bot-registry.js').BotConfig,
+  policy: ReturnType<typeof normalizeToolIdentityPolicy>,
+  frozen?: import('./core/tool-identity-decision.js').ToolIdentityDecisionRecord,
+  senderOpenId?: string,
+): void {
+  const required: import('./services/trigger-user-auth.js').TriggerUserAuthTool[] = [];
+  for (const tool of TRIGGER_USER_AUTH_TOOLS) {
+    const decision = selectToolCredential({ larkAppId: ds.larkAppId, tool, policy,
+      bindingInstalled: tool === 'lark-cli' && isLarkToolBound(botConfig, config.session.dataDir, ds.session.sessionId),
+      authority: frozen?.authority ?? 'human', senderOpenId,
+      turn: frozen ? { user: frozen.user, source: frozen.source === 'sender' ? 'provenance' : frozen.source,
+        tools: frozen.tools, failure: frozen.failure } : undefined,
+    });
+    if (decision.mode === 'denied' && decision.reason !== 'missing_provenance') {
+      throw new Error(`tool_identity_${decision.reason}`);
+    }
+    if (decision.mode === 'managed_user' && decision.source !== 'sender') {
+      assertAutomationUserAllowed(decision.user as import('./services/automation-identity.js').AutomationUser,
+        ds.larkAppId, ds.chatId);
+      noteSenderUnionId(ds.larkAppId, decision.user.openId, decision.user.unionId);
+    }
+    if (decision.mode !== 'host' && decision.mode !== 'bound_app') required.push(tool);
+  }
+  // Required transports can be installed in a new worker. An existing worker
+  // must already have them; a missing wrapper blocks the turn before input.
+  assertToolIdentitySession({ ...botConfig, identityTools: required }, ds, required);
+}
+
 async function prepareScheduledTurnCliIdentity(ds: DaemonSession, turnId: string): Promise<void> {
   if (identityPublicationConflicted(ds)) return;
+  const botConfig = getBot(ds.larkAppId).config;
+  const frozenDecision = toolIdentityDecisionFromReplyTarget(ds.session.replyTargets?.[turnId]);
+  const publicationPolicy = { ...normalizeToolIdentityPolicy(botConfig), ...frozenDecision?.baseline };
+  assertTurnIdentitySession(ds, botConfig, publicationPolicy, frozenDecision);
   if (await prepareDelegatedScheduledTurnIdentity(ds, turnId)) return;
   const taskId = parseScheduledTurnId(turnId);
   if (!taskId) throw new Error('invalid scheduled turn');
   const authority = scheduleAuthorityStore?.getRecord(ds.larkAppId, taskId);
   if (!authority) throw new Error('schedule authority record missing');
-  const task = authority.task;
+  const snapshot = ds.session.replyTargets?.[turnId]?.automationUser;
+  const configuredDefault = (() => {
+    try { return getBot(ds.larkAppId).config.automationIdentity?.user
+      ?? getBot(ds.larkAppId).config.toolIdentity?.user; } catch { return undefined; }
+  })();
+  if ((authority.task.runAsUser || configuredDefault) && snapshot === undefined) {
+    // Never substitute the creator for an explicitly configured automation
+    // principal. A turn accepted before that configuration must be re-fired so
+    // the scheduler can freeze the new decision.
+    throw new Error('schedule_execution_identity_snapshot_missing');
+  }
+  const task = snapshot !== undefined ? { ...authority.task, runAsUser: snapshot ?? undefined } : authority.task;
+  if (task.runAsUser) {
+    assertAutomationUserAllowed(task.runAsUser, ds.larkAppId, ds.chatId);
+    // A queued/restored scheduled turn can meet a worker spawned before the
+    // execution identity was configured. Refuse that admission instead of
+    // publishing credentials into a worker without the enforcing wrapper.
+    assertAutomationSession(
+      task.runAsUser,
+      ds,
+      ds.session.replyTargets?.[turnId]?.automationIdentityTools,
+    );
+  }
   // Read the host authority, never the CLI-writable schedules.json projection
   // or the session's last sender. A completed one-shot may still have an
   // admitted turn to restore/continue; manual disables and revocations cannot.
@@ -4683,7 +4749,10 @@ async function prepareScheduledTurnCliIdentity(ds: DaemonSession, turnId: string
     noteScheduledIdentityRestored(ds, task, turnId, identity);
   } else noteScheduledIdentityGap(ds, task, turnId, identity);
   await publishTurnCliIdentity({
-    botConfig: getBot(ds.larkAppId).config,
+    botConfig,
+    policy: publicationPolicy,
+    ...(frozenDecision ? { decision: frozenDecision } : {}),
+    sessionSandbox: ds.session.sandbox,
     sessionDataDir: config.session.dataDir,
     sessionId: ds.session.sessionId,
     senderOpenId,
@@ -4691,6 +4760,9 @@ async function prepareScheduledTurnCliIdentity(ds: DaemonSession, turnId: string
     turnId,
     storageModel: identityModelForPublication(ds),
     privateChat: ds.chatType === 'p2p',
+    ...(ds.session.replyTargets?.[turnId]?.automationIdentityTools
+      ? { tools: ds.session.replyTargets[turnId]!.automationIdentityTools }
+      : {}),
   });
   assertScheduledAuthorityCurrent(authority, scheduleAuthorityStore?.getRecord(ds.larkAppId, taskId),
     { turnId, allowCompleted: true });
@@ -4786,6 +4858,7 @@ async function prepareDelegatedScheduledTurnIdentity(
   );
   await publishTurnCliIdentity({
     botConfig: getBot(ds.larkAppId).config,
+    sessionSandbox: ds.session.sandbox,
     sessionDataDir: config.session.dataDir,
     sessionId: ds.session.sessionId,
     senderOpenId: undefined,
@@ -4802,10 +4875,31 @@ async function prepareDelegatedScheduledTurnIdentity(
 async function refreshTurnCliIdentity(ds: DaemonSession, turnId: string): Promise<void> {
   let botConfig;
   try { botConfig = getBot(ds.larkAppId).config; } catch { return; }
-  if (!botConfig.triggerUserAuth?.enabled) return;
+  if (!triggerUserAuthEnabledFor(ds)) return;
   if (identityPublicationConflicted(ds)) return;
 
   const reply = pickTurnReplyTarget(ds.session, turnId);
+  if (reply?.automationUser) {
+    assertAutomationUserAllowed(reply.automationUser, ds.larkAppId, ds.chatId);
+    noteSenderUnionId(ds.larkAppId, reply.automationUser.openId, reply.automationUser.unionId);
+  }
+  // An automatic turn's frozen execution user outranks any stored sender. It
+  // was resolved by the host from an explicit task/connector selection, the
+  // bot automation default, or verified provenance — never from this reply.
+  // An explicitly frozen "no user" decision (host or denied) is fail-closed:
+  // do not fall back to the event sender (e.g. a configured-but-revoked bot
+  // default must not silently run as the human inviter). The read adapter
+  // understands both the versioned record and the legacy frozen triple; an
+  // ambiguous `automationUser: null` without freeze markers is NOT a
+  // decision (plan §9) and keeps the ordinary sender behavior.
+  const frozenDecision = toolIdentityDecisionFromReplyTarget(reply);
+  const executionSenderOpenId = frozenDecision
+    ? reply?.senderOpenId : reply?.automationUser?.openId ?? reply?.senderOpenId;
+  const publicationPolicy = {
+    ...normalizeToolIdentityPolicy(botConfig),
+    ...frozenDecision?.baseline,
+  };
+  assertTurnIdentitySession(ds, botConfig, publicationPolicy, frozenDecision, executionSenderOpenId);
   let delegatedIdentity: import('./core/turn-cli-identity.js').DelegatedCliIdentity | undefined;
   let delegationBlocked = false;
   let delegationRecord: Awaited<ReturnType<typeof dispatchUserForTurn>>;
@@ -4870,13 +4964,21 @@ async function refreshTurnCliIdentity(ds: DaemonSession, turnId: string): Promis
   }
   await publishTurnCliIdentity({
     botConfig,
+    policy: publicationPolicy,
+    ...(frozenDecision ? { decision: frozenDecision } : {}),
+    sessionSandbox: ds.session.sandbox,
     sessionDataDir: config.session.dataDir,
     sessionId: ds.session.sessionId,
     senderOpenId: delegationBlocked
-      || reply?.participants?.some(p => p.openId === reply.senderOpenId && p.isBot === true)
-      || (ds.session.quoteTargetId === turnId && ds.session.quoteTargetSenderIsBot === true)
-      ? undefined : reply?.senderOpenId,
+      || (executionSenderOpenId
+        && reply?.participants?.some(p => p.openId === executionSenderOpenId && p.isBot === true))
+      || (!reply?.automationUser && ds.session.quoteTargetId === turnId && ds.session.quoteTargetSenderIsBot === true)
+      ? undefined : executionSenderOpenId,
     ...(delegatedIdentity ? { delegatedIdentity } : {}),
+    // Automation turns carry a frozen scope; tools enabled for the bot after
+    // this turn was admitted stay out of its credential publication.
+    ...(!delegatedIdentity && reply?.automationIdentityTools
+      ? { tools: reply.automationIdentityTools } : {}),
     locale: localeForBot(ds.larkAppId),
     turnId,
     storageModel: identityModelForPublication(ds),
@@ -4893,10 +4995,10 @@ async function refreshTurnCliIdentity(ds: DaemonSession, turnId: string): Promis
   // refused) it stayed silent.
   //
   // The refusal already carries this. The wrapper prints, on stderr, which tool
-  // was refused and how to authorize it — including a direct ByteCloud login
-  // link when bytedcli can start one automatically — at the moment of the
-  // refusal, for that tool only. That is strictly better information than a
-  // pre-turn guess, so the chat notice stays absent.
+  // was refused and how to authorize it. ByteCloud instructions require the
+  // command's explicit site instead of guessing CN before the tool is called.
+  // This is better information than a pre-turn guess, so the chat notice stays
+  // absent.
 }
 
 /** Freeze the source independently of a later destination or live turn.
@@ -7258,7 +7360,9 @@ const workflowNodeDaemon = createWorkflowNodeDaemon({
   handoffIdentity: {
     botTools: (appId) => {
       const policy = loadBotConfigs().find((bot) => bot.larkAppId === appId)?.triggerUserAuth;
-      return policy?.enabled ? [...policy.tools] : [];
+      return policy?.enabled
+        ? V3_HANDOFF_IDENTITY_TOOLS.filter((tool) => policy.tools.includes(tool))
+        : [];
     },
     checkSelf: workflowHandoffIdentityCheck,
   },
@@ -9715,7 +9819,9 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
       }
       const targetTriggerPolicy = getBot(ds.larkAppId).config.triggerUserAuth;
       if (!targetTriggerPolicy?.enabled
-        || !TRIGGER_USER_AUTH_TOOLS.every(tool => targetTriggerPolicy.tools.includes(tool))) {
+        || !DELEGATED_SCHEDULE_REQUIRED_IDENTITY_TOOLS.every(
+          tool => targetTriggerPolicy.tools.includes(tool),
+        )) {
         return jsonRes(res, 403, { ok: false, error: 'schedule_delegation_target_identity_isolation_required' });
       }
       if (capability.allowedRunScopes.some(scope => !targetPolicy?.runScopes?.includes(scope)
@@ -10547,6 +10653,9 @@ function v3RelaySessionView(ds: DaemonSession): import('./workflows/v3/session-r
   const rootMessageId = ds.session.rootMessageId ?? replyTarget?.rootMessageId;
   return {
     receiver: !!ds.session.vcMeetingReceiver,
+    scheduledExecutionUser: ds.managedTurnOrigin?.turnId
+      ? ds.session.replyTargets?.[ds.managedTurnOrigin.turnId]?.automationUser
+      : undefined,
     ...(ds.managedTurnOrigin ? { liveOrigin: ds.managedTurnOrigin } : {}),
     ...(ds.session.lastCallerOpenId ? { callerOpenId: ds.session.lastCallerOpenId } : {}),
     ...(ds.chatId ? { chatId: ds.chatId } : {}),
@@ -26605,8 +26714,16 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
 
   const followupContent = parsed.content.trim();
   let content = composeForwardFollowupContent(forwardSeedContent, followupContent);
-  // Strip leading @<bot> mentions so "@bot /oncall bind" is recognized as a command.
-  let cmdContent = stripLeadingMentions(newTopicCommandLane, followupMentions);
+  // Strip leading @ mentions and any @ of this bot so both "@bot /oncall bind"
+  // and "/login bytedcli eu-ttp @bot" reach the command parser without treating
+  // the bot address as a command argument. Other people/bots' @ mentions stay
+  // in the command lane because they may be meaningful arguments.
+  const selfBotForCommand = getBot(larkAppId);
+  let cmdContent = stripBotMentions(
+    stripLeadingMentions(newTopicCommandLane, followupMentions),
+    followupMentions,
+    { botOpenId: selfBotForCommand.botOpenId, larkAppId },
+  );
 
   // `/t` / `/topic` — force the bot to reply in a thread, even in 普通群.
   // In 普通群 the inbound message is chat-scope by default; override to
@@ -26621,7 +26738,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // 解析出的规格在建会话时逐项落到 workingDir / title / modelPin /
   // reasoningEffort（仅 effort 的既有路径）。任一项校验失败就在**改 scope 之前**回一句用法错误并返回——
   // 于是拒绝路径不开新话题、不发选仓卡、不留会话记录（fail closed，D5）。
-  const selfBotForHeader = getBot(larkAppId);
+  const selfBotForHeader = selfBotForCommand;
   const strippedTopicHeader = stripBotMentions(
     cmdContent,
     followupMentions,
@@ -27934,6 +28051,7 @@ async function handleBotAdded(
   if (priorAnchorKey) groupJoinAnchorByChat.delete(chatLiveKey); // stale entry, will re-register below
   autoStartJoinInFlight.add(lockKey);
   let joinReady: AutoStartJoinReadyBarrier | undefined;
+  let rollbackJoinOnError: (() => Promise<boolean>) | undefined;
   try {
     // D7 gate: an allowedUser must be a member of the chat. Alarm/oncall
     // platforms (e.g. Nexus) create the chat, add bots first and the human
@@ -27973,23 +28091,29 @@ async function handleBotAdded(
     let groupJoinSender: ResolvedSender | undefined;
     let groupJoinTrustedCaller: TrustedCaller | undefined;
     let groupJoinGateMatched = false;
-    // bot.added carries an operator id, not a platform sender_type. Read bot/app
-    // evidence before any owner or turn-sender write: a known peer, or an
-    // identity-cache entry already typed app/bot, must not be recorded as the
-    // human who opened the session. A cache miss is not evidence either way, so
-    // an unknown operator keeps the existing human registration. This read does
-    // not call resolveSender — an undefined senderType would write "user" into
-    // the cache and manufacture the evidence we are refusing to invent.
+    // bot.added supplies an operator ID, not a platform sender_type. Read
+    // independent bot evidence before resolving any display name: even an
+    // undefined senderType makes resolveSender write "user" into the cache.
+    // This classification is needed even when the lifecycle gate is off: the
+    // operator must never become a human session owner/participant merely
+    // because an automation bot invited this bot.
     const cachedOperator = operatorOpenId ? getIdentity(larkAppId, operatorOpenId) : undefined;
     const operatorIsBot: true | undefined = operatorOpenId
       && (isKnownPeerBot(config.session.dataDir, larkAppId, operatorOpenId)
         || cachedOperator?.type === 'bot' || cachedOperator?.type === 'app')
       ? true : undefined;
-    // App/bot operators get no human owner. trustedSessionController stamps
-    // every owner as senderType=user; leaving the field unset is what keeps
-    // that stamp off. lastCallerOpenId is the quote-chain caller for provenance
-    // and must not name the app either.
-    const humanOperatorOpenId = operatorIsBot ? undefined : operatorOpenId;
+    // Positive human evidence only: a platform-authenticated sender record for
+    // this app, or a strict contact lookup. `bot.added` carries an operator ID
+    // but no platform sender_type, and a cached display record learned from a
+    // mention is NOT verification. This mirrors the three-state caller contract
+    // above and keeps a synthetic owner/participant record from vouching for an
+    // automation/bot operator.
+    const cachedHuman = cachedOperator?.type === 'user'
+      && ['sender', 'message_api', 'contact_api'].includes(cachedOperator.source ?? '');
+    const operatorIsHuman = !!operatorOpenId && !operatorIsBot
+      && (cachedHuman
+        || !!(await resolveVerifiedUserIdentity(larkAppId, operatorOpenId).catch(() => undefined)));
+    const humanOperatorOpenId = operatorIsHuman ? operatorOpenId : undefined;
     if (!forced) {
       const groupJoinGate = await evaluatePromptGate('chat.bot_added', {
         larkAppId,
@@ -28014,14 +28138,14 @@ async function handleBotAdded(
       }
       groupJoinGateMatched = groupJoinGate.matched === true;
 
-      // Provenance injection (identity resolution, opening caller, and the
-      // <botmux_group_join> prompt block) is opt-in: it happens only for bots
-      // that explicitly require the lifecycle gate. A bot with the legacy
-      // autoStartOnGroupJoin toggle keeps a byte-identical opening turn — no
-      // extra contact lookup, no injected block, no turn caller (zero
-      // breakchange for existing deployments, per the gate's default-off
-      // contract). When gateRequired is true this branch is reached only after
-      // a matching sync hook allowed, so gateMatched is necessarily true here.
+      // Provenance injection for the model-facing <botmux_group_join> block and
+      // display sender is opt-in: it happens only for bots that explicitly
+      // require the lifecycle gate. Identity correctness is NOT gated here —
+      // the automation default / verified-human caller resolved below applies
+      // to both gate modes, because whether the opening turn can act as a user
+      // must not depend on a prompt-gate toggle. When gateRequired is true this
+      // branch is reached only after a matching sync hook allowed, so
+      // gateMatched is necessarily true here.
       if (botCfg.autoStartOnGroupJoinGateRequired === true) {
         // Display-name lookup stays inside the opt-in gate. resolveSender is
         // only called once operatorIsBot is already true, and with senderType
@@ -28045,12 +28169,63 @@ async function handleBotAdded(
         // A known app/bot is not the session owner, so there is no user-typed
         // controller to confuse with this caller. Turn privileges read caller.
         groupJoinTrustedCaller = groupJoinSender?.openId === operatorOpenId
-          ? trustedCallerForTurn(larkAppId, operatorOpenId, undefined, operatorIsBot)
+          ? trustedCallerForTurn(
+              larkAppId,
+              operatorOpenId,
+              undefined,
+              operatorIsBot === true ? true : operatorIsHuman ? false : undefined,
+            )
           : undefined;
       }
     }
 
-    const promptBody = opts?.forcePrompt ?? resolveGroupJoinPrompt(botCfg.autoStartOnGroupJoinPrompt, localeForBot(larkAppId));
+    // Group entry has no human inbound message. Resolve the bot's automation
+    // Run as default before spawning so the opening turn (and the group-entry
+    // seed's reply target) carries a real execution identity. A configured but
+    // invalid/revoked default is fail-closed: it must not fall through to the
+    // inviter or the session owner.
+    // Group-entry defaults to native host execution. The event actor is never
+    // an implicit Run as selection, even when independently verified human.
+    // Explicit automatic/fixed assignments retain their existing precedence
+    // and fail-closed capability/access checks.
+    const joinHasAssignment = !!(botCfg.automationIdentity || botCfg.automationIdentityInvalid
+      || botCfg.toolIdentity || botCfg.toolIdentityInvalid);
+    const joinIdentityConfig = joinHasAssignment ? botCfg
+      : { ...botCfg, triggerUserAuth: undefined };
+    const joinAutomation = resolveAutomationIdentity({
+      appId: larkAppId,
+      chatId,
+      config: joinIdentityConfig,
+    });
+    if (joinAutomation.failure) {
+      // Refuse auto-start rather than dispatch a turn with no enforceable
+      // identity. "No user" is not a safe fallback when the configured scope
+      // cannot be enforced: the worker may then use native host credentials,
+      // which is exactly the incident this identity fix prevents.
+      logger.warn(
+        `[auto-start:入群] ${chatId.substring(0, 12)} 自动化执行身份不可用`
+        + ` (source=${joinAutomation.source}, reason=${joinAutomation.failure})；`
+        + '拒绝本轮自动开工，不回退到操作人、会话 owner 或本机登录',
+      );
+      return;
+    }
+    const joinAutomationUser = joinAutomation.user;
+    if (joinAutomationUser) groupJoinTrustedCaller = automationTrustedCaller(joinAutomationUser);
+    // No automation default: a positively verified human inviter is the next
+    // supported provenance. This deliberately does not depend on the lifecycle
+    // gate toggle, which controls prompt provenance, not identity correctness.
+    else if (operatorIsHuman && operatorOpenId) {
+      groupJoinTrustedCaller = trustedCallerForTurn(larkAppId, operatorOpenId, undefined, false);
+    }
+    if (joinAutomationUser) {
+      logger.info(
+        `[auto-start:入群] ${chatId.substring(0, 12)} 执行身份 source=${joinAutomation.source} `
+        + `user=${joinAutomationUser.openId} tools=${joinAutomation.tools.join(',')}`,
+      );
+    }
+
+    const promptBody = opts?.forcePrompt
+      ?? resolveGroupJoinPrompt(botCfg.autoStartOnGroupJoinPrompt, localeForBot(larkAppId));
     const title = ((opts?.forcePrompt ?? botCfg.autoStartOnGroupJoinPrompt?.trim())
       || tr('daemon.auto_start_join_title', undefined, localeForBot(larkAppId))).substring(0, 50);
     // 入群 seed 消息文案：bot 配置了 autoStartOnGroupJoinSeed 用之，否则回退内置 i18n。
@@ -28111,6 +28286,9 @@ async function handleBotAdded(
     const session = sessionStore.createSession(chatId, anchor, title, chatType);
     const now = Date.now();
     session.larkAppId = larkAppId;
+    // Only positively verified humans become owner/caller. An automation bot
+    // that invited this bot stays the event actor (logged), never the session's
+    // human controller; the execution identity is resolved separately below.
     session.ownerOpenId = humanOperatorOpenId;
     session.lastCallerOpenId = humanOperatorOpenId;
     session.lastMessageAt = new Date(now).toISOString();
@@ -28156,6 +28334,27 @@ async function handleBotAdded(
       // 非 shared 路径的首轮 turn 身份（joinTurnId）；shared 路径由
       // armSharedReplyTarget 用 shared seed id 覆盖。
       pendingTurnId: needsSharedReply ? undefined : joinTurnId,
+    };
+    // Freeze the resolved automation principal for this opening turn. A
+    // no-default turn still records an explicit null so a later config edit
+    // cannot retroactively lend it an identity; a failed resolution records the
+    // failure source and NO user, keeping the fail-closed decision durable.
+    const freezeJoinAutomationIdentity = (turnId: string): void => {
+      freezeAutomationTurnUser(ds, turnId, joinAutomationUser ?? null, {
+        source: joinAutomation.source,
+        tools: joinAutomation.tools,
+        policy: normalizeToolIdentityPolicy(joinIdentityConfig),
+      });
+      sessionStore.updateSession(ds.session);
+    };
+    // Publish the opening turn's CLI identity once its reply target exists.
+    // Unlike the managed lark binding (which resolves at call time from the
+    // worker origin), trigger-user wrappers read a per-turn credential snapshot;
+    // without this, a group-entry opening turn governed by triggerUserAuth
+    // would reach lark-cli/bytedcli/larkdev with no identity.
+    const publishJoinOpeningIdentity = async (): Promise<void> => {
+      if (!triggerUserAuthEnabledFor(ds)) return;
+      await refreshTurnCliIdentity(ds, ds.pendingTurnId ?? joinTurnId);
     };
     const registration = await claimNewDaemonSession(activeSessions, ds);
     if (!registration.accepted) {
@@ -28240,18 +28439,29 @@ async function handleBotAdded(
       sharedReplyRootId = undefined;
       void deleteMessage(larkAppId, messageId);
     };
-    // 首轮无真人入站消息。没有应用/机器人证据时，仍把拉 bot 入群的操作人登记
-    // 为本轮 sender，schedule 等需要当前轮真人身份的命令据此归属，与
-    // session.ownerOpenId 一致。isBot:false 只覆盖「没有 bot/app 证据」的
-    // 操作人；已知 peer、或身份缓存已是 app/bot 的操作人走 humanOperatorOpenId
-    // 的空登记，避免 registryEntryProvesHumanSender 在回合结束后把机器人恢复
-    // 成真人发起人。participantsIncomplete 让 --mention-back 保持既有安全方向
-    // （窗口不完整 → 要求显式 @），这条登记不改变回复时的 @ 行为。
-    const joinTurnSenderOpts = humanOperatorOpenId
+    rollbackJoinOnError = async () => {
+      if (activeSessions.get(dsKey) !== ds || (ds.worker && !ds.worker.killed)) return false;
+      withdrawSharedReplySeed();
+      await rollbackRegisteredJoinSession();
+      return true;
+    };
+    // 首轮无真人入站消息，但 bot.added 事件本身携带操作人。只有经过独立验证的
+    // 真人才登记为本轮 sender（schedule 等需要当前轮真人身份的命令据此归属）。
+    // bot.added 不带平台 sender_type，因此 "不是已知 bot" 不能被当成真人证据：
+    // 自动化平台（告警/oncall）拉 bot 入群时，操作人是 bot，旧代码的 isBot:false
+    // 会让它通过 registryEntryProvesHumanSender，从而冒充真人授权。
+    // participantsIncomplete 让 --mention-back 保持既有安全方向（窗口不完整 →
+    // 要求显式 @），这条登记不改变回复时的 @ 行为。
+    const participantIsBot = operatorIsBot === true ? true : operatorIsHuman ? false : undefined;
+    const joinTurnSenderOpts = operatorOpenId
       ? {
-          senderOpenId: humanOperatorOpenId,
-          participants: [{ openId: humanOperatorOpenId, isBot: false }],
+          ...(humanOperatorOpenId ? { senderOpenId: humanOperatorOpenId } : {}),
+          participants: [{
+            openId: operatorOpenId,
+            ...(participantIsBot === undefined ? {} : { isBot: participantIsBot }),
+          }],
           participantsIncomplete: true,
+          lifecycleSynthetic: true as const,
         }
       : {};
     const armSharedReplyTarget = (): void => {
@@ -28259,6 +28469,7 @@ async function handleBotAdded(
       ds.pendingTurnId = sharedReplyRootId;
       if (ds.pendingGroupJoinContext) ds.pendingGroupJoinContext.turnId = sharedReplyRootId;
       beginReplyTargetTurn(ds, sharedReplyRootId, sharedReplyRootId, new Date(now).toISOString(), joinTurnSenderOpts);
+      freezeJoinAutomationIdentity(sharedReplyRootId);
       sessionStore.updateSession(ds.session);
     };
     if (needsSharedReply) {
@@ -28310,6 +28521,7 @@ async function handleBotAdded(
           new Date(now).toISOString(),
           joinTurnSenderOpts,
         );
+        freezeJoinAutomationIdentity(joinTurnId);
         sessionStore.updateSession(ds.session);
       } catch (err) {
         // 持久化失败（文件系统/数据库瞬态错误）时必须回滚已发布的会话：此时
@@ -28334,7 +28546,14 @@ async function handleBotAdded(
       }
       ds.initialStartPending = false; // pendingRepo/worktree now owns buffering
       armSharedReplyTarget();
-      startAutoWorktreePending(ds, { anchor, baseDir: pinnedWorkingDir, title, prompt: promptBody, operatorOpenId: humanOperatorOpenId });
+      await publishJoinOpeningIdentity();
+      startAutoWorktreePending(ds, {
+        anchor,
+        baseDir: pinnedWorkingDir,
+        title,
+        prompt: promptBody,
+        operatorOpenId: humanOperatorOpenId,
+      });
       return;
     }
 
@@ -28350,12 +28569,12 @@ async function handleBotAdded(
         withdrawSharedReplySeed();
         return;
       }
-      await noteTurnReceived(ds, anchor, promptBody);
+      armSharedReplyTarget();
+      await noteTurnReceived(ds, anchor, promptBody, undefined, ds.pendingTurnId ?? joinTurnId);
       if (joinBootstrapWasTakenOver()) {
         withdrawSharedReplySeed();
         return;
       }
-      armSharedReplyTarget();
       forkReservedInitialSession(ds, availableBots, groupJoinTrustedCaller);
       ds.pendingTurnId = undefined;
       ds.pendingChatContext = undefined;
@@ -28419,6 +28638,7 @@ async function handleBotAdded(
         repoCardPublished = true;
         ds.repoCardMessageId = repoCardMessageId;
         persistPendingRepoCardMessageId(ds, ds.repoCardMessageId);
+        await publishJoinOpeningIdentity();
         announcePendingRepoSession(ds);
         logger.info(`[auto-start:入群] ${chatId.substring(0, 12)} 无默认目录，弹 repo 选择卡（${projects.length} 个项目）`);
       } else {
@@ -28433,12 +28653,12 @@ async function handleBotAdded(
         withdrawSharedReplySeed();
         return;
       }
-      await noteTurnReceived(ds, anchor, promptBody);
+      armSharedReplyTarget();
+      await noteTurnReceived(ds, anchor, promptBody, undefined, ds.pendingTurnId ?? joinTurnId);
       if (joinBootstrapWasTakenOver()) {
         withdrawSharedReplySeed();
         return;
       }
-      armSharedReplyTarget();
       forkReservedInitialSession(ds, availableBots, groupJoinTrustedCaller);
       ds.pendingTurnId = undefined;
       ds.pendingChatContext = undefined;
@@ -28446,6 +28666,9 @@ async function handleBotAdded(
       ds.pendingTrustedCaller = undefined;
       logger.info(`[auto-start:入群] ${chatId.substring(0, 12)} 无默认目录${projects.length > 0 ? '且 repo 卡不可用' : '且无可选项目'}，直接开工`);
     }
+  } catch (err) {
+    if (!rollbackJoinOnError || !await rollbackJoinOnError()) throw err;
+    logger.warn(`[auto-start:入群] 首轮初始化失败，已回滚会话注册：${err instanceof Error ? err.message : String(err)}`);
   } finally {
     joinReady?.settle();
     autoStartJoinInFlight.delete(lockKey);
@@ -29096,10 +29319,16 @@ async function handleThreadReplyAdmitted(
   };
 
   let content = parsed.content.trim();
-  // Strip leading @<bot> mentions so "@bot /restart" is recognized as a command.
+  // Strip leading @ mentions and any @ of this bot so a trailing address does
+  // not become an extra daemon-command argument. Other mentions are preserved.
   // threadCommandLane 是免@ 命令模板改写**之前**的正文；没有模板时与 content
   // 逐字相同（见上方 threadCommandPrompt 处的说明）。
-  let cmdContent = stripLeadingMentions(threadCommandLane, parsed.mentions);
+  const selfBotForCommand = getBot(larkAppId);
+  let cmdContent = stripBotMentions(
+    stripLeadingMentions(threadCommandLane, parsed.mentions),
+    parsed.mentions,
+    { botOpenId: selfBotForCommand.botOpenId, larkAppId },
+  );
   // The administrative effort prefix was already consumed. Its attached task
   // remains literal model text while quota/resources/principal admission run.
   if (ctx.effortTaskReentry) cmdContent = '';
@@ -35483,6 +35712,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       && executionContext.trigger === 'dashboard'
       && isManualScheduleRun(authority.task, executionContext.runId))) {
       throw new Error(`schedule authority state is ${authority.state}; refusing run`);
+    }
+    if (task.runAsUser) {
+      for (const chatId of scheduleStore.effectiveScheduleChatIds(task)) {
+        assertAutomationUserAllowed(task.runAsUser, effectiveAppId, chatId);
+      }
     }
     if (authority.kind === 'delegated') {
       // Every identity entry is governed. Empty runScopes therefore publishes

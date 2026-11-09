@@ -1183,7 +1183,7 @@ describe('bot-config store', () => {
     expect(readConfig().showReplyTiming).toBeUndefined();
   });
 
-  it('larkToolBinding is a next-session clearable boolean with defaultOn, aliases bindlarkapp / larkappbinding, and cleans bots.json when true', async () => {
+  it('larkToolBinding is a next-session opt-in boolean, aliases bindlarkapp / larkappbinding, and cleans bots.json when off', async () => {
     const { registry, store } = await loaded();
     expect(store.findConfigField('larkToolBinding')?.configKey).toBe('larkToolBinding');
     expect(store.findConfigField('bindLarkApp')?.configKey).toBe('larkToolBinding');
@@ -1192,32 +1192,31 @@ describe('bot-config store', () => {
     const spec = store.findConfigField('larkToolBinding')!;
     expect(spec.effect).toBe('next-session');
     expect(spec.clearable).toBe(true);
-    expect(spec.defaultOn).toBe(true);
+    // 新契约：显式 opt-in，没有 defaultOn（plan §3.4/§4.3）
+    expect(spec.defaultOn).toBeUndefined();
 
-    // Initial state: undefined (renders 'on' because defaultOn: true)
+    // Initial state: undefined (renders 'off' — native host behavior)
     expect(registry.getBot('app_default').config.larkToolBinding).toBeUndefined();
     expect(readConfig().larkToolBinding).toBeUndefined();
 
-    // Disable (false) -> writes false on disk and in memory
+    // Disable (false) -> off is the default; the key is cleaned from bots.json
     const r1 = await store.applyConfigField('app_default', spec, false);
     expect(r1.ok).toBe(true);
-    if (r1.ok) { expect(r1.oldText).toBe('on'); expect(r1.newText).toBe('off'); }
-    expect(readConfig().larkToolBinding).toBe(false);
-    expect(registry.getBot('app_default').config.larkToolBinding).toBe(false);
+    if (r1.ok) { expect(r1.oldText).toBe('off'); expect(r1.newText).toBe('off'); }
+    expect(readConfig().larkToolBinding).toBeUndefined();
+    expect(registry.getBot('app_default').config.larkToolBinding).toBeUndefined();
 
-    // Enable (true) -> deletes key (back to default), in-memory undefined (= on)
+    // Enable (true) -> writes the explicit opt-in key
     const r2 = await store.applyConfigField('app_default', spec, true);
     expect(r2.ok).toBe(true);
     if (r2.ok) { expect(r2.oldText).toBe('off'); expect(r2.newText).toBe('on'); }
-    expect(readConfig().larkToolBinding).toBeUndefined();
-    expect(registry.getBot('app_default').config.larkToolBinding).toBeUndefined();
+    expect(readConfig().larkToolBinding).toBe(true);
+    expect(registry.getBot('app_default').config.larkToolBinding).toBe(true);
 
-    // Unset (null) from an explicit-false state also restores the default
-    await store.applyConfigField('app_default', spec, false);
-    expect(readConfig().larkToolBinding).toBe(false);
+    // Unset (null) from an explicit-true state also clears the binding
     const r3 = await store.applyConfigField('app_default', spec, null);
     expect(r3.ok).toBe(true);
-    if (r3.ok) expect(r3.newText).toBe('on');
+    if (r3.ok) expect(r3.newText).toBe('off');
     expect(readConfig().larkToolBinding).toBeUndefined();
     expect(registry.getBot('app_default').config.larkToolBinding).toBeUndefined();
   });

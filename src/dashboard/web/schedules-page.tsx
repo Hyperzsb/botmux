@@ -1,3 +1,4 @@
+import { AutomationUserPicker } from './automation-user-picker.js';
 import {
   useEffect,
   useMemo,
@@ -1453,7 +1454,7 @@ function SchedulesPage() {
     rootMessageId: string;
     topicTitle: string;
     updateExecutionPosition: boolean;
-    chatIds: string[]; larkAppId: string;
+    chatIds: string[]; larkAppId: string; runAsOpenId: string;
     model: string; reasoningEffort: string; calendar: string; calendarDayType: 'workday' | 'restday';
   }): Promise<void> {
     setFormError(null);
@@ -1466,6 +1467,7 @@ function SchedulesPage() {
       const payload = editing
         ? {
             name: data.name,
+            runAsOpenId: data.runAsOpenId,
             schedule: data.schedule,
             prompt: data.prompt,
             silent: data.silent,
@@ -1496,6 +1498,7 @@ function SchedulesPage() {
           }
         : {
             name: data.name,
+            runAsOpenId: data.runAsOpenId,
             schedule: data.schedule,
             prompt: data.prompt,
             silent: data.silent,
@@ -1707,6 +1710,7 @@ export function renderSchedulesPage(root: HTMLElement): PageDisposer {
 }
 
 interface ScheduleFormData {
+  runAsOpenId: string;
   name: string;
   schedule: string;
   prompt: string;
@@ -1748,6 +1752,7 @@ export function ScheduleFormModal(props: {
   const [name, setName] = useState(editing?.name ?? '');
   const [schedule, setSchedule] = useState(editing?.schedule ?? '');
   const [prompt, setPrompt] = useState(editing?.prompt ?? '');
+  const [runAsOpenId, setRunAsOpenId] = useState(editing?.runAsUser?.openId ?? '');
   const initialPrecondition = schedulePreconditionEditorInitialState(editing);
   const hasExistingPrecondition = initialPrecondition.hasExisting;
   const initialPreconditionEnabled = initialPrecondition.enabled;
@@ -2141,6 +2146,7 @@ export function ScheduleFormModal(props: {
     setPreconditionError(null);
     props.onSubmit({
       name: name.trim(),
+      runAsOpenId,
       schedule: schedule.trim(),
       prompt,
       ...precondition.fields,
@@ -2175,7 +2181,7 @@ export function ScheduleFormModal(props: {
             <span className="schedule-form-label">{tr('schedules.form.bot')}</span>
             <select
               value={larkAppId}
-              onChange={e => setLarkAppId(e.target.value)}
+              onChange={e => { setLarkAppId(e.target.value); setRunAsOpenId(''); }}
               required
             >
               {bots.map(b => (
@@ -2197,6 +2203,7 @@ export function ScheduleFormModal(props: {
             <small className="schedule-form-help">{tr('schedules.form.botImmutableHelp')}</small>
           </div>
         )}
+        <AutomationUserPicker botId={larkAppId} value={runAsOpenId} onChange={setRunAsOpenId} />
         <label className="schedule-form-field">
           <span className="schedule-form-label">
             {tr('schedules.form.name')} <i className="req" aria-hidden="true">*</i>

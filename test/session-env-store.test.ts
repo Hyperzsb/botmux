@@ -92,8 +92,9 @@ describe('bot layer (bots.json env + envUnset)', () => {
   });
 
   it('the Dashboard write path validates with this bot\'s identity lock', async () => {
-    const { store } = await loaded();
-    // lark tool binding is on by default → ZDOTDIR belongs to the wrapper
+    // lark tool binding is an explicit opt-in → the wrapper lock needs it on
+    const { store } = await loaded({ larkToolBinding: true });
+    // lark tool binding on → ZDOTDIR belongs to the wrapper
     expect(await store.applyBotSessionEnvRequest('app_a', [{ op: 'set', key: 'ZDOTDIR', value: '/z' }]))
       .toEqual({ ok: false, reason: 'reserved_key', key: 'ZDOTDIR' });
     expect('env' in readBot()).toBe(false);

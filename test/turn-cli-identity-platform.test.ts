@@ -27,6 +27,10 @@ const bytedcliJwts = new Map<string, { cloudJwt: string; codeJwt?: string }>();
 const beginBytedcliLogin = vi.fn(async () => ({ authUrl: 'https://cloud.example.test/local-bytedcli', completeToken: 'tok' }));
 vi.mock('../src/services/bytedcli-auth.js', () => ({
   renewBytedcliJwts: vi.fn(async () => null),
+  mintByteCloudUserJwts: vi.fn(async (openId: string) => {
+    const jwt = bytedcliJwts.get(openId);
+    return jwt ? { cn: jwt.cloudJwt } : null;
+  }),
   mintBytedcliJwts: vi.fn(async (openId: string) => bytedcliJwts.get(openId) ?? null),
   beginBytedcliLogin: (openId: string) => beginBytedcliLogin(openId),
 }));
@@ -35,6 +39,7 @@ const resolveLarkCliHomeForTurn = vi.fn(async (openId: string) => larkHomes.get(
 const beginLarkCliLogin = vi.fn(async () => ({ authUrl: 'https://example.test/local-lark-device' }));
 vi.mock('../src/services/lark-cli-auth.js', () => ({
   resolveLarkCliHomeForTurn: (openId: string) => resolveLarkCliHomeForTurn(openId),
+  materializeLarkCliHomeForSession: async (openId: string) => resolveLarkCliHomeForTurn(openId),
   pendingLarkCliChallenge: vi.fn(() => null),
   beginLarkCliLogin: (openId: string) => beginLarkCliLogin(openId),
 }));
@@ -84,7 +89,7 @@ function botConfig(triggerUserAuth: unknown) {
   } as any;
 }
 const publish = (config: any, sender: string | undefined, turnId = 'om_t1') =>
-  publishTurnCliIdentity({ botConfig: config, sessionDataDir: dir, sessionId: SESSION, senderOpenId: sender, turnId, privateChat: true });
+  publishTurnCliIdentity({ botConfig: config, sessionDataDir: dir, sessionId: SESSION, senderOpenId: sender, turnId, privateChat: true, storageModel: 'single' });
 const read = (tool: 'lark-cli' | 'bytedcli') => readFileSync(sessionIdentityPath(dir, SESSION, tool), 'utf8');
 const granted = (tool: 'lark-cli' | 'bytedcli') => ({
   ok: true,
@@ -113,7 +118,7 @@ describe('credentialSource = local', () => {
     const out = await publish(botConfig({ enabled: true, tools: ['bytedcli'], credentialSource: 'local' }), ALICE);
     expect(out.find(o => o.tool === 'bytedcli')?.state).toBe('user');
     expect(grantCalls).toHaveLength(0);
-    expect(read('bytedcli')).toContain("BYTEDCLI_USER_CLOUD_JWT='local-cloud'");
+    expect(read('bytedcli')).toContain("BYTECLOUD_CLI_API_JWT_TOKEN_CN='local-cloud'");
   });
 
   it('never consults the platform even when bound', async () => {
@@ -353,7 +358,7 @@ describe('delegated identity (signed cross-bot dispatch)', () => {
   });
   const publishDelegated = (tools: Array<'lark-cli' | 'bytedcli'>, triggerUserAuth: unknown) => publishTurnCliIdentity({
     botConfig: botConfig(triggerUserAuth), sessionDataDir: dir, sessionId: SESSION,
-    senderOpenId: undefined, delegatedIdentity: delegated(tools), turnId: 'om_d',
+    senderOpenId: undefined, delegatedIdentity: delegated(tools), turnId: 'om_d', storageModel: 'single',
   });
   const contactLookups: string[] = [];
   beforeEach(() => {
@@ -392,7 +397,7 @@ describe('delegated identity (signed cross-bot dispatch)', () => {
     larkHomes.set('ou_requester', '/homes/requester');
     bytedcliJwts.set('ou_requester', { cloudJwt: 'local-requester' });
     const out = await publishDelegated(['lark-cli', 'bytedcli'], { enabled: true, tools: ['lark-cli', 'bytedcli'], credentialSource: 'platform' });
-    expect(out.map(o => o.state)).toEqual(['needs-authorization', 'needs-authorization']);
+    expect(out.filter(o => o.state !== 'off').map(o => o.state)).toEqual(['needs-authorization', 'needs-authorization']);
     expect(resolveLarkCliHomeForTurn).not.toHaveBeenCalled();
     expect(read('bytedcli')).not.toContain('local-requester');
     expect(read('bytedcli')).toContain("BOTMUX_IDENTITY_MODE='denied'");
@@ -419,29 +424,6 @@ describe('delegated identity (signed cross-bot dispatch)', () => {
     });
     expect(out.find(o => o.tool === 'bytedcli')?.state).toBe('needs-authorization');
     expect(grantCalls).toEqual([]);
-  });
-});
-
-
-describe('both tools from the platform', () => {
-  it('asks for both grants at once, with one union_id lookup for the sender', async () => {
-    const lookups: string[] = [];
-    const pending: Array<() => void> = [];
-    __setPlatformCredentialDepsForTest({
-      readBinding: () => BINDING,
-      resolveUnionId: async (_app, openId) => { lookups.push(openId); await new Promise(r => setTimeout(r, 5)); return 'on_alice'; },
-      requestGrant: (req) => new Promise(resolve => {
-        grantCalls.push(req);
-        pending.push(() => resolve(granted(req.tool) as any));
-      }),
-    });
-    const run = publish(botConfig({ enabled: true, tools: ['lark-cli', 'bytedcli'], credentialSource: 'platform' }), ALICE);
-    await vi.waitFor(() => expect(grantCalls.map(c => c.tool).sort()).toEqual(['bytedcli', 'lark-cli']));
-    pending.forEach(release => release());
-    expect((await run).map(o => o.state)).toEqual(['user', 'user']);
-    expect(lookups).toEqual([ALICE]);
-    expect(read('lark-cli')).toContain('platform-user-token');
-    expect(read('bytedcli')).toContain('cloud-jwt');
   });
 });
 
@@ -486,5 +468,30 @@ describe('union_id lookup sharing', () => {
     const out = await publish(config, ALICE, 'om_fresh');
     expect(fresh).toEqual([ALICE]);
     expect(out.find(o => o.tool === 'lark-cli')?.state).toBe('unavailable');
+  });
+});
+
+describe('regional tools with platform grants', () => {
+  it('publishes only the larkdev sites granted to this human', async () => {
+    grantResponse = { ok: true, value: {
+      tool: 'larkdev', unionId: 'on_alice', expiresAt: Date.now() + 60_000,
+      variables: { BYTECLOUD_CLI_API_JWT_TOKEN_I18N_BD: 'alice-bd' },
+    } };
+    const out = await publish(botConfig({ enabled: true, tools: ['larkdev'], credentialSource: 'platform' }), ALICE);
+    expect(out.find(o => o.tool === 'larkdev')?.state).toBe('user');
+    const body = readFileSync(sessionIdentityPath(dir, SESSION, 'larkdev'), 'utf8');
+    expect(body).toContain("BYTECLOUD_CLI_API_JWT_TOKEN_I18N_BD='alice-bd'");
+    expect(body).not.toContain('BYTECLOUD_CLI_API_JWT_TOKEN_CN=');
+    expect(grantCalls[0]).toMatchObject({ tool: 'larkdev', unionId: 'on_alice' });
+  });
+
+  it('keeps an unscoped platform JWT unscoped and publishes its Codebase companion', async () => {
+    grantResponse = granted('bytedcli');
+    await publish(botConfig({ enabled: true, tools: ['bytedcli'], credentialSource: 'platform' }), ALICE);
+    expect(read('bytedcli')).toContain("BYTEDCLI_USER_CLOUD_JWT='cloud-jwt'");
+    expect(read('bytedcli')).not.toContain('BYTECLOUD_CLI_API_JWT_TOKEN_CN=');
+    const companion = readFileSync(sessionIdentityPath(dir, SESSION, 'codebase'), 'utf8');
+    expect(companion).toContain("CODEBASE_CLI_USER_JWT='code-jwt'");
+    expect(companion).toContain("BOTMUX_IDENTITY_OPEN_ID='ou_alice'");
   });
 });

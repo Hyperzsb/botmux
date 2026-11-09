@@ -1,3 +1,4 @@
+import { AutomationUserPicker } from './automation-user-picker.js';
 import type React from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { CreateActionButton, DropdownMenu, FieldTitle, LoadingState, dropdownLabel } from './dashboard-components.js';
@@ -16,6 +17,7 @@ import { SearchableGroupPicker } from './searchable-group-picker.js';
 import { BotPickerChips } from './bot-picker-chips.js';
 
 interface Connector {
+  runAsUser?: { openId: string; name?: string };
   id: string;
   name: string;
   enabled: boolean;
@@ -63,6 +65,7 @@ interface GroupOpt {
 }
 
 interface CreateForm {
+  runAsOpenId: string;
   name: string;
   botId: string;
   additionalBotIds: string[];
@@ -107,6 +110,7 @@ export function replaceConnectorById<T extends { id: string }>(connectors: T[], 
 }
 
 const emptyForm: CreateForm = {
+  runAsOpenId: '',
   name: '',
   botId: '',
   additionalBotIds: [],
@@ -247,6 +251,7 @@ function formFromConnector(connector: Connector, groups: GroupOpt[]): CreateForm
   const knownChat = chatId && botGroups(groups, connector.target.botId).some(group => group.chatId === chatId);
   return {
     name: connector.name,
+    runAsOpenId: connector.runAsUser?.openId ?? '',
     botId: connector.target.botId,
     additionalBotIds: additionalConnectorBotIds(connector.target.botId, connector.target.botIds),
     kind: connector.target.kind,
@@ -490,6 +495,7 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
     const body: any = {
       name,
       enabled: editingConnector?.enabled ?? true,
+      runAsOpenId: form.runAsOpenId,
       target: buildConnectorTargetBody({ ...form, chatId }),
       promptEnvelope: { sourceName: name, instruction: form.instruction.trim(), trustPayload: form.trustPayload && trustPayloadAllowed },
       topicMessage: topicMessage.value,
@@ -735,10 +741,13 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
               onChange={botId => setForm(cur => ({
                 ...cur,
                 botId,
+                runAsOpenId: '',
                 additionalBotIds: cur.additionalBotIds.filter(id => id !== botId),
               }))}
             />
           </div>
+
+          <AutomationUserPicker botId={form.botId} value={form.runAsOpenId} onChange={runAsOpenId => patchForm({ runAsOpenId })} />
 
           <div className="cn-field">
             <FieldTitle>{tr('connectors.fKind')}</FieldTitle>

@@ -389,7 +389,7 @@ export function buildLayoutString(bin: string, args: string[], opts: SpawnOpts):
     opts.protectedUnsetEnv,
   );
   const kind = shellKindForPath(shellSpec.shell);
-  const [cmd, ...paneArgs] = opts.strictEnv ? strictPaneCommand(bin, args, opts) : shellCommandArgv(shellSpec, shellWrapperScript(resolveBotmuxWrapperBinDir(opts.env ?? process.env), kind), [
+  const [cmd, ...paneArgs] = opts.strictEnv ? strictPaneCommand(bin, args, opts) : shellCommandArgv(shellSpec, shellWrapperScript(resolveBotmuxWrapperBinDir(opts.env ?? process.env), kind, opts.env?.BOTMUX_IDENTITY_BIN), [
     opts.cwd,
     ...envAssignments,
     bin, ...args,

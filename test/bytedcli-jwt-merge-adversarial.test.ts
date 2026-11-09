@@ -25,12 +25,17 @@ vi.mock('node:child_process', () => ({
     const child = Object.assign(new EventEmitter(), { stdout: Object.assign(new EventEmitter(), { destroy() {} }),
       stderr: Object.assign(new EventEmitter(), { destroy() {} }), kill: vi.fn() });
     const wasAuthorized = existsSync(join(home, 'authorized'));
-    const isStatus = args.includes('status');
-    const isBegin = args.includes('--begin');
-    const isComplete = args.includes('--complete');
-    const isRegional = args[0] === '--site';
-    const isDefault = args[0] === 'auth' && args[1] === 'get-bytecloud-jwt-token';
-    const region = args[1] === 'i18n-tt' ? 'i18n' : args[1] === 'i18n-bd' ? 'i18nbd' : 'tx';
+    const authIndex = args.indexOf('auth');
+    const authCommand = authIndex >= 0 ? args[authIndex + 1] : undefined;
+    const siteIndex = args.indexOf('--site');
+    const site = siteIndex >= 0 ? args[siteIndex + 1] : 'cn';
+    const isStatus = authCommand === 'status';
+    const isBegin = authCommand === 'login' && args.includes('--begin');
+    const isComplete = authCommand === 'login' && args.includes('--complete');
+    const isCloudMint = authCommand === 'get-bytecloud-jwt-token';
+    const isDefault = isCloudMint && site === 'cn';
+    const isRegional = isCloudMint && site !== 'cn';
+    const region = site === 'i18n-tt' ? 'i18n' : site === 'i18n-bd' ? 'i18nbd' : 'tx';
     const output = isStatus ? JSON.stringify({ status: 'success', data: { authenticated: wasAuthorized } })
       : isBegin ? JSON.stringify({ status: 'success', data: { verification_uri_complete: 'https://example.test/login', complete_token: `challenge-${++beginCount}` } })
       : isComplete ? JSON.stringify({ status: 'success', data: { login_status: completeSuccess ? 'success' : 'pending' } })
@@ -39,7 +44,7 @@ vi.mock('node:child_process', () => ({
     setTimeout(() => {
       active--;
       if (oldWrite) { mkdirSync(home, { recursive: true }); writeFileSync(join(home, 'authorized'), 'old-sdk-refresh-session'); }
-      if (isBegin && blockChallengeWrite) mkdirSync(join(home, '.botmux-login-challenge'), { recursive: true });
+      if (isBegin && blockChallengeWrite) mkdirSync(join(home, '.botmux-login-challenge.cn'), { recursive: true });
       child.stdout.emit('data', output); child.emit('close', 0);
     }, isDefault ? defaultDelay : isRegional ? regionalDelay : isBegin ? loginDelay : isComplete ? completeDelay : 1);
     return child;
@@ -81,7 +86,7 @@ describe('merged JWT lifecycle durable epoch timing', () => {
     calls.length = 0;
     const next = auth.mintBytedcliJwts(USER); await vi.advanceTimersByTimeAsync(100);
     expect(await next).not.toBeNull();
-    expect(calls.filter(c => c.args[0] === '--site')).toHaveLength(3);
+    expect(calls.filter(c => c.args.includes('get-bytecloud-jwt-token') && !c.args.includes('cn'))).toHaveLength(3);
   });
 
   it('does not reuse another durable epoch regional cache in a daemon that did not perform the revoke', async () => {
@@ -93,7 +98,7 @@ describe('merged JWT lifecycle durable epoch timing', () => {
     calls.length = 0;
     const next = auth.mintBytedcliJwts(USER); await vi.advanceTimersByTimeAsync(100);
     expect(await next).not.toBeNull();
-    expect(calls.filter(c => c.args[0] === '--site')).toHaveLength(3);
+    expect(calls.filter(c => c.args.includes('get-bytecloud-jwt-token') && !c.args.includes('cn'))).toHaveLength(3);
   });
 
   it('keeps the durable epoch fence closed after only epoch persistence succeeds', async () => {
@@ -110,7 +115,7 @@ describe('merged JWT lifecycle durable epoch timing', () => {
     expect(readFileSync(join(auth.bytedcliHomeFor(USER), '.botmux-auth-epoch'), 'utf8').trim()).toBe(String(epoch.readCliAuthEpoch(USER)));
     expect(auth.pendingBytedcliChallenge(USER)).toBeNull();
     blockChallengeWrite = false;
-    rmSync(join(auth.bytedcliHomeFor(USER), '.botmux-login-challenge'), { recursive: true, force: true });
+    rmSync(join(auth.bytedcliHomeFor(USER), '.botmux-login-challenge.cn'), { recursive: true, force: true });
     vi.resetModules(); auth = await import('../src/services/bytedcli-auth.js');
     const again = auth.beginBytedcliLogin(USER); await vi.advanceTimersByTimeAsync(10);
     expect(await again).not.toBeNull();

@@ -10,6 +10,8 @@ import { turnFailureDiagnostics } from '../services/turn-failure-diagnostics.js'
 import { canTalk, evaluateTalk } from '../im/lark/event-dispatcher.js';
 import { cancelDeploymentContinuation, deploymentContinuationClaimCurrent } from '../services/deployment-continuation.js';
 import { deploymentContinuationAuthority } from './deployment-continuation-authority.js';
+import { larkToolBindingEnabled } from '../services/trigger-user-auth.js';
+import { wrapperIdentityTools } from '../services/tool-identity-config.js';
 import { CliProgressNotifier, cliProgressNoticeCard } from '../services/cli-progress-notice.js';
 import { traexStreamCardActivity } from './stream-card-activity.js';
 import { listPendingAsks } from './ask-broker.js';
@@ -2570,9 +2572,10 @@ function isOrdinaryRecoveryTurnId(turnId: string | undefined): turnId is string 
 function scheduledContinuationTrustedCaller(
   ds: DaemonSession,
   taskId: string,
+  turnId?: string,
 ): TrustedCaller | undefined {
   const task = callbacks?.loadScheduledTaskForIdentity?.(ds.larkAppId, taskId);
-  return task ? trustedCallerForScheduledTask(task, ds.larkAppId) : undefined;
+  return task ? trustedCallerForScheduledTask(task, ds.larkAppId, turnId ? ds.session.replyTargets?.[turnId]?.automationUser : undefined) : undefined;
 }
 
 function ordinaryTurnRecoveryStillOwnsSession(ds: DaemonSession): boolean {
@@ -3037,7 +3040,8 @@ export function ensureOrdinaryTurnRecoveryAttached(
     persist: () => sessionStore.updateSession(ds.session),
     mintContinuationTurnId: logicalTurnId => mintScheduledContinuationTurnId(logicalTurnId),
     prepare: dispatch => {
-      if (isCodexAppCliId(sessionCliId(ds, botCfg)) && !parseScheduledTurnId(dispatch.logicalTurnId)) {
+      const scheduledTaskId = parseScheduledTurnId(dispatch.logicalTurnId);
+      if (isCodexAppCliId(sessionCliId(ds, botCfg)) && !scheduledTaskId) {
         if (!codexAppRecoveryCaller(ds.session, ds.larkAppId, dispatch.logicalTurnId)) {
           throw new Error('recovery_original_human_unverified');
         }
@@ -3052,8 +3056,25 @@ export function ensureOrdinaryTurnRecoveryAttached(
         sessionStore.updateSession(ds.session);
         return callbacks?.prepareRawInputTurn?.(ds, dispatch.turnId);
       }
-      return parseScheduledTurnId(dispatch.logicalTurnId)
-        ? callbacks?.prepareRawInputTurn?.(ds, dispatch.turnId) : undefined;
+      if (!scheduledTaskId) return;
+      const prior = ds.session.replyTargets?.[dispatch.logicalTurnId];
+      const snapshot = prior?.automationUser;
+      if (snapshot !== undefined) {
+        ds.session.replyTargets ??= {};
+        ds.session.replyTargets[dispatch.turnId] = { ...ds.session.replyTargets[dispatch.turnId],
+          automationUser: snapshot,
+          // The versioned decision is part of the frozen identity: a recovery
+          // re-dispatch replays the SAME admitted decision, not a re-derivation.
+          ...(prior?.toolIdentityDecision !== undefined
+            ? { toolIdentityDecision: prior.toolIdentityDecision } : {}),
+          ...(prior?.automationIdentitySource !== undefined
+            ? { automationIdentitySource: prior.automationIdentitySource } : {}),
+          ...(prior?.automationIdentityTools !== undefined
+            ? { automationIdentityTools: prior.automationIdentityTools } : {}),
+          updatedAt: new Date().toISOString() };
+        sessionStore.updateSession(ds.session);
+      }
+      return callbacks?.prepareRawInputTurn?.(ds, dispatch.turnId);
     },
     enqueue: (dispatch: OrdinaryTurnRecoveryDispatch) => {
       if (!ordinaryTurnRecoveryEligible(ds) || !ordinaryTurnRecoveryStillOwnsSession(ds)) return false;
@@ -3065,7 +3086,7 @@ export function ensureOrdinaryTurnRecoveryAttached(
       const scheduledTaskId = parseScheduledTurnId(dispatch.logicalTurnId);
       const appRecovery = isCodexAppCliId(sessionCliId(ds, botCfg));
       const trustedCaller = scheduledTaskId
-        ? scheduledContinuationTrustedCaller(ds, scheduledTaskId)
+        ? scheduledContinuationTrustedCaller(ds, scheduledTaskId, dispatch.turnId)
         : appRecovery ? codexAppRecoveryCaller(ds.session, ds.larkAppId, dispatch.logicalTurnId) : undefined;
       if (appRecovery && !trustedCaller) return false;
       // Silence comes from the frozen per-turn attribute in the persisted
@@ -7841,12 +7862,12 @@ function latestCodexRpcInputForRespawn(ds: DaemonSession): boolean | undefined {
 
 /**
  * Live-worker /restart 或崩溃恢复携带的最新 larkToolBinding 开关。
- * 三分态返回：true = 开启/默认（未配置视为开启）；null = 明确关闭；undefined = 异常保持快照不动。
+ * 三分态返回：true = 显式开启；null = 未配置或显式关闭（新契约下两者都表示
+ * 不安装应用绑定，respawn 必须清除旧绑定而不是沿用快照）；undefined = 异常保持快照不动。
  */
 export function latestLarkToolBindingForRespawn(ds: DaemonSession): boolean | null | undefined {
   try {
-    const binding = getBot(ds.larkAppId).config.larkToolBinding;
-    return binding === false ? null : true;
+    return larkToolBindingEnabled(getBot(ds.larkAppId).config) ? true : null;
   } catch {
     return undefined;
   }
@@ -14152,7 +14173,7 @@ function rememberScheduledTurnCaller(
   const taskId = parseScheduledTurnId(turnId);
   if (!taskId || caller.taskId !== taskId) return;
   const task = callbacks?.loadScheduledTaskForIdentity?.(ds.larkAppId, taskId);
-  const expected = task ? trustedCallerForScheduledTask(task, ds.larkAppId) : undefined;
+  const expected = task ? trustedCallerForScheduledTask(task, ds.larkAppId, ds.session.replyTargets?.[turnId]?.automationUser) : undefined;
   if (!expected
     || expected.requestLarkAppId !== ds.larkAppId
     || expected.requestUserOpenId !== caller.requestUserOpenId
@@ -14169,6 +14190,12 @@ function forgetScheduledTurnCaller(ds: DaemonSession, turnId: string | undefined
 }
 
 /** Reuse the daemon's normal per-turn credential publication, including scheduled authority checks. */
+/** Publish credentials before admitting a host-selected external turn. */
+export async function prepareExternalTurnIdentity(ds: DaemonSession, turnId: string): Promise<void> {
+  if (!callbacks?.prepareRawInputTurn) throw new Error('external_identity_preparation_unavailable');
+  await callbacks.prepareRawInputTurn(ds, turnId);
+}
+
 export async function prepareFailedTurnRecoveryIdentity(ds: DaemonSession, turnId: string): Promise<void> {
   if (!callbacks?.prepareRawInputTurn) throw new Error('recovery_identity_preparation_unavailable');
   await callbacks.prepareRawInputTurn(ds, turnId);
@@ -16807,8 +16834,13 @@ function forkWorkerPrepared(
     cliInstanceBinding: ds.session.cliInstanceBinding,
     // Trigger-user CLI auth: the worker needs the policy to know which tools to
     // wrap at spawn. Absent → the worker installs nothing and PATH is untouched.
+    // `identityTools` is the merged wrapper TRANSPORT scope (per-turn tools plus
+    // the fixed bot user's tools, plan §12.1): a fixed personal account stays
+    // enforceable without globally enabling sender mode. WHO executes a tool
+    // remains a daemon-side per-turn policy decision.
     ...(botCfg.triggerUserAuth ? { triggerUserAuth: botCfg.triggerUserAuth } : {}),
-    larkToolBinding: botCfg.larkToolBinding !== false,
+    ...(wrapperIdentityTools(botCfg).length ? { identityTools: wrapperIdentityTools(botCfg) } : {}),
+    larkToolBinding: larkToolBindingEnabled(botCfg),
     // Startup commands run on every fresh spawn (incl. resume) so session-only
     // settings like `/effort ultracode` are re-established. Adopt sessions are
     // observed, not driven — forkAdoptWorker intentionally omits this.
@@ -24810,7 +24842,9 @@ export function forkAdoptWorker(
     ownerOpenId: ds.ownerOpenId,
     webPort: ds.session.webPort,
     larkAppId: botCfg.larkAppId,
-    larkToolBinding: botCfg.larkToolBinding !== false,
+    ...(botCfg.triggerUserAuth ? { triggerUserAuth: botCfg.triggerUserAuth } : {}),
+    ...(wrapperIdentityTools(botCfg).length ? { identityTools: wrapperIdentityTools(botCfg) } : {}),
+    larkToolBinding: larkToolBindingEnabled(botCfg),
     // Freeze on the session transport capability: a no-transport session
     // (apiOnly bot OR HTTP virtual chat) must not even RECEIVE the real secret —
     // withholding it removes the capability rather than gating a tamperable flag

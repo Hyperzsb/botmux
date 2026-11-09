@@ -26,7 +26,7 @@ import { releaseActiveIdentityTurn } from './active-identity-turns.js';
 import { larkTransportEnabled, type DaemonSession } from './types.js';
 import { findActiveBySessionId, identityStorageModelForDaemonSession } from './worker-pool.js';
 
-export type DetachedIdentityRouteTool = 'lark-cli' | 'bytedcli' | 'codebase';
+export type DetachedIdentityRouteTool = 'lark-cli' | 'bytedcli' | 'codebase' | 'larkdev';
 export interface AuthorizedScheduledSessionContext {
   ds?: DaemonSession; session: Session; larkAppId: string; chatId: string; botConfig: BotConfig;
   scheduledTurnId: string; taskId: string; authority: ScheduleAuthorityRecord; runIdentity: ScheduledRunIdentity;

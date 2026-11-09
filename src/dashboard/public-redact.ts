@@ -157,6 +157,7 @@ export function redactSchedulesForPublic(schedules: unknown[]): unknown[] {
       ownerOpenId: _ownerOpenId,
       ownerUnionId: _ownerUnionId,
       runAsClaim: _runAsClaim,
+      runAsUser: _runAsUser,
       ...rest
     } = projected as Record<string, unknown>;
     return rest;

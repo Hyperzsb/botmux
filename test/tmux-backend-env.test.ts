@@ -1049,10 +1049,13 @@ describe('debug keep-shell wrapper end-to-end', () => {
       const script = buildDebugKeepShellScript('/bin/sh', '/home/u/.botmux/bin');
       // Syntax-check the script in /bin/sh — guards against typos in the
       // template that no test of buildDebugKeepShellScript alone would catch.
-      const syntaxCheck = spawnSync('/bin/sh', ['-n', '-c', script], {
+      // dash can execute -c strings despite -n; stdin exercises its noexec
+      // parser without running the launch or requiring positional arguments.
+      const syntaxCheck = spawnSync('/bin/sh', ['-n'], {
+        input: script,
         encoding: 'utf-8',
       });
-      expect(syntaxCheck.status).toBe(0);
+      expect(syntaxCheck.status, syntaxCheck.stderr).toBe(0);
       expect(syntaxCheck.stderr).toBe('');
 
       // Now run a non-interactive version where the trailing `exec sh -i`
@@ -1495,6 +1498,108 @@ describe('shell wrapper end-to-end (the contract spawn() builds)', () => {
       }
     },
   );
+});
+
+describe('session identity PATH after shell rcfiles', () => {
+  const bash = firstExistingPath(['/bin/bash', '/usr/bin/bash']);
+  const fish = firstExistingPath(['/bin/fish', '/usr/bin/fish', '/usr/local/bin/fish', '/opt/homebrew/bin/fish']);
+  let root: string | undefined;
+  afterEach(() => {
+    if (root) rmSync(root, { recursive: true, force: true });
+    root = undefined;
+  });
+
+  function pathFixture() {
+    root = mkdtempSync(join(tmpdir(), 'pane-identity-path-'));
+    const identityBin = join(root, "identity's bin");
+    const botmuxBin = join(root, "botmux's bin");
+    const customBin = join(root, "rc's custom", 'bin');
+    const explicitBin = join(root, "explicit's bin");
+    for (const dir of [identityBin, botmuxBin, customBin, explicitBin]) mkdirSync(dir, { recursive: true });
+    const command = (dir: string, name: string, output: string) => {
+      writeFileSync(join(dir, name), `#!/bin/sh\nprintf '%s\\n' ${shellSingleQuote(output)}\n`, { mode: 0o755 });
+    };
+    command(identityBin, 'lark-cli', 'session-identity');
+    command(botmuxBin, 'botmux', 'current-botmux');
+    command(customBin, 'lark-cli', 'native-lark');
+    command(customBin, 'botmux', 'stale-botmux');
+    command(customBin, 'rc-only-tool', 'rc-tool');
+    command(explicitBin, 'explicit-only-tool', 'explicit-tool');
+    return { home: root, identityBin, botmuxBin, customBin, explicitBin };
+  }
+
+  it.skipIf(!bash).each(['inherited', 'legacy', 'explicit', 'debug'] as const)(
+    'executes the %s launch with the intended wrappers and tool directories', mode => {
+      const paths = pathFixture();
+      // The directory exists only in the user's rcfile, never daemon PATH.
+      // Both host-resolved prefixes contain apostrophes and spaces.
+      writeFileSync(join(paths.home, '.bashrc'), `export PATH=${shellSingleQuote(paths.customBin)}:"$PATH"\n`);
+      const identityBin = mode === 'legacy' ? undefined : paths.identityBin;
+      const tool = mode === 'explicit' ? 'explicit-only-tool' : 'rc-only-tool';
+      const probe = `printf '%s\\n' "$PATH"; lark-cli; botmux; ${tool}`;
+      const debugShell = join(paths.home, "debug's shell");
+      if (mode === 'debug') {
+        writeFileSync(debugShell, `#!/bin/sh\nprintf '%s\\n' debug-stage\n${probe}\n`, { mode: 0o755 });
+      }
+      const script = mode === 'debug'
+        ? buildDebugKeepShellScript(debugShell, paths.botmuxBin, 'bash', identityBin)
+        : shellWrapperScript(paths.botmuxBin, 'bash', identityBin);
+      // Explicit PATH has already been prefixed by the trusted Worker. The
+      // backend must still honor this operator-selected PATH at env injection.
+      const injectEnv = mode === 'explicit'
+        ? { PATH: `${paths.identityBin}:${paths.botmuxBin}:${paths.explicitBin}:/usr/bin:/bin` }
+        : undefined;
+      const [command, ...prefix] = shellLaunchArgv(bash!, ['-i']);
+      const result = spawnSync(command!, [
+        ...prefix, '-c', script, '_', paths.home,
+        ...buildBotmuxEnvAssignments(identityBin ? { BOTMUX_IDENTITY_BIN: identityBin } : {}, injectEnv),
+        '/bin/sh', '-c', probe,
+      ], {
+        encoding: 'utf8', timeout: 5000,
+        env: { HOME: paths.home, PATH: '/usr/bin:/bin', BOTMUX_IDENTITY_BIN: '/stale/identity' },
+      });
+      expect(result.status, result.stderr || String(result.error ?? '')).toBe(0);
+      const lines = result.stdout.trimEnd().split('\n');
+      const effectivePath = lines[0]!.split(':');
+      expect(effectivePath.slice(0, 2)).toEqual(mode === 'legacy'
+        ? [paths.botmuxBin, paths.customBin] : [paths.identityBin, paths.botmuxBin]);
+      expect(lines.slice(1, 4)).toEqual([
+        mode === 'legacy' ? 'native-lark' : 'session-identity',
+        'current-botmux', mode === 'explicit' ? 'explicit-tool' : 'rc-tool',
+      ]);
+      expect(effectivePath).toContain(mode === 'explicit' ? paths.explicitBin : paths.customBin);
+      if (mode === 'debug') {
+        // Execute the real trailing exec contract instead of editing its text:
+        // the interactive-shell executable receives the preserved PATH too.
+        expect(lines[4]).toBe('debug-stage');
+        expect(lines.slice(5)).toEqual(lines.slice(0, 4));
+      }
+    },
+  );
+
+  it.skipIf(!fish)('fish preserves config.fish tool directories behind the host-resolved wrappers', () => {
+    const paths = pathFixture();
+    const fishConfig = join(paths.home, '.config', 'fish');
+    mkdirSync(fishConfig, { recursive: true });
+    const fishQuote = (value: string) => `'${value.replace(/\\/g, '\\\\').replace(/'/g, "\\'")}'`;
+    writeFileSync(join(fishConfig, 'config.fish'), `set -gx PATH ${fishQuote(paths.customBin)} $PATH\n`);
+    const script = shellWrapperScript(paths.botmuxBin, 'fish', paths.identityBin);
+    const [command, ...prefix] = shellLaunchArgv(fish!, ['-i']);
+    const result = spawnSync(command!, [
+      ...prefix, '-c', script, paths.home,
+      ...buildBotmuxEnvAssignments({ BOTMUX_IDENTITY_BIN: paths.identityBin }),
+      '/bin/sh', '-c', 'printf "%s\\n" "$PATH"; lark-cli; botmux; rc-only-tool',
+    ], {
+      encoding: 'utf8', timeout: 5000,
+      env: { HOME: paths.home, XDG_CONFIG_HOME: join(paths.home, '.config'), PATH: '/usr/bin:/bin', TERM: 'xterm' },
+    });
+    expect(result.status, result.stderr || String(result.error ?? '')).toBe(0);
+    const lines = result.stdout.trimEnd().split('\n');
+    const effectivePath = lines[0]!.split(':');
+    expect(effectivePath.slice(0, 2)).toEqual([paths.identityBin, paths.botmuxBin]);
+    expect(effectivePath).toContain(paths.customBin);
+    expect(lines.slice(1)).toEqual(['session-identity', 'current-botmux', 'rc-tool']);
+  });
 });
 
 describe('shellWrapperScript — host-resolved bin dir survives pane env scrub (codex P1)', () => {

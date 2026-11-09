@@ -52,7 +52,13 @@ function transpiledWorkerFunction(name: string): string {
     };
     return ts.visitNode(node, visit) as ts.FunctionDeclaration;
   }]);
-  const code = ts.createPrinter().printNode(ts.EmitHint.Unspecified, transformed.transformed[0]!, source);
+  const code = ts.createPrinter()
+    .printNode(ts.EmitHint.Unspecified, transformed.transformed[0]!, source)
+    // The extracted declaration is evaluated as a script inside `with`, not
+    // as its original ESM module. Keeping `export` makes TypeScript emit an
+    // `Object.defineProperty(exports, …)` prelude even though this harness has
+    // no module exports object.
+    .replace(/\bexport\s+(?=function\s)/, '');
   transformed.dispose();
   return ts.transpileModule(code, {
     compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },

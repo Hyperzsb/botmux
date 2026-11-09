@@ -1,3 +1,4 @@
+import { parseToolIdentityConfig } from '../services/tool-identity-config.js';
 import { defaultSummaryRangePrefs, summaryRangeFromLegacyContentTriggers } from '../services/summary-range-store.js';
 import { selectionKeyForBot } from '../setup/cli-selection.js';
 import { normalizeReplyFooter } from '../services/reply-footer.js';
@@ -8,7 +9,7 @@ import type { CliLaunchMode } from '../core/cli-launch-mode.js';
 import { GRANT_DURATION_OPTIONS } from '../services/grant-policy.js';
 import { normalizeSparseReplyStyleConfig } from './reply-style.js';
 import { normalizeAskOptionLayout } from '../im/lark/ask-option-layout.js';
-import { parseTriggerUserAuthConfig, type TriggerUserAuthConfig } from '../services/trigger-user-auth.js';
+import { parseTriggerUserAuthConfig, larkToolBindingEnabled, type TriggerUserAuthConfig } from '../services/trigger-user-auth.js';
 import type { NativeSubagentRuntimePolicy } from '../services/native-subagent-runtime-policy.js';
 import type { CodexServiceTier } from '../services/codex-service-tier.js';
 import { normalizeQuotaFallbackBotConfig } from '../services/quota-fallback.js';
@@ -243,6 +244,17 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     autoStartOnGroupJoinPrompt: typeof j?.autoStartOnGroupJoinPrompt === 'string' ? j.autoStartOnGroupJoinPrompt : '',
     autoStartOnGroupJoinSeed: typeof j?.autoStartOnGroupJoinSeed === 'string' ? j.autoStartOnGroupJoinSeed : '',
     autoStartOnGroupJoinSeedDefault: typeof j?.autoStartOnGroupJoinSeedDefault === 'string' ? j.autoStartOnGroupJoinSeedDefault : '',
+    // Bot-level automatic-turn Run as default (group entry / schedules /
+    // webhooks without a more specific selection). Sparse: null = none.
+    automationIdentity: j?.automationIdentity && typeof j.automationIdentity === 'object'
+      ? j.automationIdentity : null,
+    automationIdentityInvalid: typeof j?.automationIdentityInvalid === 'string' ? j.automationIdentityInvalid : null,
+    toolIdentity: j?.toolIdentity && typeof j.toolIdentity === 'object'
+      ? j.toolIdentity : null,
+    toolIdentityInvalid: typeof j?.toolIdentityInvalid === 'string' ? j.toolIdentityInvalid : null,
+    ...(Array.isArray(j?.automationIdentityTools)
+      ? { automationIdentityTools: j.automationIdentityTools.filter((tool: unknown): tool is string => typeof tool === 'string') }
+      : {}),
     groupJoinCommandEnabled: j?.groupJoinCommandEnabled === true,
     groupJoinCommand: typeof j?.groupJoinCommand === 'string' ? j.groupJoinCommand : '',
     autoStartOnNewTopic: j?.autoStartOnNewTopic === true,
@@ -294,7 +306,11 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     // malformed hand edit degrades to null (feature off) instead of reaching
     // form state as a half-shaped policy the toggle would misrender.
     triggerUserAuth: normalizeTriggerUserAuthForClient(j?.triggerUserAuth),
-    larkToolBinding: j?.larkToolBinding !== false,
+    // 只有显式 true 才是已绑定；未配置现在就是「不绑定」（原生宿主凭据），
+    // 不再把按人授权的开关反向映射成应用绑定（plan §3.4）。
+    larkToolBinding: larkToolBindingEnabled({
+      larkToolBinding: typeof j?.larkToolBinding === 'boolean' ? j.larkToolBinding : undefined,
+    }),
     skillInjection: (j?.skillInjection === 'global' || j?.skillInjection === 'prompt' || j?.skillInjection === 'off') ? j.skillInjection : null,
     skillInjectionDefault: (j?.skillInjectionDefault === 'global' || j?.skillInjectionDefault === 'off') ? j.skillInjectionDefault : 'prompt',
     skillInjectionSupport: (j?.skillInjectionSupport === 'dynamic' || j?.skillInjectionSupport === 'global') ? j.skillInjectionSupport : 'none',
@@ -331,12 +347,14 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
  * /api/bot-default-oncall, so fields whose saved value would otherwise be
  * misread as their default have to come from disk here. Only fields that need
  * that fidelity belong in this map; everything else keeps the payload layer's
- * normalization. `larkToolBinding` in particular is default-on, so an explicit
- * `false` dropped here renders a disabled binding back as enabled.
+ * normalization. `larkToolBinding` is opt-in (unset renders unchecked native
+ * behavior, plan §10), so only a saved `true` needs lifting here.
  */
 export function sparseOverridesFromRawBotConfig(rawEntry: any): {
   quotaFallbackBot: any;
   autoInviteOwnerOnGroupAdd: any;
+  automationIdentity: any;
+  toolIdentity: any;
   larkToolBinding: boolean | undefined;
   askOptionLayout: any;
   trustSameOwnerBots: boolean | undefined;
@@ -345,7 +363,11 @@ export function sparseOverridesFromRawBotConfig(rawEntry: any): {
   return {
     quotaFallbackBot: rawEntry?.quotaFallbackBot,
     autoInviteOwnerOnGroupAdd: rawEntry?.autoInviteOwnerOnGroupAdd,
-    larkToolBinding: typeof rawEntry?.larkToolBinding === 'boolean' ? rawEntry.larkToolBinding : undefined,
+    // Offline rows keep showing the saved selection when the daemon is down.
+    automationIdentity: rawEntry?.automationIdentity && typeof rawEntry.automationIdentity === 'object'
+      ? rawEntry.automationIdentity : null,
+    toolIdentity: parseToolIdentityConfig(rawEntry?.toolIdentity, rawEntry?.larkAppId).value ?? null,
+    larkToolBinding: rawEntry?.larkToolBinding === true ? true : false,
     askOptionLayout: rawEntry?.askOptionLayout,
     // 默认开：显式 false 不从这里带回，离线行会把已关闭的同机信任显示成开启。
     trustSameOwnerBots: typeof rawEntry?.trustSameOwnerBots === 'boolean' ? rawEntry.trustSameOwnerBots : undefined,

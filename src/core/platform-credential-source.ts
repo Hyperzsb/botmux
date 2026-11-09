@@ -22,12 +22,13 @@ import {
 } from '../platform/credential-grant-client.js';
 import { resolveUnionIdFromOpenId } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
+import { recordIdentity } from '../im/lark/identity-cache.js';
 import type { BotConfig } from '../bot-registry.js';
 import type { TriggerUserAuthTool } from '../services/trigger-user-auth.js';
-import type { LarkCliIdentity, BytedCliIdentity } from './cli-identity.js';
+import type { LarkCliIdentity, BytedCliIdentity, LarkdevIdentity } from './cli-identity.js';
 
 export type PlatformIdentityResolution =
-  | { state: 'granted'; identity: LarkCliIdentity | BytedCliIdentity; expiresAt: number }
+  | { state: 'granted'; identity: LarkCliIdentity | BytedCliIdentity | LarkdevIdentity; expiresAt: number }
   /** This machine is not bound to a platform; nothing was asked. */
   | { state: 'unbound' }
   /** The platform knows the person but has no usable credential for this tool
@@ -127,6 +128,12 @@ export function noteInboundSenderUnionId(larkAppId: string, data: unknown): void
   const sender = (data as { sender?: { sender_type?: unknown; sender_id?: { open_id?: unknown; union_id?: unknown } } } | null)?.sender;
   if (!sender || sender.sender_type !== 'user') return;
   noteSenderUnionId(larkAppId, sender.sender_id?.open_id, sender.sender_id?.union_id);
+  const openId = sender.sender_id?.open_id;
+  const unionId = sender.sender_id?.union_id;
+  if (typeof openId === 'string' && OPEN_ID_RE.test(openId)) {
+    recordIdentity(larkAppId, { openId, type: 'user', source: 'sender', interactedAt: Date.now(),
+      ...(typeof unionId === 'string' && unionId.startsWith('on_') && UNION_ID_RE.test(unionId) ? { unionId } : {}) });
+  }
 }
 
 /** Same as {@link noteInboundSenderUnionId} for a pair the daemon already holds
@@ -186,7 +193,7 @@ async function lookupUnionId(larkAppId: string, openId: string, key: string, gen
  * Note `LARKSUITE_CLI_APP_ID` is the PLATFORM's Feishu app (the issuer of the
  * user token), deliberately not this bot's app id — the two differ by design.
  */
-function toIdentity(tool: TriggerUserAuthTool, variables: Record<string, string>): LarkCliIdentity | BytedCliIdentity | null {
+function toIdentity(tool: TriggerUserAuthTool, variables: Record<string, string>): LarkCliIdentity | BytedCliIdentity | LarkdevIdentity | null {
   const nonEmpty = (v: unknown): v is string => typeof v === 'string' && v.length > 0;
   if (tool === 'lark-cli') {
     const appId = variables.LARKSUITE_CLI_APP_ID;
@@ -194,10 +201,24 @@ function toIdentity(tool: TriggerUserAuthTool, variables: Record<string, string>
     if (!nonEmpty(appId) || !nonEmpty(userAccessToken)) return null;
     return { tool, appId, userAccessToken };
   }
+  if (tool === 'larkdev') {
+    const cloudJwts: LarkdevIdentity['cloudJwts'] = {};
+    const keys = {
+      cn: 'BYTECLOUD_CLI_API_JWT_TOKEN_CN',
+      'i18n-tt': 'BYTECLOUD_CLI_API_JWT_TOKEN_I18N_TT',
+      'i18n-bd': 'BYTECLOUD_CLI_API_JWT_TOKEN_I18N_BD',
+      'eu-ttp': 'BYTECLOUD_CLI_API_JWT_TOKEN_EU_TTP',
+      'us-ttp': 'BYTECLOUD_CLI_API_JWT_TOKEN_US_TTP',
+    } as const;
+    for (const site of Object.keys(keys) as Array<keyof typeof keys>) {
+      if (nonEmpty(variables[keys[site]])) cloudJwts[site] = variables[keys[site]];
+    }
+    return Object.keys(cloudJwts).length ? { tool, cloudJwts } : null;
+  }
   const cloudJwt = variables.BYTEDCLI_USER_CLOUD_JWT;
   if (!nonEmpty(cloudJwt)) return null;
   const codeJwt = variables.BYTEDCLI_USER_CODE_JWT;
-  return { tool, cloudJwt, ...(nonEmpty(codeJwt) ? { codeJwt } : {}) };
+  return { tool, cloudJwts: {}, cloudJwt, ...(nonEmpty(codeJwt) ? { codeJwt } : {}) };
 }
 
 /** The platform page a refused person should open (null when unbound). */

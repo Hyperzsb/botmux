@@ -12,6 +12,7 @@ import { t } from '../src/i18n/index.js';
 
 const mocks = vi.hoisted(() => ({
   forkWorker: vi.fn(),
+  publishTurnCliIdentity: vi.fn(async (..._args: any[]) => [] as any[]),
   registerHostAsk: vi.fn(),
   getAvailableBots: vi.fn(async () => []),
   getChatContext: vi.fn(async (_appId: string, chatId: string) => ({
@@ -88,6 +89,11 @@ vi.mock('../src/core/worker-pool.js', async () => {
   return { ...actual, forkWorker: mocks.forkWorker };
 });
 
+vi.mock('../src/core/turn-cli-identity.js', async () => {
+  const actual = await vi.importActual<any>('../src/core/turn-cli-identity.js');
+  return { ...actual, publishTurnCliIdentity: mocks.publishTurnCliIdentity };
+});
+
 let tempRoot = '';
 let allowJoinHook = '';
 let modules: Awaited<ReturnType<typeof loadModules>>;
@@ -128,6 +134,7 @@ beforeEach(() => {
   modules.daemon.__testOnly_setAutoStartJoinReadyMaxWaitMs();
   vi.clearAllMocks();
   mocks.forkWorker.mockReset();
+  mocks.publishTurnCliIdentity.mockReset().mockResolvedValue([]);
   mocks.getChatContext.mockImplementation(async (_appId: string, chatId: string) => ({
     chatId,
     name: '【Pippit】【BUG】测试群',
@@ -355,9 +362,9 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
     expect(firstTurn.content).toContain('<name>【Pippit】【BUG】测试群</name>');
     expect(firstTurn.content).toContain('issue/detail/123');
     expect(firstTurn.content).not.toContain('<chat_mode>');
-    // Legacy toggle (no gateRequired): the opening turn is byte-identical to
-    // pre-feature behaviour — no lifecycle block, no sender tag, no caller, and
-    // no identity-cache contact lookup.
+    // Legacy toggle (no gateRequired): no lifecycle prompt block, no sender
+    // tag. Identity resolution is independent of the gate, but this operator
+    // has no positive human evidence, so no caller is established either.
     expect(firstTurn.content).not.toContain('<botmux_group_join');
     expect(firstTurn.content).not.toContain('<sender ');
     expect(firstTurn.content).not.toContain('<turn_id>om_join_seed</turn_id>');
@@ -383,9 +390,13 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
   });
 
   it('首轮登记拉 bot 入群的操作人为 sender（schedule 身份），且保持 mention 安全方向', async () => {
-    const { daemon, registry, types } = modules;
+    const { daemon, registry, types, identities } = modules;
     const appId = 'app_join_sender';
     const chatId = 'oc_join_sender';
+    // Positive human evidence: a cached platform sender record for this app.
+    // `bot.added` alone carries no sender_type, so an unverified operator must
+    // NOT be written as isBot:false.
+    identities.recordIdentity(appId, { openId: 'ou_owner', type: 'user', source: 'sender' });
     registry.registerBot({
       larkAppId: appId,
       larkAppSecret: 's',
@@ -432,9 +443,10 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
   });
 
   it('chat 模式（非 shared）首轮同样登记操作人 sender', async () => {
-    const { daemon, registry, types } = modules;
+    const { daemon, registry, types, identities } = modules;
     const appId = 'app_join_chat_sender';
     const chatId = 'oc_join_chat_sender';
+    identities.recordIdentity(appId, { openId: 'ou_owner', type: 'user', source: 'sender' });
     registry.registerBot({
       larkAppId: appId,
       larkAppSecret: 's',
@@ -461,9 +473,10 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
   });
 
   it('话题群（thread scope）首轮同样登记操作人 sender', async () => {
-    const { daemon, registry, types } = modules;
+    const { daemon, registry, types, identities } = modules;
     const appId = 'app_join_topic_sender';
     const chatId = 'oc_join_topic_sender';
+    identities.recordIdentity(appId, { openId: 'ou_owner', type: 'user', source: 'sender' });
     mocks.getChatContext.mockImplementationOnce(async (_appId: string, targetChatId: string) => ({
       chatId: targetChatId,
       name: '话题群',
@@ -570,6 +583,149 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
     // Legacy toggle still does not inject a sender tag or call the contact cache writer.
     expect(mocks.forkWorker).toHaveBeenCalledOnce();
     expect(mocks.forkWorker.mock.calls[0]?.[1].content).not.toContain('<sender ');
+  });
+
+  it('runs the group-entry opening turn as the bot automation default, not the inviter', async () => {
+    const { daemon, registry, identities, types } = modules;
+    const appId = 'app_join_automation_default';
+    const chatId = 'oc_join_automation_default';
+    const operator = 'ou_alarm_platform_bot';
+    mocks.forkWorker.mockReturnValueOnce(true);
+    mocks.listChatMemberOpenIds.mockResolvedValue(['ou_owner']);
+    identities.recordIdentity(appId, { openId: operator, type: 'bot', source: 'sender', name: 'Alarm' });
+    registry.registerBot({
+      larkAppId: appId, larkAppSecret: 's', cliId: 'claude-code',
+      allowedUsers: ['ou_owner'], autoStartOnGroupJoin: true,
+      // 绑定是显式 opt-in（plan §3.4）：默认身份要靠托管 lark 绑定执行。
+      larkToolBinding: true,
+      automationIdentity: {
+        user: { larkAppId: appId, openId: 'ou_owner', unionId: 'on_owner' },
+        tools: ['lark-cli'],
+      },
+      defaultWorkingDir: tempDir('repo-automation-default'), regularGroupReplyMode: 'shared',
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, operator, appId);
+
+    const ds = daemon.__testOnly_activeSessions.get(types.sessionKey(chatId, appId));
+    expect(ds).toBeDefined();
+    const [, , options] = mocks.forkWorker.mock.calls[0]!;
+    expect(options.trustedCaller).toMatchObject({
+      requestLarkAppId: appId, requestUserOpenId: 'ou_owner', requestUserUnionId: 'on_owner',
+      senderType: 'user', source: 'automation',
+    });
+    // The inviter stays the event actor; it is not promoted to session owner.
+    expect(ds?.ownerOpenId).toBeUndefined();
+    expect(ds?.session.ownerOpenId).toBeUndefined();
+    expect(ds?.session.replyTargets?.['om_join_seed']).toMatchObject({
+      automationUser: { larkAppId: appId, openId: 'ou_owner', unionId: 'on_owner' },
+      automationIdentitySource: 'bot_default',
+      automationIdentityTools: ['lark-cli'],
+    });
+  });
+
+  it('refuses group-entry auto-start when the configured default cannot be enforced', async () => {
+    const { daemon, registry, identities, types } = modules;
+    const appId = 'app_join_automation_unenforceable';
+    const chatId = 'oc_join_automation_unenforceable';
+    const operator = 'ou_alarm_platform_bot';
+    identities.recordIdentity(appId, { openId: operator, type: 'bot', source: 'sender', name: 'Alarm' });
+    registry.registerBot({
+      larkAppId: appId, larkAppSecret: 's', cliId: 'claude-code',
+      allowedUsers: ['ou_owner'], autoStartOnGroupJoin: true,
+      // The default exists but this bot can no longer enforce it: the managed
+      // binding is off and per-turn auth was never enabled. Dispatching would
+      // let the worker fall through to native host credentials.
+      larkToolBinding: false,
+      automationIdentity: {
+        user: { larkAppId: appId, openId: 'ou_owner', unionId: 'on_owner' },
+        tools: ['lark-cli'],
+      },
+      defaultWorkingDir: tempDir('repo-automation-unenforceable'), regularGroupReplyMode: 'shared',
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, operator, appId);
+
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(daemon.__testOnly_activeSessions.get(types.sessionKey(chatId, appId))).toBeUndefined();
+  });
+
+  it('publishes the verified inviter identity for the exact shared opening turn', async () => {
+    const { daemon, registry, types, identities } = modules;
+    const appId = 'app_join_publish';
+    const chatId = 'oc_join_publish';
+    mocks.forkWorker.mockReturnValueOnce(true);
+    mocks.listChatMemberOpenIds.mockResolvedValue(['ou_owner']);
+    // Positive human evidence, as a real inviter who has messaged this bot has.
+    identities.recordIdentity(appId, { openId: 'ou_owner', type: 'user', source: 'sender' });
+    registry.registerBot({
+      larkAppId: appId, larkAppSecret: 's', cliId: 'claude-code',
+      allowedUsers: ['ou_owner'], autoStartOnGroupJoin: true,
+      triggerUserAuth: { enabled: true, tools: ['lark-cli', 'bytedcli', 'larkdev'], fallback: 'none' },
+      defaultWorkingDir: tempDir('repo-join-publish'), regularGroupReplyMode: 'shared',
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+
+    expect(mocks.publishTurnCliIdentity).toHaveBeenCalledWith(expect.objectContaining({
+      turnId: 'om_join_seed',
+      senderOpenId: 'ou_owner',
+      decision: expect.objectContaining({ mode: 'host', baseline: expect.objectContaining({ perTurnTools: [] }) }),
+    }));
+    expect(mocks.forkWorker).toHaveBeenCalledOnce();
+    expect(daemon.__testOnly_activeSessions.get(types.sessionKey(chatId, appId))).toBeDefined();
+  });
+
+  it.each(['shared', 'chat', 'topic'] as const)('unconfigured %s opening freezes host execution without trusting an unknown inviter', async (mode) => {
+    const { daemon, registry, types } = modules;
+    const appId = `app_join_host_${mode}`;
+    const chatId = `oc_join_host_${mode}`;
+    if (mode === 'topic') mocks.getChatContext.mockResolvedValueOnce({
+      chatId, name: 'Topic', description: '', mode: 'topic' as any, fetchStatus: 'ok',
+    });
+    registry.registerBot({
+      larkAppId: appId, larkAppSecret: 's', cliId: 'traex', allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true, defaultWorkingDir: tempDir(`host-${mode}`),
+      regularGroupReplyMode: mode === 'topic' ? undefined : mode,
+      triggerUserAuth: { enabled: true, tools: ['lark-cli', 'bytedcli', 'larkdev'], fallback: 'none' },
+    });
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_unknown_inviter', appId);
+    const ds = daemon.__testOnly_activeSessions.get(types.sessionKey(mode === 'topic' ? 'om_join_seed' : chatId, appId));
+    expect(ds).toBeDefined();
+    const target = Object.values(ds!.session.replyTargets ?? {})[0]!;
+    expect(target.senderOpenId).toBeUndefined();
+    expect(target.participants).toEqual([{ openId: 'ou_unknown_inviter' }]);
+    expect(target.toolIdentityDecision).toMatchObject({
+      authority: 'automatic', mode: 'host', source: 'none', baseline: { perTurnTools: [] },
+    });
+    expect(mocks.publishTurnCliIdentity).toHaveBeenCalledWith(expect.objectContaining({
+      senderOpenId: undefined, decision: target.toolIdentityDecision,
+    }));
+  });
+
+  it.each(['shared', 'chat', 'topic'] as const)('freezes a fixed execution user on the %s opening', async (mode) => {
+    const { daemon, registry, types } = modules;
+    const appId = `app_join_fixed_${mode}`;
+    const chatId = `oc_join_fixed_${mode}`;
+    const user = { larkAppId: appId, openId: 'ou_owner', unionId: 'on_owner' };
+    if (mode === 'topic') mocks.getChatContext.mockResolvedValueOnce({
+      chatId, name: 'Topic', description: '', mode: 'topic' as any, fetchStatus: 'ok',
+    });
+    registry.registerBot({
+      larkAppId: appId, larkAppSecret: 's', cliId: 'claude-code', allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true, defaultWorkingDir: tempDir(`fixed-${mode}`),
+      regularGroupReplyMode: mode === 'topic' ? undefined : mode,
+      triggerUserAuth: { enabled: true, tools: ['lark-cli'], fallback: 'none' },
+      toolIdentity: { user, tools: ['lark-cli'], credentialSource: 'local' },
+    });
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_unknown_inviter', appId);
+    const ds = daemon.__testOnly_activeSessions.get(types.sessionKey(mode === 'topic' ? 'om_join_seed' : chatId, appId));
+    expect(Object.values(ds!.session.replyTargets ?? {})[0]?.toolIdentityDecision).toMatchObject({
+      authority: 'automatic', mode: 'managed_user', source: 'automatic_default', user,
+    });
+    expect(mocks.publishTurnCliIdentity).toHaveBeenCalledWith(expect.objectContaining({
+      decision: expect.objectContaining({ mode: 'managed_user', user }),
+    }));
   });
 
   it('starts without sender or caller authority when the join event has no operator', async () => {
@@ -1978,7 +2134,7 @@ describe('handleBotAdded — 非 shared 首轮 turn 身份与 provenance', () =>
     });
   });
 
-  it('provenance 持久化失败时回滚会话注册，下次 bot.added 不被去重', async () => {
+  it.each(['chat', 'shared'] as const)('%s provenance 持久化失败时回滚会话注册，下次 bot.added 不被去重', async (replyMode) => {
     // 回归：首轮 turn provenance 的 sessionStore.updateSession 若抛错（文件系统/
     // 数据库瞬态失败），会话已发布到 activeSessions 且 groupJoinAnchorByChat 已
     // 登记。修复前 finally 只 settle barrier/释放 in-flight 锁，留下 active 但
@@ -1996,7 +2152,7 @@ describe('handleBotAdded — 非 shared 首轮 turn 身份与 provenance', () =>
       autoStartOnGroupJoin: true,
       autoStartOnGroupJoinPrompt: '开始排查',
       defaultWorkingDir: tempDir('repo-provenance-persist-failure'),
-      regularGroupReplyMode: 'chat',
+      regularGroupReplyMode: replyMode,
     });
 
     // 只在「带 turn provenance 的那次落盘」上注入一次瞬态失败（ENOSPC 替身）：
