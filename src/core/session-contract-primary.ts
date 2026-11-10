@@ -5,8 +5,9 @@ import type { Session } from '../types.js';
 import { sessionKey, storedSessionAnchorId } from './types.js';
 
 const primaryFacades = new Map<string, { facade: DurableSessionFacade; fence(sessionId: string): void }>();
-export function registerSessionContractPrimary(appId: string, facade: DurableSessionFacade, fence: (sessionId: string) => void): void {
-  primaryFacades.set(appId, { facade, fence });
+export function registerSessionContractPrimary(appId: string, facade: DurableSessionFacade, fence: (sessionId: string) => void): () => void {
+  const registration = { facade, fence }; primaryFacades.set(appId, registration);
+  return () => { if (primaryFacades.get(appId) === registration) primaryFacades.delete(appId); };
 }
 export function sessionContractPrimary(appId: string) { return primaryFacades.get(appId); }
 

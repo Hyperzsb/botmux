@@ -12,6 +12,7 @@ function harness(cliId = 'codex') {
   const scope: Record<string, any> = {
     isPromptReady: true, isFlushing: false, durableTurnInFlight: false,
     preserveActiveTurnAuthorityForReady: false,
+    initialInputOwnershipPending: false, spawnArgvNeedsWorkingSeed: false,
     lastInitConfig: { cliId }, effectiveBackendType: 'tmux',
     activeTurnAuthority: authority,
     pendingMessages: [

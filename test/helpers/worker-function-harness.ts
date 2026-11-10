@@ -19,8 +19,9 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { randomUUID } from 'node:crypto';
 import ts from 'typescript';
-import { contractTerminalStatus } from '../../src/services/session-contract.js';
+import { contractTerminalStatus, reusableRuntimeIdentity, samePhysicalRuntimeIdentity } from '../../src/services/session-contract.js';
 
 let parsed: ts.SourceFile | undefined;
 
@@ -76,7 +77,15 @@ export function loadWorkerFunction<T extends (...args: any[]) => any>(
   const resolve = (key: string | symbol): unknown => {
     if (key in scope) return scope[key as string];
     if (key === 'contractTerminalStatus') return contractTerminalStatus;
-    if (typeof key === 'string' && ['sessionEventMetadata', 'bindSessionObservation', 'spawnCliBody'].includes(key)) {
+    if (key === 'reusableRuntimeIdentity') return reusableRuntimeIdentity;
+    if (key === 'samePhysicalRuntimeIdentity') return samePhysicalRuntimeIdentity;
+    if (key === 'randomUUID') return randomUUID;
+    if (typeof key === 'string' && ['sessionEventMetadata', 'bindSessionObservation', 'spawnCliBody',
+      'clearObservedRuntimeBindingTimer', 'observedRuntimeBindingStillCurrent',
+      'retireObservedRuntimeBindingAttempt', 'finishObservedRuntimeBindingHandshake',
+      'publishObservedRuntimeBindingProbe', 'settleObservedRuntimeBindingProbe', 'publishObservedRuntimeBindingAttempt',
+      'startObservedRuntimeBindingAttempt', 'retryObservedRuntimeBindingAfterRefusal',
+      'settleObservedRuntimeBindingAssignment'].includes(key)) {
       if (!dependencies.has(key)) dependencies.set(key, loadWorkerFunction(key, scope));
       return dependencies.get(key);
     }

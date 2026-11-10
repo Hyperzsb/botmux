@@ -17,6 +17,11 @@ export interface RuntimeEventBinding {
   identity?: RuntimeIdentity;
 }
 interface Context { binding?: RuntimeEventBinding; execution?: ExecutionRef; operationId?: string }
+interface PendingRuntimeReady {
+  physicalId: string;
+  bindingId: string;
+  callback: () => void;
+}
 
 /** Async work keeps the binding it was created under. Live physical screen
  * callbacks opt in separately; old async callbacks never borrow current state. */
@@ -30,11 +35,18 @@ export class WorkerSessionEventScope {
   private current?: RuntimeEventBinding;
   private readonly predecessors = new Map<string, RuntimeEventBinding | undefined>();
   private readonly aborted = new Set<string>();
+  private readonly retired = new Set<string>();
   private readonly abortReports = new Map<string, { timer?: ReturnType<typeof setTimeout> }>();
+  private readonly readyDenied = new Set<string>();
+  private pendingReady?: PendingRuntimeReady;
   private sequence = 0;
   constructor(readonly session: ContractSessionRef, readonly worker: WorkerRef) {}
   beginRuntime(operationId?: string, physicalId: string = randomUUID()): RuntimeEventBinding {
     const value: RuntimeEventBinding = { bindingId: randomUUID(), physicalId, ...(operationId ? { operationId } : {}) };
+    if (this.pendingReady) {
+      if (this.pendingReady.physicalId === physicalId) this.pendingReady.bindingId = value.bindingId;
+      else this.pendingReady = undefined;
+    }
     this.predecessors.set(value.bindingId, this.current);
     this.bindings.set(value.bindingId, value); this.current = value; return value;
   }
@@ -50,8 +62,16 @@ export class WorkerSessionEventScope {
     this.aborted.add(binding.bindingId);
     if (this.current !== binding) return;
     let source = this.predecessors.get(binding.bindingId);
-    while (source && this.aborted.has(source.bindingId)) source = this.predecessors.get(source.bindingId);
+    while (source && (this.aborted.has(source.bindingId) || this.retired.has(source.bindingId))) source = this.predecessors.get(source.bindingId);
     this.current = source;
+  }
+  retireBinding(bindingId: string): boolean {
+    const binding = this.bindings.get(bindingId); if (!binding) return false;
+    this.retired.add(bindingId);
+    if (this.current !== binding) return true;
+    let source = this.predecessors.get(bindingId);
+    while (source && (this.aborted.has(source.bindingId) || this.retired.has(source.bindingId))) source = this.predecessors.get(source.bindingId);
+    this.current = source; return true;
   }
   reportAbortedStart(binding: RuntimeEventBinding, report: () => void): void {
     if (!this.aborted.has(binding.bindingId) || this.abortReports.has(binding.bindingId)) return;
@@ -68,6 +88,26 @@ export class WorkerSessionEventScope {
   refuseBinding(bindingId: string): void {
     const binding = this.bindings.get(bindingId);
     if (binding) this.restoreAfterAbortedStart(binding);
+  }
+  deferReady(binding: RuntimeEventBinding, callback: () => void): boolean {
+    if (binding.runtime || this.current !== binding || this.readyDenied.has(binding.bindingId)) return false;
+    this.pendingReady = { physicalId: binding.physicalId, bindingId: binding.bindingId, callback };
+    return true;
+  }
+  discardReady(bindingId: string): boolean {
+    this.readyDenied.add(bindingId);
+    if (this.pendingReady?.bindingId !== bindingId) return false;
+    this.pendingReady = undefined;
+    return true;
+  }
+  isReadyDenied(bindingId: string): boolean { return this.readyDenied.has(bindingId); }
+  flushReady(bindingId: string): boolean {
+    const binding = this.bindings.get(bindingId); const pending = this.pendingReady;
+    if (!binding?.runtime || this.current !== binding || this.readyDenied.has(bindingId) || !pending
+      || pending.bindingId !== bindingId || pending.physicalId !== binding.physicalId) return false;
+    this.pendingReady = undefined;
+    this.run(binding, pending.callback);
+    return true;
   }
   confirmAbortedStart(bindingId: string): void {
     const pending = this.abortReports.get(bindingId); if (!pending) return;

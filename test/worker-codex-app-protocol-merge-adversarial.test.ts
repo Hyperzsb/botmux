@@ -58,7 +58,8 @@ async function fixture() {
   scope.publishSandboxRelayCapability.mockImplementation(() => { scope.publishedOrigins.push({ turnId: scope.currentBotmuxTurnId, caller: authority.snapshot()?.caller }); });
   scope.failCodexAppControlGeneration = vi.fn(() => { scope.codexAppControlFatal = true; scope.codexAppControlProven = false; });
   for (const name of ['adoptInitialActiveTurn', 'restoreCodexAppAttestedTurn', 'waitForCodexAppEngineRoot',
-    'publishLocalProcessAttestation', 'clearCodexAppEngineIdentity']) scope[name] = loadWorkerFunction(name, scope);
+    'publishLocalProcessAttestation', 'clearCodexAppEngineIdentity',
+    'releaseUnstartedAuthorityForRemovedInput']) scope[name] = loadWorkerFunction(name, scope);
   const apply = loadWorkerFunction<(...args: any[]) => Promise<boolean>>('handleTrustedCodexAppMarker', scope);
   const state = (extra: Record<string, any> = {}) => ({ acceptingInput: true, busy: true, tracksTurn: true,
     activeReplyTurnId: 'om_original', appServerProcess: proof, ...extra });

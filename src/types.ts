@@ -2120,6 +2120,7 @@ export interface CodexAppEffortResult {
 /** Messages sent from Daemon to Worker */
 type DaemonToWorkerBase =
   | { type: 'runtime_contract_reserved'; bindingId: string; mayStart: boolean; runtime?: import('./services/session-contract.js').RuntimeRef }
+  | { type: 'runtime_binding_probe_result'; probeId: string; mayStart: boolean }
   | { type: 'runtime_binding_aborted_ack'; bindingId: string }
   /** The host refused this binding; the worker returns to its predecessor. */
   | { type: 'runtime_binding_refused'; bindingId: string }
@@ -2449,6 +2450,7 @@ export type WorkerToDaemonBase =
   | ({ type: 'codex_app_effort_result'; requestId: string } & CodexAppEffortResult)
   | ({ type: 'codex_cli_effort_result'; requestId: string } & CodexAppEffortResult)
   | { type: 'runtime_binding_started'; bindingId: string; operationId?: string }
+  | { type: 'runtime_binding_probe'; probeId: string }
   | { type: 'runtime_binding_aborted'; bindingId: string; operationId?: string }
   | { type: 'runtime_binding'; bindingId: string; identity: import('./services/session-contract.js').RuntimeIdentity; operationId?: string }
   | { type: 'worker_ipc_ready' }

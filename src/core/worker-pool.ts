@@ -22460,6 +22460,25 @@ function setupWorkerHandlers(
     // store. It cannot acquire executor control from a new worker envelope.
     if (msg.type === 'final_output_offer') return handleLegacyWorkerMessage(msg);
     const metadata = msg.sessionContract as WorkerContractContext | undefined;
+    if (msg.type === 'runtime_binding_probe') {
+      const admitted = sessionController.ingest(msg as unknown as import('./session-controller.js').ControlledWorkerMessage, contractWorker);
+      const mayStart = (): boolean => {
+        const state = sessionController.store.read(sessionController.ref);
+        const runtime = sessionController.store.runtime(sessionController.ref);
+        const binding = metadata?.bindingId
+          ? sessionController.store.binding(sessionController.ref, metadata.bindingId) : undefined;
+        return admitted.kind === 'current' && ds.worker === worker && !!state && !!runtime
+          && sameWorker(state.worker, contractWorker) && state.lifecycle === 'active' && !state.activeOperationId
+          && !!binding && sessionController.store.bindingProducer(sessionController.ref, metadata!.bindingId!, contractWorker)
+          && sameRuntime(binding.ref, state.activeRuntime) && sameRuntime(admitted.context.scope.runtime, runtime.ref)
+          && ['starting', 'ready'].includes(runtime.phase)
+          && !sessionController.store.hasPendingRuntimeReplacement(sessionController.ref, runtime.ref);
+      };
+      let allowed = mayStart();
+      if (allowed) { await sessionController.flushPrimary(); allowed = mayStart(); }
+      if (ds.worker === worker) worker.send({ type: 'runtime_binding_probe_result', probeId: msg.probeId, mayStart: allowed } as DaemonToWorker);
+      return;
+    }
     if (msg.type === 'runtime_binding_started' || msg.type === 'runtime_binding' || msg.type === 'runtime_binding_aborted') {
       if (!sessionController.admitsRegistration(msg.type, msg.bindingId, metadata, contractWorker) || ds.worker !== worker) return;
       try {
@@ -22475,7 +22494,32 @@ function setupWorkerHandlers(
               && (!state.activeOperationId || state.activeOperationId === msg.operationId) });
         }
         else if (msg.type === 'runtime_binding_aborted') {
-          if (!sessionController.abandonBinding(msg.bindingId, contractWorker, metadata!.eventId)) return;
+          const registered = sessionController.store.binding(sessionController.ref, msg.bindingId);
+          if (registered?.identity
+            && sessionController.store.bindingProducer(sessionController.ref, msg.bindingId, contractWorker)) {
+            // The worker may have crossed its operation fence after bindRuntime
+            // committed but before the assignment receipt arrived. It cannot
+            // abort a proven runtime; replay the durable assignment so its
+            // abort reporter stops and a successor can converge idempotently.
+            await sessionController.flushPrimary();
+            if (ds.worker !== worker || !sameWorker(sessionController.store.read(sessionController.ref)!.worker, contractWorker)) return;
+            worker.send({ type: 'runtime_contract_assigned', bindingId: msg.bindingId,
+              runtime: registered.ref, mayExecute: ['starting', 'ready'].includes(registered.phase),
+              executions: sessionController.store.executions(sessionController.ref).filter(execution => execution.runtime?.runtimeId === registered.ref.runtimeId).map(execution => execution.ref),
+              admissionStates: sessionController.store.executions(sessionController.ref).map(({ ref, runtime, phase }) => ({ ref, runtime, phase })) } as DaemonToWorker);
+            return;
+          }
+          let acknowledgeAbort = !registered;
+          if (registered?.phase === 'starting') {
+            acknowledgeAbort = sessionController.abandonBinding(msg.bindingId, contractWorker, metadata!.eventId);
+          } else if (registered?.phase === 'stopped' && !registered.identity
+            && sessionController.store.bindingProducer(sessionController.ref, msg.bindingId, contractWorker)) {
+            acknowledgeAbort = true;
+          }
+          if (!acknowledgeAbort) return;
+          // The ACK is a durable no-reservation proof. Replays after a lost ACK
+          // must cross the primary flush again, including the half-written case
+          // where the local row is already stopped.
           await sessionController.flushPrimary();
           if (ds.worker !== worker || !sameWorker(sessionController.store.read(sessionController.ref)!.worker, contractWorker)) return;
           worker.send({ type: 'runtime_binding_aborted_ack', bindingId: msg.bindingId });
@@ -22496,10 +22540,20 @@ function setupWorkerHandlers(
         // to that runtime's binding.
         if (msg.type === 'runtime_binding') {
           try {
-            if (sessionController.store.binding(sessionController.ref, msg.bindingId)?.phase === 'starting'
+            const registered = sessionController.store.binding(sessionController.ref, msg.bindingId);
+            let resendRefusal = registered?.phase === 'stopped' && registered.reason === 'runtime_binding_refused';
+            if (registered?.phase === 'starting'
               && sessionController.abandonBinding(msg.bindingId, contractWorker, metadata!.eventId, 'runtime_binding_refused')) {
+              resendRefusal = true;
+            }
+            if (resendRefusal) {
+              // A stopped local row is not yet an acknowledgement: the primary
+              // snapshot may still be starting after a half-completed write.
+              // Every original or replayed refusal crosses the same durable
+              // flush before the worker is allowed to stop retrying.
               await sessionController.flushPrimary();
-              if (ds.worker === worker && sameWorker(sessionController.store.read(sessionController.ref)!.worker, contractWorker)) {
+              if (ds.worker === worker
+                && sameWorker(sessionController.store.read(sessionController.ref)!.worker, contractWorker)) {
                 worker.send({ type: 'runtime_binding_refused', bindingId: msg.bindingId } as DaemonToWorker);
               }
             }

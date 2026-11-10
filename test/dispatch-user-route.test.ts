@@ -105,7 +105,8 @@ function screenReady(queue: CodexBridgeQueue, cliId = 'traex', quotaPending: unk
     stopBusyPatternIdleProbe: vi.fn(), readyGate: { shouldHold: () => false },
     awaitingPostSessionStartPromptEvidence: false, isSettlingFirstFlush: false,
     freshnessInputQueue: { onPromptReady: () => 'continue' }, spawnArgvTurnStartGateHolds: () => false,
-    spawnArgvInitialPromptBusy: false, ptyOutputGeneration: { snapshot: () => 1 },
+    spawnArgvInitialPromptBusy: false, initialInputOwnershipPending: false,
+    spawnArgvNeedsWorkingSeed: false, ptyOutputGeneration: { snapshot: () => 1 },
     backgroundTaskTracker: { pendingTurnAgents: () => 0 },
     structuredRejectedReadyEvidenceGeneration: undefined, log: vi.fn(),
     scheduleStructuredStartGraceRecheck: vi.fn(), flushQueuedInputAfterTurnStartEvidence: vi.fn(),
@@ -114,6 +115,9 @@ function screenReady(queue: CodexBridgeQueue, cliId = 'traex', quotaPending: unk
     // is inert by its first guard; stub it like the other module boundaries.
     releaseInterruptedStructuredBridgeOnFirstPrompt: vi.fn(),
     durableTurnInFlight: false, preserveActiveTurnAuthorityForReady: false,
+    // These probes model an already-submitted transcript turn, not the cold
+    // startup reservation covered by worker-ready-keeps-busy-turn-authority.
+    activeTurnAuthority: { snapshot: () => ({ started: true }) },
     releaseActiveTurnAuthority: release,
     queuedTurnAdvanceConsumedForPrompt: undefined, queuedTypeAheadTurns: [],
     syncQueuedTurnsFromMarkerDisk: () => false,

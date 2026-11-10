@@ -135,6 +135,15 @@ export function reusableRuntimeIdentity(left?: RuntimeIdentity, right?: RuntimeI
     && left.backend === right.backend && left.physicalId === right.physicalId
     && left.nativeSessionId === right.nativeSessionId && left.nativeGeneration === right.nativeGeneration;
 }
+/** A concrete identity is immutable once its binding has been confirmed. New
+ * native details may enrich a field that was previously unknown, but changing
+ * already-proven executor identity requires a fresh binding/runtime epoch. */
+export function confirmedRuntimeIdentityChanged(previous: RuntimeIdentity | undefined, next: RuntimeIdentity): boolean {
+  return !!previous && previous.proof !== 'opaque' && (previous.backend !== next.backend
+    || previous.physicalId !== next.physicalId || previous.proof !== next.proof
+    || (previous.nativeGeneration !== undefined && previous.nativeGeneration !== next.nativeGeneration)
+    || (previous.nativeSessionId !== undefined && previous.nativeSessionId !== next.nativeSessionId));
+}
 export function samePhysicalRuntimeIdentity(left?: RuntimeIdentity, right?: RuntimeIdentity): boolean {
   if (!left || !right || left.backend !== right.backend || left.physicalId !== right.physicalId || left.proof !== right.proof) return false;
   if (left.proof === 'native_generation') return left.nativeGeneration !== undefined && left.nativeGeneration === right.nativeGeneration;

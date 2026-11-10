@@ -54,7 +54,10 @@ export class SessionController {
   flushPrimary(): Promise<void> {
     if (!sessionContractPrimary(this.ref.appId)) return Promise.resolve();
     const snapshot = this.store.snapshot(this.ref);
-    const pending = this.primaryQueue.then(async () => {
+    // Preserve caller-visible failure for the write that failed, but do not
+    // poison every later retry. Registration/refusal handshakes deliberately
+    // withhold their ACK until a subsequent primary commit succeeds.
+    const pending = this.primaryQueue.catch(() => {}).then(async () => {
       if (snapshot.session.revision <= this.primaryRevision) return;
       await commitPrimarySessionContract(this.ds.session, snapshot, this.primaryRevision);
       this.primaryRevision = snapshot.session.revision;
@@ -246,7 +249,11 @@ export class SessionController {
       if (!proven || (context.scope.runtime && !sameRuntime(context.scope.runtime, proven.scope.runtime))
         || (context.scope.execution && proven.scope.execution && context.scope.execution.executionId !== proven.scope.execution.executionId)) return { kind: 'reject', reason: 'output_origin_conflict' };
     }
-    if (!context.scope.execution && typeof message.turnId === 'string' && context.scope.runtime && this.store.authorizedProducer(this.ref, context.scope.runtime, channel)) {
+    // Identity-model turnId is only a replay hint for publication after a
+    // model flip. The decision belongs to the spawn/binding, not to the queued
+    // opening execution, which intentionally has not been accepted yet.
+    if (message.type !== 'session_identity_decision' && !context.scope.execution && typeof message.turnId === 'string'
+      && context.scope.runtime && this.store.authorizedProducer(this.ref, context.scope.runtime, channel)) {
       const preliminary = this.gateway.admit(message.type, context, channel);
       if (preliminary.kind === 'reject' || preliminary.kind === 'defer') return preliminary;
       const existing = this.store.executions(this.ref, message.turnId, message.dispatchAttempt);

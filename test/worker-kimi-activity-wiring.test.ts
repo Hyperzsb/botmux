@@ -68,6 +68,7 @@ describe('Kimi activity reaches the turn it belongs to', () => {
       currentBotmuxTurnId: 'om_A', currentBotmuxDispatchAttempt: undefined,
       isPromptReady: false, isFlushing: false, durableTurnInFlight: false,
       preserveActiveTurnAuthorityForReady: false,
+      initialInputOwnershipPending: false, spawnArgvNeedsWorkingSeed: false,
       lastInitConfig: { cliId: 'kimi' }, effectiveBackendType: 'tmux',
       activeTurnAuthority: authority, pendingMessages: [], pendingRawInputs: [],
       pendingAdoptMessages: [], pendingSessionRename: null, pendingInjections: [],

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { WorkerSessionEventScope, type RuntimeEventBinding, type CapturedSessionOrigin } from './services/session-event-scope.js';
 import { admitSessionCommand } from './services/session-command-gateway.js';
-import { contractTerminalStatus, type RuntimeIdentity } from './services/session-contract.js';
+import { confirmedRuntimeIdentityChanged, contractTerminalStatus, reusableRuntimeIdentity, samePhysicalRuntimeIdentity, type RuntimeIdentity } from './services/session-contract.js';
 import { applyWorkerLaunchModel } from './core/worker-launch-model.js';
 import { readTraexEffortComposer, validateTraexTopicEffortRestart, type TraexTopicEffortRestart } from './utils/traex-session-effort.js';
 import { deploymentContinuationTemplate } from './services/deployment-continuation.js';
@@ -1971,6 +1971,179 @@ function armRpcStartupDialogDismiss(): void {
  * transcript lifecycle or user-visible state. */
 let workerSessionEventScope: WorkerSessionEventScope | undefined;
 const pendingRuntimeReservations = new Map<string, (mayStart: boolean) => void>();
+interface ObservedRuntimeBindingHandshake {
+  scope: WorkerSessionEventScope;
+  physicalId: string;
+  backend: SessionBackend | null;
+  spawnGeneration: number;
+  identity: RuntimeIdentity;
+  binding?: RuntimeEventBinding;
+  operationId?: string;
+  probeId?: string;
+  timer?: ReturnType<typeof setTimeout>;
+}
+/** Desired native identity keyed by the physical CLI lineage. A refused or
+ * stale semantic binding is only one attempt: the desired identity survives
+ * until a fresh binding is durably assigned or the physical CLI changes. */
+const observedRuntimeBindingHandshakes = new Map<string, ObservedRuntimeBindingHandshake>();
+function clearObservedRuntimeBindingTimer(handshake: ObservedRuntimeBindingHandshake): void {
+  if (handshake.timer) clearTimeout(handshake.timer);
+  handshake.timer = undefined;
+}
+function observedRuntimeBindingStillCurrent(handshake: ObservedRuntimeBindingHandshake): boolean {
+  const current = handshake.scope.currentBinding();
+  if (observedRuntimeBindingHandshakes.get(handshake.physicalId) !== handshake
+      || workerSessionEventScope !== handshake.scope
+      || backend !== handshake.backend
+      || cliSpawnGeneration !== handshake.spawnGeneration
+      || closeRequested
+      || !current
+      || current.physicalId !== handshake.physicalId) return false;
+  // nativeSessionId is a one-shot observation. After a refusal restores the
+  // launcher binding it may no longer be derivable from that predecessor, so
+  // fence the still-live physical executor here and keep the frozen native id
+  // as the desired semantic identity for the successor attempt.
+  return samePhysicalRuntimeIdentity(runtimeIdentityForContract(current), handshake.identity);
+}
+function retireObservedRuntimeBindingAttempt(
+  handshake: ObservedRuntimeBindingHandshake,
+  reportAbort: boolean,
+): void {
+  clearObservedRuntimeBindingTimer(handshake);
+  const binding = handshake.binding;
+  handshake.binding = undefined;
+  handshake.operationId = undefined;
+  if (!binding || binding.runtime || !reportAbort) return;
+  handshake.scope.restoreAfterAbortedStart(binding);
+  handshake.scope.reportAbortedStart(binding, () => send({
+    type: 'runtime_binding_aborted',
+    bindingId: binding.bindingId,
+    ...(binding.operationId ? { operationId: binding.operationId } : {}),
+  }));
+}
+function finishObservedRuntimeBindingHandshake(handshake: ObservedRuntimeBindingHandshake, reportAbort = false): void {
+  retireObservedRuntimeBindingAttempt(handshake, reportAbort);
+  handshake.probeId = undefined;
+  if (observedRuntimeBindingHandshakes.get(handshake.physicalId) === handshake) {
+    observedRuntimeBindingHandshakes.delete(handshake.physicalId);
+  }
+}
+function publishObservedRuntimeBindingProbe(handshake: ObservedRuntimeBindingHandshake): void {
+  clearObservedRuntimeBindingTimer(handshake);
+  if (!observedRuntimeBindingStillCurrent(handshake)) {
+    finishObservedRuntimeBindingHandshake(handshake, true);
+    return;
+  }
+  const current = handshake.scope.currentBinding()!;
+  const probeId = randomUUID(); handshake.probeId = probeId;
+  handshake.timer = setTimeout(() => publishObservedRuntimeBindingProbe(handshake), 1_000);
+  handshake.timer.unref?.();
+  // A refusal receipt and its retry timer can both inherit the refused
+  // binding's AsyncLocalStorage context. Freeze this read-only probe under the
+  // restored live predecessor instead, or the host will reject it forever.
+  if (handshake.scope.currentBinding() !== current || !observedRuntimeBindingStillCurrent(handshake)) {
+    finishObservedRuntimeBindingHandshake(handshake, true);
+    return;
+  }
+  handshake.scope.run(current, () => send({ type: 'runtime_binding_probe', probeId }));
+}
+function settleObservedRuntimeBindingProbe(probeId: string, mayStart: boolean): boolean {
+  const handshake = [...observedRuntimeBindingHandshakes.values()]
+    .find(candidate => candidate.probeId === probeId);
+  if (!handshake) return false;
+  if (!observedRuntimeBindingStillCurrent(handshake)) {
+    finishObservedRuntimeBindingHandshake(handshake, true);
+    return true;
+  }
+  if (!mayStart) return true;
+  clearObservedRuntimeBindingTimer(handshake);
+  handshake.probeId = undefined;
+  startObservedRuntimeBindingAttempt(handshake);
+  return true;
+}
+function publishObservedRuntimeBindingAttempt(handshake: ObservedRuntimeBindingHandshake): void {
+  const binding = handshake.binding;
+  if (!binding || !observedRuntimeBindingStillCurrent(handshake)) {
+    finishObservedRuntimeBindingHandshake(handshake, true);
+    return;
+  }
+  // A retry may only reuse the operation frozen into this binding while that
+  // exact restart is live. Once it settles, abandon the unconfirmed semantic
+  // binding and mint a clean no-operation successor. A different/new restart
+  // supersedes this observation and will publish its own CLI generation.
+  if (activeRestartAttemptId !== handshake.operationId) {
+    const retryAfterSettledRestart = !!handshake.operationId && !activeRestartAttemptId;
+    retireObservedRuntimeBindingAttempt(handshake, true);
+    if (retryAfterSettledRestart && observedRuntimeBindingStillCurrent(handshake)) {
+      publishObservedRuntimeBindingProbe(handshake);
+    } else {
+      finishObservedRuntimeBindingHandshake(handshake);
+    }
+    return;
+  }
+  handshake.scope.run(binding, () => {
+    send({ type: 'runtime_binding_started', bindingId: binding.bindingId,
+      ...(handshake.operationId ? { operationId: handshake.operationId } : {}) });
+    send({ type: 'runtime_binding', bindingId: binding.bindingId, identity: binding.identity!,
+      ...(handshake.operationId ? { operationId: handshake.operationId } : {}) });
+  });
+  if (handshake.binding !== binding) return;
+  handshake.timer = setTimeout(() => publishObservedRuntimeBindingAttempt(handshake), 1_000);
+  handshake.timer.unref?.();
+}
+function startObservedRuntimeBindingAttempt(handshake: ObservedRuntimeBindingHandshake): void {
+  clearObservedRuntimeBindingTimer(handshake);
+  handshake.probeId = undefined;
+  if (!observedRuntimeBindingStillCurrent(handshake)) {
+    finishObservedRuntimeBindingHandshake(handshake, true);
+    return;
+  }
+  const operationId = activeRestartAttemptId;
+  const binding = handshake.scope.beginRuntime(operationId, handshake.physicalId);
+  binding.identity = handshake.identity;
+  handshake.binding = binding;
+  handshake.operationId = operationId;
+  handshake.scope.enterRuntime(binding);
+  publishObservedRuntimeBindingAttempt(handshake);
+}
+function retryObservedRuntimeBindingAfterRefusal(bindingId: string): boolean {
+  const handshake = [...observedRuntimeBindingHandshakes.values()]
+    .find(candidate => candidate.binding?.bindingId === bindingId);
+  if (!handshake) return false;
+  clearObservedRuntimeBindingTimer(handshake);
+  handshake.binding = undefined;
+  handshake.operationId = undefined;
+  handshake.scope.refuseBinding(bindingId);
+  if (observedRuntimeBindingStillCurrent(handshake)) publishObservedRuntimeBindingProbe(handshake);
+  else finishObservedRuntimeBindingHandshake(handshake);
+  return true;
+}
+function settleObservedRuntimeBindingAssignment(bindingId: string, mayExecute: boolean): 'none' | 'accepted' | 'retrying' | 'rejected' {
+  const handshake = [...observedRuntimeBindingHandshakes.values()]
+    .find(candidate => candidate.binding?.bindingId === bindingId);
+  if (!handshake) return 'none';
+  clearObservedRuntimeBindingTimer(handshake);
+  const staleSettledRestart = !mayExecute && !!handshake.operationId && !activeRestartAttemptId;
+  handshake.binding = undefined;
+  handshake.operationId = undefined;
+  if (mayExecute) {
+    finishObservedRuntimeBindingHandshake(handshake);
+    return 'accepted';
+  }
+  if (staleSettledRestart) {
+    // The host has durably classified this operation-scoped attempt as
+    // retiring. Remove it from the worker's current lineage before another
+    // physical ready edge can inherit that dead scope, then publish the clean
+    // successor synchronously so an intervening edge is deferred to it.
+    handshake.scope.retireBinding(bindingId);
+    if (observedRuntimeBindingStillCurrent(handshake)) {
+      startObservedRuntimeBindingAttempt(handshake);
+      return 'retrying';
+    }
+  }
+  finishObservedRuntimeBindingHandshake(handshake);
+  return 'rejected';
+}
 const contractWriteBackends = new WeakSet<SessionBackend>();
 function hasCurrentSessionRuntime(): boolean { return !workerSessionEventScope || workerSessionEventScope.isCurrentContext(); }
 function fenceContractBackendWrites(): void {
@@ -1987,6 +2160,36 @@ function fenceContractBackendWrites(): void {
 function bindSessionRuntimeCallback<T extends (...args: any[]) => any>(callback: T, livePhysical = false): T {
   fenceContractBackendWrites();
   return workerSessionEventScope ? livePhysical ? workerSessionEventScope.bindLivePhysical(callback) : workerSessionEventScope.bind(callback) : callback;
+}
+/** A ready edge belongs to the live executor behind this backend, not to the
+ * provisional semantic identity captured while its launcher was starting.
+ * Follow same-lineage PID/native-id refinement, but let bindLivePhysical drop
+ * the callback after a genuine backend replacement with a new lineage. */
+function bindSessionRuntimeReadyCallback<T extends (...args: any[]) => any>(callback: T): T {
+  return bindSessionRuntimeCallback(((...args: Parameters<T>) => {
+    const scope = workerSessionEventScope; const binding = scope?.currentBinding();
+    if (!scope || !binding) return callback(...args);
+    const observed = runtimeIdentityForContract(binding);
+    // A fast CLI can reach its first prompt before spawnCli's final contract
+    // publication. Refine the launcher identity first so this one-shot ready
+    // edge is deferred/replayed against the real runtime instead of marooning
+    // a later replacement in `starting` forever.
+    if (!binding.runtime || confirmedRuntimeIdentityChanged(binding.identity, observed)) {
+      void publishRuntimeContract(binding);
+    }
+    const current = scope.currentBinding();
+    if (!current || current.physicalId !== binding.physicalId) return;
+    // The host can still refuse this semantic binding while a cancel/suspend
+    // is applying. Do not let ready trigger a literal input write until the
+    // exact binding is assigned; the physical ready edge follows a clean
+    // same-lineage retry, but never crosses a genuine backend replacement.
+    if (!current.runtime) {
+      scope.deferReady(current, () => callback(...args));
+      return;
+    }
+    if (scope.isReadyDenied(current.bindingId)) return;
+    return scope.run(current, () => callback(...args));
+  }) as T, true);
 }
 function bindSessionInputCallback<T extends (...args: any[]) => any>(callback: T): T {
   return ((...args: Parameters<T>) => {
@@ -2019,16 +2222,33 @@ function observeContractNativeSession(nativeSessionId: string): void {
   const scope = workerSessionEventScope;
   const active = scope?.currentBinding();
   if (!scope || !active || scope.contextBinding() !== active || !nativeSessionId) return;
-  const previous = active.identity?.nativeSessionId;
-  if (previous && previous !== nativeSessionId) {
-    const binding = scope.beginRuntime(active.operationId, active.physicalId);
-    binding.identity = { ...runtimeIdentityForContract(active), nativeSessionId };
-    scope.enterRuntime(binding);
-    send({ type: 'runtime_binding_started', bindingId: binding.bindingId });
-    send({ type: 'runtime_binding', bindingId: binding.bindingId, identity: binding.identity });
-  } else if (!previous) {
-    active.identity = { ...runtimeIdentityForContract(active), nativeSessionId };
-    send({ type: 'runtime_binding', bindingId: active.bindingId, identity: active.identity });
+  const identity = { ...runtimeIdentityForContract(active), nativeSessionId };
+  // The binding may retain the operation that created it after that operation
+  // has settled. A later native identity observation must only join a restart
+  // that is still live, otherwise the daemon correctly classifies the new
+  // runtime as historical/retiring under the stale operation id.
+  if (confirmedRuntimeIdentityChanged(active.identity, identity)) {
+    const previous = observedRuntimeBindingHandshakes.get(active.physicalId);
+    if (previous && reusableRuntimeIdentity(previous.identity, identity)
+        && previous.scope === scope && previous.backend === backend
+        && previous.spawnGeneration === cliSpawnGeneration) {
+      if (!previous.binding) startObservedRuntimeBindingAttempt(previous);
+      return;
+    }
+    if (previous) finishObservedRuntimeBindingHandshake(previous, true);
+    const handshake: ObservedRuntimeBindingHandshake = {
+      scope,
+      physicalId: active.physicalId,
+      backend,
+      spawnGeneration: cliSpawnGeneration,
+      identity,
+    };
+    observedRuntimeBindingHandshakes.set(active.physicalId, handshake);
+    startObservedRuntimeBindingAttempt(handshake);
+  } else {
+    active.identity = identity;
+    send({ type: 'runtime_binding', bindingId: active.bindingId, identity: active.identity,
+      ...(activeRestartAttemptId ? { operationId: activeRestartAttemptId } : {}) });
   }
 }
 function sessionEventMetadata(msg: WorkerToDaemon, origin?: CapturedSessionOrigin): WorkerToDaemon {
@@ -2041,8 +2261,12 @@ function sessionEventMetadata(msg: WorkerToDaemon, origin?: CapturedSessionOrigi
     if (execution) context.scope.execution = execution;
   }
   // Physical process proof is available before an opening attempt is bound.
-  // Keep its frozen runtime, without claiming execution acceptance.
-  if (msg.type === 'claude_exit' || msg.type === 'local_process_attestation') delete context.scope.execution;
+  // Keep its frozen runtime, without claiming execution acceptance. The
+  // identity storage decision is likewise a spawn/binding fact: carrying the
+  // opening turn here makes its pre-bind defer replay fail because that queued
+  // execution has deliberately not been bound yet.
+  if (msg.type === 'claude_exit' || msg.type === 'local_process_attestation'
+    || msg.type === 'session_identity_decision') delete context.scope.execution;
   return { ...msg, sessionContract: context };
 }
 function runtimeIdentityForContract(binding: RuntimeEventBinding): RuntimeIdentity {
@@ -2075,11 +2299,13 @@ async function publishRuntimeContract(binding: RuntimeEventBinding): Promise<voi
   if (!workerSessionEventScope || workerSessionEventScope.currentBinding() !== binding) return;
   const identity = runtimeIdentityForContract(binding);
   const previous = binding.identity;
-  if (previous && previous.proof !== 'opaque' && (previous.backend !== identity.backend || previous.physicalId !== identity.physicalId
-    || previous.proof !== identity.proof || (previous.nativeGeneration !== undefined && previous.nativeGeneration !== identity.nativeGeneration)
-    || (previous.nativeSessionId !== undefined && previous.nativeSessionId !== identity.nativeSessionId))) {
+  if (confirmedRuntimeIdentityChanged(previous, identity)) {
     const scope = workerSessionEventScope;
-    binding = scope.beginRuntime(binding.operationId, binding.physicalId);
+    // A binding keeps the operation that created it for historical event
+    // attribution, but an identity refinement is a new semantic binding. Do
+    // not let a restart that has already settled retire the live CLI again.
+    const operationId = binding.operationId === activeRestartAttemptId ? binding.operationId : undefined;
+    binding = scope.beginRuntime(operationId, binding.physicalId);
     scope.enterRuntime(binding);
     send({ type: 'runtime_binding_started', bindingId: binding.bindingId, ...(binding.operationId ? { operationId: binding.operationId } : {}) });
   }
@@ -6533,6 +6759,29 @@ function releaseActiveTurnAuthority(
   log(`Released active turn authority ${released.turnId?.slice(0, 12) ?? '-'} (${reason})`);
   queueMicrotask(() => { void flushPending(); });
   return true;
+}
+
+/**
+ * A reserved turn can disappear after startup readiness preserved its
+ * authority but before the literal CLI write marks it started.  Retire only
+ * that exact, still-unstarted reservation when the corresponding queue item is
+ * removed; a started turn or a newer attempt must keep its live authority.
+ */
+function releaseUnstartedAuthorityForRemovedInput(
+  reason: string,
+  input: { turnId?: string; dispatchAttempt?: number },
+): boolean {
+  if (!input.turnId) return false;
+  const active = activeTurnAuthority.snapshot();
+  if (!active || active.started
+      || active.turnId !== input.turnId
+      || active.dispatchAttempt !== input.dispatchAttempt) return false;
+  return releaseActiveTurnAuthority(reason, {
+    turnId: input.turnId,
+    ...(input.dispatchAttempt !== undefined
+      ? { dispatchAttempt: input.dispatchAttempt }
+      : {}),
+  });
 }
 
 function currentGatewayTrustedTurnIdentity(): GatewayTrustedTurnIdentity {
@@ -17525,6 +17774,10 @@ async function retireCodexAppDispatchForDurableReplay(
         pendingMessages.splice(index, 1);
       }
     }
+    releaseUnstartedAuthorityForRemovedInput('durable queued input retired', {
+      turnId,
+      dispatchAttempt,
+    });
     return true;
   }
   const reservation = codexAppTurnDispatchQueue.findExact(turnId, dispatchAttempt);
@@ -17561,6 +17814,10 @@ async function retireCodexAppDispatchForDurableReplay(
   codexAppRecoveredDispatches = codexAppRecoveredDispatches.filter(
     entry => entry.dispatchId !== dispatchId,
   );
+  releaseUnstartedAuthorityForRemovedInput('Codex App durable queued input retired', {
+    turnId,
+    dispatchAttempt,
+  });
   return true;
 }
 
@@ -19691,11 +19948,34 @@ function markPromptReady(): void {
   // this same A edge; later B output makes the observation stale. The matching
   // observation also prevents this same A edge from advancing twice to C.
   const observedQueuedAdvanceGeneration = queuedTurnAdvanceConsumedForPrompt?.outputGeneration;
+  // A cold worker can reach its empty startup prompt before init finishes
+  // materialising a QUEUED opening input.  That turn already owns a
+  // reservation, but it has not crossed the literal CLI submission edge yet.
+  // This ready is therefore transport/startup readiness, not that turn's
+  // terminal boundary: revoking it here leaves the real first tool call with
+  // no live execution authority.  The startup ready may land either while
+  // init still owns prompt placement, or just after init puts the prompt at
+  // the queue head and hands ownership to flushPending. Keep both sides of
+  // that handoff covered until markActiveTurnStarted records the real write.
+  //
+  // Do not infer this from `started === false` alone.  An argv-baked opening
+  // prompt is submitted by backend.spawn while init still awaits spawnCli();
+  // its fast first ready can be the REAL completion edge even though the late
+  // init bookkeeping has not called markActiveTurnStarted yet.  In that case
+  // spawnArgvNeedsWorkingSeed is already armed before the backend starts, so
+  // the ready must release/revoke the old origin instead of preserving it.
+  const openingAuthority = activeTurnAuthority.snapshot();
+  const openingQueuedTurnAwaitingSubmission = !spawnArgvNeedsWorkingSeed
+    && openingAuthority?.started === false
+    && (initialInputOwnershipPending
+      || (!!openingAuthority.turnId
+        && pendingMessages[0]?.turnId === openingAuthority.turnId
+        && pendingMessages[0]?.dispatchAttempt === openingAuthority.dispatchAttempt));
   const readyTransition = (syncedFromDisk: boolean) => decideQueuedReadyTransition({
     observedOutputGeneration: observedQueuedAdvanceGeneration,
     currentOutputGeneration: ptyOutputGeneration.snapshot(),
     durableTurnInFlight,
-    preserveActiveTurnAuthority: preserveActiveTurnAuthorityForReady,
+    preserveActiveTurnAuthority: preserveActiveTurnAuthorityForReady || openingQueuedTurnAwaitingSubmission,
     syncedFromDisk,
     hasQueuedTurn: queuedTypeAheadTurns.length > 0,
   });
@@ -21082,6 +21362,7 @@ async function flushPending(): Promise<void> {
       const item = freshnessInputQueue.takeNormal();
       if (!item) break;
       if (workerSessionEventScope && !workerSessionEventScope.canSubmit(item.turnId, item.dispatchAttempt)) {
+        releaseUnstartedAuthorityForRemovedInput('queued input rejected before CLI write', item);
         if (item.turnId) send({ type: 'turn_input_rejected', turnId: item.turnId, ...(item.dispatchAttempt !== undefined ? { dispatchAttempt: item.dispatchAttempt } : {}), reason: 'execution_reconciliation_required' });
         continue;
       }
@@ -29004,7 +29285,7 @@ async function spawnCliBody(
     if (backend !== observedBackend) return;
     send({ type: 'remote_usage', usage });
   }));
-  backend.onReady?.(bindSessionRuntimeCallback(() => {
+  backend.onReady?.(bindSessionRuntimeReadyCallback(() => {
     if (backend !== observedBackend || fatalWorkerErrorPending) return;
     if (effectiveBackendType === 'remote-runner') {
       if (remoteRunnerRecoveredTurnInFlight && currentBotmuxTurnId) {
@@ -34285,7 +34566,13 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       break;
     }
     case 'runtime_binding_refused': {
-      workerSessionEventScope?.refuseBinding(msg.bindingId);
+      if (!retryObservedRuntimeBindingAfterRefusal(msg.bindingId)) {
+        workerSessionEventScope?.refuseBinding(msg.bindingId);
+      }
+      break;
+    }
+    case 'runtime_binding_probe_result': {
+      settleObservedRuntimeBindingProbe(msg.probeId, msg.mayStart);
       break;
     }
     case 'runtime_contract_reserved': {
@@ -34300,10 +34587,25 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       break;
     }
     case 'runtime_contract_assigned': {
+      // An operation-drifted provisional binding may already have started its
+      // durable abort reporter before this delayed assignment arrives. The
+      // assignment itself proves the host persisted a terminal answer for that
+      // binding, so stop the abort retry even if a fresh successor is current.
+      workerSessionEventScope?.confirmAbortedStart(msg.bindingId);
       workerSessionEventScope?.assign(msg.bindingId, msg.runtime);
       for (const state of msg.admissionStates ?? []) workerSessionEventScope?.noteAdmission(state);
       for (const execution of msg.executions ?? []) workerSessionEventScope?.rememberExecution(execution);
-      if (!msg.mayExecute) { closeRequested = true; stopBridgeWatcher(); stopScreenshotLoop(); killCli(); }
+      const observedAssignment = settleObservedRuntimeBindingAssignment(msg.bindingId, msg.mayExecute);
+      // A negative receipt is terminal for this exact semantic binding. Keep
+      // that tombstone even if a stale positive receipt arrives later, but do
+      // it after observed-assignment settlement: a same-physical retry has
+      // already transferred the one-shot ready edge to its clean successor.
+      if (!msg.mayExecute) workerSessionEventScope?.discardReady(msg.bindingId);
+      if (msg.mayExecute) workerSessionEventScope?.flushReady(msg.bindingId);
+      if (!msg.mayExecute && observedAssignment !== 'retrying'
+          && workerSessionEventScope?.currentBinding()?.bindingId === msg.bindingId) {
+        closeRequested = true; stopBridgeWatcher(); stopScreenshotLoop(); killCli();
+      }
       break;
     }
 
@@ -34951,6 +35253,10 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
             pendingMessages.splice(i, 1);
           }
         }
+        releaseUnstartedAuthorityForRemovedInput('recovery-held durable queued input retired', {
+          turnId: msg.turnId,
+          dispatchAttempt: msg.dispatchAttempt,
+        });
         ambiguousSubmissionRecoveryHold = null;
         log(
           `Expiring recovery-held durable input turn=${msg.turnId.slice(0, 12)} `

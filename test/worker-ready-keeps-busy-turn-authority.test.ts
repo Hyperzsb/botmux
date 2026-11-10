@@ -13,19 +13,28 @@ import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 function harness(opts: {
   backgroundAgents?: number;
   argvPromptBusy?: boolean;
+  argvPromptNeedsWorkingSeed?: boolean;
+  activeTurnStarted?: boolean;
+  initialInputOwnershipPending?: boolean;
   pendingMessages?: unknown[];
   queuedTypeAheadTurns?: unknown[];
 } = {}) {
   const caller = { requestUserOpenId: 'owner', requestLarkAppId: 'app', senderType: 'user' as const };
   const authority = new ActiveTurnAuthority();
   authority.reserve({ turnId: 'turn-a', caller });
-  authority.markStarted({ turnId: 'turn-a', caller });
+  if (opts.activeTurnStarted !== false) authority.markStarted({ turnId: 'turn-a', caller });
   const scope: Record<string, any> = {
+    sessionId: 'sid',
     isPromptReady: false, isFlushing: false, durableTurnInFlight: false,
     preserveActiveTurnAuthorityForReady: false,
+    initialInputOwnershipPending: opts.initialInputOwnershipPending === true,
     lastInitConfig: { cliId: 'claude-code' }, effectiveBackendType: 'tmux',
     activeTurnAuthority: authority,
-    releaseActiveTurnAuthority: vi.fn(() => authority.clear()),
+    sandboxRelayCapability: { token: 'old-token', turnId: 'turn-a' },
+    sandboxPolicyCapability: 'policy-token',
+    currentVcMeetingImTurnOrigin: undefined,
+    readIsolationOriginChannelId: undefined,
+    unlinkManagedOriginCapabilityFiles: vi.fn(),
     pendingMessages: opts.pendingMessages ?? [], pendingRawInputs: [], pendingAdoptMessages: [], pendingSessionRename: null,
     pendingInjections: [],
     queuedTurnAdvanceConsumedForPrompt: undefined,
@@ -34,7 +43,7 @@ function harness(opts: {
     inflightInputs: { onTurnComplete: vi.fn() },
     backgroundTaskTracker: { pendingTurnAgents: () => opts.backgroundAgents ?? 0 },
     spawnArgvInitialPromptBusy: opts.argvPromptBusy === true,
-    spawnArgvNeedsWorkingSeed: false,
+    spawnArgvNeedsWorkingSeed: opts.argvPromptNeedsWorkingSeed === true,
     renderer: { snapshot: () => ({ content: '' }) },
     idleDetector: { isStartupPending: () => false, adoptPromptReady: vi.fn(), reset: vi.fn() },
     freshnessInputQueue: { onPromptReady: vi.fn() },
@@ -60,10 +69,88 @@ function harness(opts: {
     'judgeClaudeBridgeTurn', 'settleSessionRenameOnPrompt', 'releaseRawInputRestartGate',
     'maybeEmitWorkflowTranscriptOutput', 'send', 'refreshBackgroundWait', 'settleRestartAttemptOnReady',
     'advanceQueuedTypeAheadTurn']) scope[name] = vi.fn();
+  scope.completeManagedTurnOriginRevocation = loadWorkerFunction(
+    'completeManagedTurnOriginRevocation',
+    scope,
+  );
+  scope.releaseActiveTurnAuthority = vi.fn(loadWorkerFunction(
+    'releaseActiveTurnAuthority',
+    scope,
+  ));
   return scope;
 }
 
 describe('a prompt-ready edge that is not the turn boundary keeps the turn authority', () => {
+  it('keeps a cold-start opening turn that is reserved but not submitted yet', () => {
+    const h = harness({ activeTurnStarted: false, initialInputOwnershipPending: true });
+    loadWorkerFunction('markPromptReady', h)();
+    expect(h.isPromptReady).toBe(true);
+    expect(h.releaseActiveTurnAuthority).not.toHaveBeenCalled();
+    expect(h.activeTurnAuthority.snapshot()).toMatchObject({
+      turnId: 'turn-a',
+      started: false,
+    });
+  });
+
+  it('keeps the opening turn after init queues it but before the literal CLI write', () => {
+    const h = harness({
+      activeTurnStarted: false,
+      initialInputOwnershipPending: false,
+      pendingMessages: [{ content: 'opening prompt', turnId: 'turn-a' }],
+    });
+    loadWorkerFunction('markPromptReady', h)();
+    expect(h.isPromptReady).toBe(true);
+    expect(h.releaseActiveTurnAuthority).not.toHaveBeenCalled();
+    expect(h.activeTurnAuthority.snapshot()).toMatchObject({
+      turnId: 'turn-a',
+      started: false,
+    });
+  });
+
+  it('releases a fast-completed argv opening turn even before late init marks it started', () => {
+    const h = harness({
+      activeTurnStarted: false,
+      initialInputOwnershipPending: true,
+      argvPromptNeedsWorkingSeed: true,
+    });
+    loadWorkerFunction('markPromptReady', h)();
+
+    expect(h.releaseActiveTurnAuthority).toHaveBeenCalledWith('prompt_ready');
+    expect(h.activeTurnAuthority.snapshot()).toBeUndefined();
+    expect(h.sandboxRelayCapability).toBeNull();
+    expect(h.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'managed_turn_origin_revoked',
+      sessionId: 'sid',
+      capability: 'old-token',
+      turnId: 'turn-a',
+    }));
+    expect(h.unlinkManagedOriginCapabilityFiles).toHaveBeenCalledOnce();
+
+    const oldDataDir = process.env.SESSION_DATA_DIR;
+    process.env.SESSION_DATA_DIR = '/tmp';
+    try {
+      const authorizeManagedSend = loadWorkerFunction('authorizeManagedSend', h);
+      expect(authorizeManagedSend({ capability: 'old-token' })).toEqual({
+        ok: false,
+        error: 'origin_mismatch: relay capability is stale or missing',
+      });
+    } finally {
+      if (oldDataDir === undefined) delete process.env.SESSION_DATA_DIR;
+      else process.env.SESSION_DATA_DIR = oldDataDir;
+    }
+  });
+
+  it('does not preserve an unstarted reservation for a different queued turn', () => {
+    const h = harness({
+      activeTurnStarted: false,
+      initialInputOwnershipPending: false,
+      pendingMessages: [{ content: 'different turn', turnId: 'turn-b' }],
+    });
+    loadWorkerFunction('markPromptReady', h)();
+    expect(h.releaseActiveTurnAuthority).toHaveBeenCalledWith('prompt_ready');
+    expect(h.activeTurnAuthority.snapshot()).toBeUndefined();
+  });
+
   it('keeps it while background agents of the turn are still running', () => {
     const h = harness({ backgroundAgents: 1 });
     loadWorkerFunction('markPromptReady', h)();

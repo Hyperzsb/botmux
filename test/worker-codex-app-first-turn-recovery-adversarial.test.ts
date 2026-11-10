@@ -27,6 +27,10 @@ function fixture() {
     isCodexAppCliId: (id: string) => id === 'codex-app', pendingMessages: [],
   };
   scope.adoptInitialActiveTurn = loadWorkerFunction('adoptInitialActiveTurn', scope);
+  scope.releaseUnstartedAuthorityForRemovedInput = loadWorkerFunction(
+    'releaseUnstartedAuthorityForRemovedInput',
+    scope,
+  );
   const restore = loadWorkerFunction<(turn: unknown, control?: any) => void>('restoreCodexAppAttestedTurn', scope);
   const retire = loadWorkerFunction<(turn: string, attempt: number) => Promise<boolean>>('retireCodexAppDispatchForDurableReplay', scope);
   return { entry, queue, authority, scope, restore, retire };

@@ -1608,11 +1608,23 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
   const peer = await resolveLoopbackPeerProcesses({
     remoteAddress: req.socket.remoteAddress, remotePort: req.socket.remotePort, localPort: req.socket.localPort,
   });
-  if (!peer.ok) return jsonRes(res, 403, blocked);
+  if (!peer.ok) {
+    logger.warn(`[${sessionId.slice(0, 8)}] Current execution identity peer was not resolved: ${peer.reason}`);
+    return jsonRes(res, 403, blocked);
+  }
   const document = resolveDaemonCurrentExecution({ sessionId, peer: peer.peer, findSession: findActiveBySessionId });
   if (document) {
     const ds = findActiveBySessionId(sessionId);
-    if (!ds || identityStorageModelForDaemonSession(ds) !== 'proven') return jsonRes(res, 403, blocked);
+    if (!ds || identityStorageModelForDaemonSession(ds) !== 'proven') {
+      const report = ds?.reportedIdentityModel;
+      logger.warn(
+        `[${sessionId.slice(0, 8)}] Current execution identity storage model is not proven: `
+        + `report=${report?.model ?? 'missing'} reportGeneration=${report?.workerGeneration ?? '-'} `
+        + `currentGeneration=${ds?.workerGeneration ?? '-'} `
+        + `conflict=${ds ? identityDecisionConflict(ds) ?? report?.conflict ?? '-' : '-'}`,
+      );
+      return jsonRes(res, 403, blocked);
+    }
     const identityTurnId = document.identityTurnId ?? document.turnId;
     // A workflow handoff's delegation is re-checked on every use: once its
     // attempt ended or it was withdrawn, this turn's tool refuses from now on
@@ -1681,6 +1693,16 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
       identityTurnId: detached.identityTurnId, env: detached.env,
     });
   }
+  const ds = findActiveBySessionId(sessionId);
+  logger.warn(
+    `[${sessionId.slice(0, 8)}] Current execution identity lineage was not verified: `
+    + `peer=${peer.peer.pid}:${peer.peer.procStart} status=${ds?.session.status ?? 'missing'} `
+    + `workerGeneration=${ds?.workerGeneration ?? '-'} `
+    + `origin=${ds?.managedTurnOrigin?.turnId ?? '-'} `
+    + `originProcesses=${ds?.managedTurnOrigin?.preexistingProcessIdentities?.length ?? 0} `
+    + `cli=${ds?.localProcessAttestation?.cliPid ?? '-'}:${ds?.localProcessAttestation?.cliProcStart ?? '-'} `
+    + `engine=${ds?.localProcessAttestation?.enginePid ?? '-'}:${ds?.localProcessAttestation?.engineProcStart ?? '-'}`,
+  );
   return jsonRes(res, 403, blocked);
 });
 
