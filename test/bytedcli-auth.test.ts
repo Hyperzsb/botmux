@@ -219,6 +219,24 @@ describe('login — device code, in two steps', () => {
     expect(calls[0].args.slice(0, 2)).toEqual(['--site', 'i18n-bd']);
   });
 
+  it('accepts the idempotent already-authenticated result without creating a challenge', async () => {
+    const mod = await fresh();
+    replies = [{
+      code: 0,
+      stdout: envelope({
+        login_status: 'success',
+        already_authenticated: true,
+        message: 'Already authenticated',
+      }),
+    }];
+
+    expect(await mod.beginBytedcliLogin(ALICE, 'i18n-bd')).toEqual({
+      site: 'i18n-bd',
+      alreadyAuthenticated: true,
+    });
+    expect(mod.pendingBytedcliChallenge(ALICE, 'i18n-bd')).toBeNull();
+  });
+
   it('reuses an unfinished login instead of creating another link', async () => {
     const mod = await fresh();
     replies = [{

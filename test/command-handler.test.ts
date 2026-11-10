@@ -6057,6 +6057,20 @@ describe('handleCommand', () => {
         expect(text).toContain('和飞书 /login 是两回事');
       });
 
+      it('reports an existing bytedcli login as authorized without asking for another challenge', async () => {
+        vi.mocked(beginBytedcliLogin).mockResolvedValueOnce({
+          site: 'i18n-bd',
+          alreadyAuthenticated: true,
+        });
+        const deps = makeDeps(makeDaemonSession());
+        await handleCommand('/login', ROOT_ID, makeLarkMessage('/login bytedcli i18n-bd'), deps, LARK_APP_ID);
+
+        const text = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+        expect(text).toContain('授权已保存');
+        expect(text).not.toContain('/login bytedcli i18n-bd done');
+        expect(text).not.toContain('无法发起');
+      });
+
       it('requires an explicit supported site', async () => {
         for (const command of ['/login bytedcli', '/login bytedcli unknown']) {
           const deps = makeDeps(makeDaemonSession());

@@ -3834,6 +3834,10 @@ export async function handleCommand(
             await sessionReply(rootId, t('cmd.login.bytedcli_begin_failed', { site, detail: `bytedcli --site ${site} auth login --begin` }, loc));
             break;
           }
+          if (started.alreadyAuthenticated) {
+            await sessionReply(rootId, bytedcliLoginSuccessReply(botCfg2, loc, site));
+            break;
+          }
           await sessionReply(rootId, [
             t('cmd.login.bytedcli_title', { site }, loc),
             '',

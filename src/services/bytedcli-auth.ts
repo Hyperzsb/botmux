@@ -250,7 +250,20 @@ export interface BytedcliLoginChallenge {
   authUrl: string;
   /** Opaque token that resumes this login; valid about an hour. */
   completeToken: string;
+  /** Present only on the idempotent success result returned by newer bytedcli. */
+  alreadyAuthenticated?: never;
 }
+
+export interface BytedcliAlreadyAuthenticated {
+  /** Canonical ByteCloud credential site whose existing login is usable. */
+  site: ByteCloudUserSite;
+  /** Newer bytedcli returns this instead of a challenge when login is already valid. */
+  alreadyAuthenticated: true;
+  authUrl?: never;
+  completeToken?: never;
+}
+
+export type BytedcliLoginBeginResult = BytedcliLoginChallenge | BytedcliAlreadyAuthenticated;
 
 /**
  * Start a login for one person and return the link to send them. An unfinished,
@@ -260,12 +273,12 @@ export interface BytedcliLoginChallenge {
  * instead of holding a terminal open waiting for a scan, which is the only
  * shape that works when the person authorizing is on the other side of a chat.
  */
-const beginnings = new Map<string, Promise<BytedcliLoginChallenge | null>>();
+const beginnings = new Map<string, Promise<BytedcliLoginBeginResult | null>>();
 
 export async function beginBytedcliLogin(
   openId: string,
   site: ByteCloudUserSite,
-): Promise<BytedcliLoginChallenge | null> {
+): Promise<BytedcliLoginBeginResult | null> {
   const key = `${openId}\0${site}`;
   const existing = beginnings.get(key);
   if (existing) return existing;
@@ -274,7 +287,7 @@ export async function beginBytedcliLogin(
   try { return await work; } finally { beginnings.delete(key); }
 }
 
-async function beginLogin(openId: string, site: ByteCloudUserSite): Promise<BytedcliLoginChallenge | null> {
+async function beginLogin(openId: string, site: ByteCloudUserSite): Promise<BytedcliLoginBeginResult | null> {
   const pending = pendingBytedcliLogin(openId, site);
   if (pending?.authUrl) return pending;
 
@@ -288,6 +301,11 @@ async function beginLogin(openId: string, site: ByteCloudUserSite): Promise<Byte
     ? data.verification_uri_complete
     : undefined;
   const completeToken = typeof data?.complete_token === 'string' ? data.complete_token : undefined;
+  if (ok && env?.status === 'success'
+    && data?.login_status === 'success' && data?.already_authenticated === true) {
+    clearChallenge(openId, site);
+    return { site, alreadyAuthenticated: true };
+  }
   if (!ok || env?.status !== 'success' || !authUrl || !completeToken) {
     logger.warn('[bytedcli-auth] could not start a login; provider failed or returned an invalid challenge');
     return null;
