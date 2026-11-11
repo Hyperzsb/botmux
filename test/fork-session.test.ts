@@ -267,6 +267,11 @@ describe('turnStartingCardStatus', () => {
     expect(turnStartingCardStatus(steered, 'codex-app')).toBe('working');
   });
 
+  it('starts a live TRAE turn as working when the worker is already working', () => {
+    const live = makeSourceDs({ cliId: 'traex' }, { workerReady: true, lastScreenStatus: 'working' });
+    expect(turnStartingCardStatus(live, 'traex')).toBe('working');
+  });
+
   // Unlike Grok (which projects working after init regardless of status),
   // Codex App must additionally observe `working`: a fresh turn on an
   // initialized-but-idle worker is a real cold turn and stays `starting` until
