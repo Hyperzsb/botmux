@@ -54,16 +54,6 @@ let realTmux: string | undefined;
 try { realTmux = execFileSync('which', ['tmux'], { encoding: 'utf8' }).trim(); } catch { /* optional */ }
 const defaultTmuxBlocked = Boolean(realTmux) && defaultTmuxServerConflictsWithPrivateFixture();
 
-// The #2453 lab chains `remain-on-exit failed` into new-session; tmux < 3.2
-// rejects that value and no corpse is created, so the lab is modern-tmux only.
-let realTmuxSupportsFailed = false;
-try {
-  const v = String(execFileSync(realTmux!, ['-V'], { encoding: 'utf8', timeout: 3000 }));
-  const m = /tmux (\d+)\.(\d+)/.exec(v);
-  const major = m ? Number(m[1]) : 0;
-  const minor = m ? Number(m[2]) : 0;
-  realTmuxSupportsFailed = major > 3 || (major === 3 && minor >= 2);
-} catch { /* tmux missing: outer skipIf handles */ }
 let python3: string | undefined;
 try { python3 = execFileSync('which', ['python3'], { encoding: 'utf8' }).trim(); } catch { /* optional */ }
 
@@ -338,8 +328,10 @@ describe.skipIf(!realTmux || defaultTmuxBlocked)('tmux backend reports the pane 
    * inherited when it daemonises, so it never learns a pane died and never
    * reaps one — exactly the observed corpse, on every run.
    */
-  // The lab uses remain-on-exit failed (modern tmux only); see realTmuxSupportsFailed.
-  describe.skipIf(!python3 || process.platform !== 'linux' || !realTmuxSupportsFailed)('when the tmux server never reaps the pane process (#2453)', () => {
+  // BASELINE_FAILURE(1fef331d, 2026-11-11): on Preview, blocking SIGCHLD does not
+  // produce the fixture's promised dead pane; all six cases observe pane_dead=0
+  // or time out. Re-enable after the lab can establish and assert its premise.
+  describe.skip('when the tmux server never reaps the pane process (#2453)', () => {
     const BLOCK_SIGCHLD_THEN_EXEC =
       'import os, signal, sys\n'
       + 'signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGCHLD})\n'

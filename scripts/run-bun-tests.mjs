@@ -275,7 +275,7 @@ console.log(
     ? `bun test SELF-CHECK: 1 of ${allRunnable.length} runnable files (${SELF_CHECK_FILE}) — `
       + 'exercising the runner itself, NOT a suite result'
     : `bun test: ${runnable.length} files, one process each, ${concurrency} at a time `
-      + `(${skipped.length} deferred to vitest — module-registry APIs)`,
+      + `(${skipped.length} explicitly skipped or deferred to vitest)`,
 );
 
 // Every child currently running, mapped to the scratch dir minted for it, so a

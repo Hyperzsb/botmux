@@ -14,12 +14,18 @@
  * name-based factory pattern that missed a callback spelled `orig`), and each time
  * the population count looked perfectly healthy while files silently sat out.
  *
- * Hence two rules here:
+ * Hence three rules here:
  *   1. comments are stripped before matching, and
  *   2. this module carries NO example strings of its own — the guard that exercises
  *      it lives in `test/bun-runner-selectors.test.ts` and passes sources in as
- *      arguments, so the examples cannot feed back into a scan of the repo.
+ *      arguments, so the examples cannot feed back into a scan of the repo, and
+ *   3. a known Bun-only baseline failure is deferred only through the exact
+ *      `@bun-test-skip: BASELINE_FAILURE(...) <reason>` directive. The reason is
+ *      mandatory so the skip cannot become an unexplained permanent blind spot.
  */
+
+/** Explicit, reviewed Bun-only baseline skips; kept file-local instead of a stale path list. */
+const BASELINE_FAILURE_DIRECTIVE = /^[ \t]*\/\/[ \t]*@bun-test-skip:[ \t]*BASELINE_FAILURE\([^)\r\n]+\)[ \t]+\S[^\r\n]*$/m;
 
 /** APIs whose absence is a module-registry or transform gap, not a missing helper. */
 const UNSUPPORTED_API = new RegExp(
@@ -193,6 +199,8 @@ function blankLiterals(source: string): string {
 
 /** True when the bun leg cannot run this file and it must stay on vitest. */
 export function isDeferredFromBunLeg(source: string): boolean {
+  if (BASELINE_FAILURE_DIRECTIVE.test(source)) return true;
+
   // Parsed, not text-matched: only `inject` FROM VITEST is unavailable under bun.
   const injectsFromVitest = importedModulesWithNamedBinding(source, 'inject')
     .some(spec => VITEST_MODULE.test(spec));

@@ -5,6 +5,7 @@
  *
  * Run:  npx vitest run --project unit test/turn-cli-identity-transient-retry.test.ts
  */
+// @bun-test-skip: BASELINE_FAILURE(1fef331d, 2026-11-11) Bun resolves bytedcli-auth before vi.mock; mintByteCloudUserJwts is absent. Vitest remains authoritative.
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';

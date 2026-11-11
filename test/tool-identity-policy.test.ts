@@ -12,6 +12,7 @@
  *   per-tool baseline, not like `true`.
  * - The production publication path routes through the same selector.
  */
+// @bun-test-skip: BASELINE_FAILURE(1fef331d, 2026-11-11) Bun resolves bytedcli-auth before vi.mock; mintByteCloudUserJwts is absent. Vitest remains authoritative.
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';

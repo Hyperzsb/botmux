@@ -43,6 +43,10 @@ describe('bun leg selectors — files that must be deferred', () => {
     ['inject imported under an alias', "import { inject as get } from 'vitest';"],
     // A mixed clause: the type specifier is erased, the value one is not.
     ['a value inject beside a type specifier', "import { type Mock, inject } from 'vitest';"],
+    [
+      'an explicit reviewed Bun-only baseline failure',
+      '// @bun-test-skip: BASELINE_FAILURE(1fef331d, 2026-11-11) collection fails before mocks install\nit("x", () => {});',
+    ],
   ])('defers: %s', (_label, source) => {
     expect(isDeferredFromBunLeg(source)).toBe(true);
   });
@@ -79,6 +83,14 @@ describe('bun leg selectors — files that must stay runnable', () => {
     ['a type-only import clause', "import type { inject } from 'vitest';"],
     ['an inline type specifier', "import { type inject } from 'vitest';"],
     ['type-only inject beside a value import', "import { type inject, describe } from 'vitest';"],
+    [
+      'a baseline marker mentioned in a string',
+      "const note = '// @bun-test-skip: BASELINE_FAILURE(abc, today) prose only';\nit('x', () => {});",
+    ],
+    [
+      'a malformed baseline directive without a reason',
+      '// @bun-test-skip: BASELINE_FAILURE(1fef331d, 2026-11-11)\nit("x", () => {});',
+    ],
   ])('keeps runnable: %s', (_label, source) => {
     expect(isDeferredFromBunLeg(source)).toBe(false);
   });
