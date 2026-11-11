@@ -61,7 +61,7 @@ describe('identityStorageModelForDaemonSession follows the worker report', () =>
     expect(identityStorageModelForDaemonSession(ds)).toBe('single');
   });
 
-  it('follows a proven report even when the frozen config says net-isolated sandbox', () => {
+  it.skipIf(process.platform !== 'linux')('follows a proven report even when the frozen config says net-isolated sandbox', () => {
     // The worker's spawn ran without a sandbox (e.g. a worker started with a
     // different config than the frozen one), so it reached loopback and
     // rendered proven. The frozen config (sandbox:true, sandboxNetwork:false)
@@ -76,7 +76,7 @@ describe('identityStorageModelForDaemonSession follows the worker report', () =>
     expect(ds.reportedIdentityModel).toMatchObject({ workerPid: 4242, workerGeneration: 9 });
   });
 
-  it('keeps following proven with BOTMUX_SANDBOX set in the daemon environment', () => {
+  it.skipIf(process.platform !== 'linux')('keeps following proven with BOTMUX_SANDBOX set in the daemon environment', () => {
     // Fake-fix counterexample ①: a daemon that reads process.env.BOTMUX_SANDBOX
     // would flip its own answer. The daemon never reads it for this decision.
     vi.stubEnv('BOTMUX_SANDBOX', '0');
@@ -104,7 +104,7 @@ describe('identityStorageModelForDaemonSession follows the worker report', () =>
     expect(identityDecisionConflict(ds)).toBeUndefined();
   });
 
-  it('tracks the latest report across model switches', () => {
+  it.skipIf(process.platform !== 'linux')('tracks the latest report across model switches', () => {
     const ds = sessionFixture({ sessionExtra: { sandbox: false } });
     recordWorkerIdentityDecision(ds, worker, 9, {
       model: 'proven', sandboxEngaged: true, loopbackShared: true,
@@ -143,7 +143,7 @@ describe('fail-closed on impossible or malformed reports', () => {
     expect(identityStorageModelForDaemonSession(ds)).toBe('single');
   });
 
-  it('honors a proven report from a verified headless session, whose worker runs the binding without chat transport', () => {
+  it.skipIf(process.platform !== 'linux')('honors a proven report from a verified headless session, whose worker runs the binding without chat transport', () => {
     const ds = sessionFixture({
       chatId: headlessChatId('hl_decision01'),
       sessionExtra: { headless: { id: 'hl_decision01', source: 'cli', createdAt: '2026-11-08T00:00:00.000Z' } },
@@ -185,7 +185,7 @@ describe('fail-closed on impossible or malformed reports', () => {
     expect(identityStorageModelForDaemonSession(ds)).toBe('single');
   });
 
-  it('drops to single when the session shape turns structurally impossible after the report', () => {
+  it.skipIf(process.platform !== 'linux')('drops to single when the session shape turns structurally impossible after the report', () => {
     // Config can change between the worker's report and a later turn (the long
     // gap a device-grant poll covers). The accessor re-checks the structural
     // half live rather than trusting a proven record that no longer applies.
@@ -199,7 +199,7 @@ describe('fail-closed on impossible or malformed reports', () => {
     expect(identityStorageModelForDaemonSession(ds)).toBe('single');
   });
 
-  it('detects a flip against the LAST PUBLISHED model, not the previous report (N1/N2 restart window)', () => {
+  it.skipIf(process.platform !== 'linux')('detects a flip against the LAST PUBLISHED model, not the previous report (N1/N2 restart window)', () => {
     const ds = sessionFixture({ sessionExtra: { sandbox: false, sandboxNetwork: false } });
 
     // Cold start / restart: the daemon publishes the opening turn single

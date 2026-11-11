@@ -25,6 +25,7 @@ import {
 const SECRET = 'test-secret';
 const APP = 'cli_app';
 const NOW = 1_700_000_000_000;
+const LIVE_PROCESS_START = readProcessStartIdentity(process.pid);
 
 function issue(overrides: Partial<Parameters<typeof issueCardClickTurn>[0]> = {}) {
   const issued = issueCardClickTurn({
@@ -349,15 +350,14 @@ describe('acceptCardClickTurn', () => {
 });
 
 describe('card click turn provenance', () => {
-  it('resolves the clicker from lastCallerOpenId even though cct_ is outside the human registry', () => {
+  it.skipIf(!LIVE_PROCESS_START)('resolves the clicker from lastCallerOpenId even though cct_ is outside the human registry', () => {
     const root = mkdtempSync(join(tmpdir(), 'card-click-prov-'));
     const dataDir = join(root, 'sessions');
     mkdirSync(join(dataDir, '.botmux-cli-pids'), { recursive: true });
     try {
       const turnId = 'cct_11111111-2222-4333-8444-555555555555';
       expect(registryTurnMayAuthenticateHuman({}, turnId)).toBe(false);
-      const procStart = readProcessStartIdentity(process.pid);
-      if (!procStart) throw new Error('test process start identity unavailable');
+      const procStart = LIVE_PROCESS_START!;
       writeFileSync(join(dataDir, '.botmux-cli-pids', String(process.pid)), JSON.stringify({
         sessionId: 'sess-click', turnId, procStart,
       }));

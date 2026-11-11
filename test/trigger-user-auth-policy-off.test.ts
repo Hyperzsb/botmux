@@ -13,7 +13,7 @@
  * the agent's shell does.
  */
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -62,18 +62,22 @@ function run(env: NodeJS.ProcessEnv, tool: string): { resolved: string; status: 
   return { resolved, status: result.status, output: rest.join('\n') + result.stderr };
 }
 
+function expectSamePath(actual: string, expected: string): void {
+  expect(realpathSync(actual)).toBe(realpathSync(expected));
+}
+
 describe('trigger-user auth turned off', () => {
   it('a session that spawned under the policy runs the real bytedcli once it respawns with the policy off', () => {
     const before = run(spawnSession(policy(['lark-cli', 'bytedcli'])), 'bytedcli');
-    expect(before.resolved).toBe(join(sessionIdentityBinDir(dataDir, SESSION), 'bytedcli'));
+    expectSamePath(before.resolved, join(sessionIdentityBinDir(dataDir, SESSION), 'bytedcli'));
     expect(before.status).toBe(77);
 
     const env = spawnSession(undefined);
     const after = run(env, 'bytedcli');
-    expect(after.resolved).toBe(join(realBin, 'bytedcli'));
+    expectSamePath(after.resolved, join(realBin, 'bytedcli'));
     expect(after.status).toBe(0);
     expect(after.output).toContain('real bytedcli status');
-    expect(run(env, 'codebase').resolved).toBe(join(realBin, 'codebase'));
+    expectSamePath(run(env, 'codebase').resolved, join(realBin, 'codebase'));
     // The lark-cli binding entry is not a trigger-user wrapper and stays.
     expect(readFileSync(join(sessionIdentityBinDir(dataDir, SESSION), 'lark-cli'), 'utf8'))
       .toContain('# botmux managed lark-cli');
@@ -82,17 +86,17 @@ describe('trigger-user auth turned off', () => {
   it('an explicit enabled:false behaves the same as an absent policy', () => {
     spawnSession(policy(['bytedcli']));
     const after = run(spawnSession({ ...policy(['bytedcli']), enabled: false }), 'bytedcli');
-    expect(after.resolved).toBe(join(realBin, 'bytedcli'));
+    expectSamePath(after.resolved, join(realBin, 'bytedcli'));
     expect(after.status).toBe(0);
   });
 
   it('dropping bytedcli from the policy releases bytedcli and its codebase companion, not lark-cli', () => {
     spawnSession(policy(['lark-cli', 'bytedcli']), false);
     const env = spawnSession(policy(['lark-cli']), false);
-    expect(run(env, 'bytedcli').resolved).toBe(join(realBin, 'bytedcli'));
-    expect(run(env, 'codebase').resolved).toBe(join(realBin, 'codebase'));
+    expectSamePath(run(env, 'bytedcli').resolved, join(realBin, 'bytedcli'));
+    expectSamePath(run(env, 'codebase').resolved, join(realBin, 'codebase'));
     const lark = run(env, 'lark-cli');
-    expect(lark.resolved).toBe(join(sessionIdentityBinDir(dataDir, SESSION), 'lark-cli'));
+    expectSamePath(lark.resolved, join(sessionIdentityBinDir(dataDir, SESSION), 'lark-cli'));
     expect(lark.status).toBe(77);
   });
 
@@ -107,7 +111,7 @@ describe('trigger-user auth turned off', () => {
 
   it('a session that never enabled the policy gets no identity wrapper at all', () => {
     const env = spawnSession(undefined);
-    expect(run(env, 'bytedcli').resolved).toBe(join(realBin, 'bytedcli'));
+    expectSamePath(run(env, 'bytedcli').resolved, join(realBin, 'bytedcli'));
     const binDir = sessionIdentityBinDir(dataDir, SESSION);
     expect(readdirSync(binDir).filter(name => ['bytedcli', 'codebase'].includes(name))).toEqual([]);
   });

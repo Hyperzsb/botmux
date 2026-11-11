@@ -14843,9 +14843,9 @@ export function promoteQueuedActivationTail(
       ...(exactInput.trustedController ? { trustedController: exactInput.trustedController } : {}),
       // Take the caller from the FROZEN promote record, not a live replyTargets
       // lookup: a tail that sat in the queue past the replyTargets eviction
-      // window would find nothing and publish an empty caller, and the wrapper
-      // reads an empty caller as "not the same person" — a legitimate
-      // same-principal continuation would be refused.
+      // window would find nothing and lose principal audit/revocation data.
+      // Wrapper authorization is exact-identity-turn and never relaxed by
+      // this caller label.
       ...(exactInput.trustedCaller?.requestUserOpenId
         ? { turnCallerOpenId: exactInput.trustedCaller.requestUserOpenId }
         : {}),

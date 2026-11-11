@@ -13,8 +13,8 @@ beforeEach(() => { dir = realpathSync(mkdtempSync(join(tmpdir(), 'lark-tool-bind
 afterEach(() => rmSync(dir, { recursive: true, force: true }));
 const defaults = { appId: 'cli_current', defaultAs: 'bot' as const };
 const parseLarkToolInvocation = (args: string[], binding: { appId: string; defaultAs: 'bot' | 'user' }) => {
-  const { args: output, mode, offline, passthroughProfile } = parseInvocation(args, binding, readLarkToolHelp);
-  return { args: output, mode, offline, passthroughProfile };
+  const { args: output, mode, offline } = parseInvocation(args, binding, readLarkToolHelp);
+  return { args: output, mode, offline };
 };
 
 describe('managed lark-cli binding', () => {
@@ -192,10 +192,9 @@ describe('managed lark-cli binding', () => {
   ].map(args => ({ args })))('refuses account changes or conflicting selectors: $args', ({ args }) => {
     expect(() => parseLarkToolInvocation(args, defaults)).toThrow();
   });
-  it('allows switching to other profiles via --profile as passthrough', () => {
-    const parsed = parseLarkToolInvocation(['docs', '+fetch', '--profile', 'cli_other'], defaults);
-    expect(parsed.passthroughProfile).toBe('cli_other');
-    expect(parsed.args).toEqual(['docs', '+fetch', '--profile', 'cli_other']);
+  it('refuses switching to another host profile in a managed turn', () => {
+    expect(() => parseLarkToolInvocation(['docs', '+fetch', '--profile', 'cli_other'], defaults))
+      .toThrow('Managed lark-cli cannot switch profiles');
   });
   it('preserves literal payloads and permits credential-free help/schema', () => {
     const args = ['im', '+send', '--text', 'literal --as user', '--', '--profile=other'];
@@ -238,7 +237,7 @@ describe('managed lark-cli binding', () => {
     expect(platformUserEnv.LARKSUITE_CLI_USER_ACCESS_TOKEN).toBe('platform-user');
     expect(platformUserEnv.LARKSUITE_CLI_CONFIG_DIR).toBe(first.configDir);
     expect(larkToolChildEnv(botEnv, first, { mode: 'bot', credential: 'bot-token', appId: 'cli_platform' }).LARKSUITE_CLI_APP_ID).toBe(defaults.appId);
-    expect(larkToolPromptFromEnv('en', env)).toContain('lark-cli uses application cli_current');
+    expect(larkToolPromptFromEnv('en', env)).toContain('lark-cli is fixed to application cli_current');
     expect(larkToolPromptFromEnv('zh', env)).toContain('lark-cli 固定使用当前机器人的应用 cli_current');
     const headlessEnv = { ...env, BOTMUX_CHAT_ID: 'headless_hl_runner' };
     for (const locale of ['en', 'zh']) {

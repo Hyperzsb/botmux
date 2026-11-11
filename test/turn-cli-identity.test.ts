@@ -353,9 +353,11 @@ describe('publishTurnCliIdentity — withholding removes, never inherits', () =>
     expect(body).toContain('/login bytedcli <site>');
     expect(body).toContain('/login status <site>');
     // Someone refused for lack of authorization usually has no stored name, so
-    // the nameless path is the common one — it must read as a sentence, not
-    // print a raw open_id back at the person.
-    expect(body).not.toContain(ALICE);
+    // The refusal carries an internal principal stamp for exact-turn CAS, but
+    // the user-visible message must still read as a sentence rather than print
+    // a raw open_id back at the person.
+    expect(body).toContain(`BOTMUX_IDENTITY_OPEN_ID='${ALICE}'`);
+    expect(body).not.toContain(`「${ALICE}」`);
     expect(body).toContain('你自己');
   });
 
@@ -483,11 +485,12 @@ describe('publishTurnCliIdentity — failures fail closed', () => {
 
     resolveLarkCliHomeForTurn.mockRejectedValueOnce(new Error('personal credential store unavailable'));
     const outcomes = await publish(botConfig(), ALICE);
-    // The turn survives, and the stale identity is gone. A store outage lands on
-    // the same policy as "never authorized" — a refusal with a link, never a
-    // borrowed or machine identity.
-    expect(outcomes.find(o => o.tool === 'lark-cli')?.state).toBe('needs-authorization');
+    // The turn survives, and the stale identity is gone. A store outage is
+    // distinct from "never authorized": retry later without asking the person
+    // to start another login, and never use a borrowed or machine identity.
+    expect(outcomes.find(o => o.tool === 'lark-cli')?.state).toBe('unavailable');
     expect(identityBody('lark-cli')).not.toContain('/homes/alice-personal-app');
+    expect(identityBody('lark-cli')).toContain('[reason=provider_unavailable]');
   });
 
   // Missing Bot app credentials must not resurrect the legacy Bot-app token
@@ -1219,7 +1222,7 @@ it('does not begin another login when the bytedcli provider fails', async () => 
   expect(result).toContainEqual({ tool: 'bytedcli', state: 'unavailable' });
   expect(provider.beginBytedcliLogin).not.toHaveBeenCalled();
   const written = identityBody('bytedcli', 'turn-unavailable');
-  expect(written).toContain('停止自动重试');
+  expect(written).toContain('不要连续反复重试');
   expect(written).toContain('[reason=provider_unavailable]');
   expect(written).not.toContain('old-sender-credential');
 });

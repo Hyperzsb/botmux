@@ -5907,8 +5907,8 @@ function frozenTurnLinkRefMode(
   return mode === 'observe' || mode === 'enabled' ? mode : undefined;
 }
 /** Open id of the human whose turn currentBotmuxTurnId belongs to. Published
- *  alongside the live-turn marker so the identity wrapper can keep a
- *  same-principal credential across consecutive turns. */
+ *  alongside the live-turn marker for principal audit and revocation; wrapper
+ *  authorization remains bound to the exact identity turn. */
 let currentBotmuxCallerOpenId: string | undefined;
 /** Monotonic per worker PROCESS (never reset by a CLI restart). Bumped only
  * when the capture tuple really changes; frames carry the revision they were
@@ -7092,9 +7092,8 @@ function adoptInitialActiveTurn(parsed: {
   setCaptureIdentity(
     parsed.turnId,
     typeof parsed.dispatchAttempt === 'number' ? parsed.dispatchAttempt : undefined,
-    // Fall back to the durable trusted provenance when the marker predates
-    // caller persistence: an empty caller would refuse a same-principal
-    // continuation the marker itself already witnessed.
+    // Fall back to durable trusted provenance when the marker predates caller
+    // persistence, so audit/revocation still names the admitted principal.
     parsed.callerOpenId ?? parsed.trustedCaller?.requestUserOpenId,
   );
   currentBotmuxLinkRefMode = parsed.linkRefMode;

@@ -54,7 +54,7 @@ import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliId, ResumableSession } from '../adapters/cli/types.js';
 import { resolveCliRuntime, runtimeInstallationKey, snapshotCliRuntime } from '../adapters/cli/runtime.js';
 import { RPC_CAPABLE_CLIS } from '../codex-rpc-lifecycle.js';
-import { deleteMessage, sendMessage, sendUserMessage, replyMessage, listChatBotMembers, resolveUserUnionId, getChatModeStrict, getMessageThreadId, getMessageDetail, uploadImage, UserTokenMissingError } from '../im/lark/client.js';
+import { deleteMessage, sendEphemeralCard, sendMessage, sendUserMessage, replyMessage, listChatBotMembers, resolveUserUnionId, getChatModeStrict, getMessageThreadId, getMessageDetail, uploadImage, UserTokenMissingError } from '../im/lark/client.js';
 import type { OutboundMessageOptions } from '../im/lark/client.js';
 import { assertSendTopicsAvailable, TopicSendError } from '../cli/topic-send-guard.js';
 import { prepareForkTopic } from '../im/lark/fork-topic.js';
@@ -4476,6 +4476,7 @@ export async function handleCommand(
         }
         // 授权归属到「发起这条 /login 的人」。每个人的 lark-cli HOME 独立。
         const loginOpenId = message.senderId;
+        const authChatId = ds?.chatId ?? message.chatId;
         // Any reply carrying an authorization link reaches only the sender: a
         // group member opening someone else's link would authorize as THEMSELVES.
         const authLinkReply = (text: string, privateCommand = '/login') => deliverAuthLink({
@@ -4484,6 +4485,9 @@ export async function handleCommand(
           text,
           replyInPlace: content => sessionReply(rootId, content),
           sendDirect: (openId, content) => sendUserMessage(botCfg2.larkAppId, openId, content),
+          ...(authChatId ? { sendEphemeral: (openId: string, card: string) => sendEphemeralCard(
+            botCfg2.larkAppId, authChatId, openId, card,
+          ) } : {}),
           locale: loc,
           privateCommand,
         });
@@ -4929,6 +4933,7 @@ export async function handleCommand(
             text: loginPromptLines(authUrl, loc, 'cmd.subdoc.need_login').join('\n'),
             replyInPlace: content => sessionReply(rootId, content),
             sendDirect: (openId, content) => sendUserMessage(subCfg.larkAppId, openId, content),
+            sendEphemeral: (openId, card) => sendEphemeralCard(subCfg.larkAppId, ds.chatId, openId, card),
             locale: loc,
             privateCommand: '/subscribe-lark-doc',
           });

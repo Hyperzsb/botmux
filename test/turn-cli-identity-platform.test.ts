@@ -414,7 +414,7 @@ describe('delegated identity (signed cross-bot dispatch)', () => {
     const out = await publishDelegated(['bytedcli'], { enabled: true, tools: ['bytedcli'] });
     expect(out.find(o => o.tool === 'bytedcli')?.state).toBe('needs-authorization');
     expect(read('bytedcli')).toContain("BOTMUX_IDENTITY_MODE='denied'");
-    expect(read('bytedcli')).toContain('delegated bytedcli execution refused');
+    expect(read('bytedcli')).toContain('[reason=platform_not_authorized]');
   });
 
   it('a malformed dispatch union_id is never sent to the platform', async () => {
@@ -422,7 +422,7 @@ describe('delegated identity (signed cross-bot dispatch)', () => {
       botConfig: botConfig({ enabled: true, tools: ['bytedcli'], credentialSource: 'platform' }), sessionDataDir: dir, sessionId: SESSION,
       senderOpenId: undefined, delegatedIdentity: { ...delegated(['bytedcli']), unionId: 'ou_requester' }, turnId: 'om_d',
     });
-    expect(out.find(o => o.tool === 'bytedcli')?.state).toBe('needs-authorization');
+    expect(out.find(o => o.tool === 'bytedcli')?.state).toBe('unavailable');
     expect(grantCalls).toEqual([]);
   });
 });

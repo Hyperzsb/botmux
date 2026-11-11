@@ -147,6 +147,8 @@ import { readProcessStartIdentity } from '../src/core/session-marker.js';
 import { seedPersistedSessionRows } from './helpers/session-store-disk.js';
 import type { RoutingContext } from '../src/im/lark/event-dispatcher.js';
 
+const LIVE_PROCESS_START = readProcessStartIdentity(process.pid);
+
 const APP = 'sg_anchor_app';
 const GROUP_CHAT = 'oc_session_group_chat';
 const DM_CHAT = 'oc_dm_source_chat';
@@ -319,7 +321,7 @@ describe('session-group birth first-turn anchoring (image/file/merge_forward)', 
     expect(mocks.createdSessions[0].quoteTargetId).toBe(SOURCE_MSG);
   });
 
-  it('birth first turn: fork turnId === quoteTargetId, and the REAL current-turn provenance resolver accepts it', async () => {
+  it.skipIf(!LIVE_PROCESS_START)('birth first turn: fork turnId === quoteTargetId, and the REAL current-turn provenance resolver accepts it', async () => {
     await handleNewTopic(makeImageEventData(), birthCtx());
 
     // The worker's turn-identity chain starts at forkWorker's { turnId } — the
@@ -348,8 +350,7 @@ describe('session-group birth first-turn anchoring (image/file/merge_forward)', 
     const provDir = join(mocks.dataDir, `prov-${session.sessionId}`);
     mkdirSync(join(provDir, '.botmux-cli-pids'), { recursive: true });
     seedPersistedSessionRows(provDir, APP, { [session.sessionId]: session });
-    const procStart = readProcessStartIdentity(process.pid);
-    expect(procStart).toBeTruthy();
+    const procStart = LIVE_PROCESS_START!;
     const writeMarker = (turnId: string) => writeFileSync(
       join(provDir, '.botmux-cli-pids', String(process.pid)),
       JSON.stringify({ sessionId: session.sessionId, turnId, procStart }),

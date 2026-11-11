@@ -63,6 +63,7 @@ beforeEach(async () => {
   installPersonalLoginFixture();
   vi.spyOn(cliIdentity, 'refreshSessionIdentity').mockReturnValue(true);
   vi.spyOn(cliIdentity, 'sessionIdentityMaterialPresent').mockReturnValue(true);
+  vi.spyOn(cliIdentity, 'sessionIdentityAllowsLarkUserAuthorization').mockReturnValue(true);
   setIpcAuthSecret(SECRET);
   ipc = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
 });
@@ -111,8 +112,9 @@ describe('agent authorization in a group chat', () => {
     expect(dm).toHaveBeenCalledTimes(1);
   });
 
-  it('refuses without a link when the DM cannot be delivered, and drops the request', async () => {
+  it('refuses without a link when both private channels fail, and drops the request', async () => {
     vi.spyOn(larkClient, 'sendUserMessage').mockRejectedValue(new Error('230013 user not in scope'));
+    vi.spyOn(larkClient, 'sendEphemeralCard').mockRejectedValue(new Error('18053 topic group'));
     const response = await post();
     expect(response.status).toBe(409);
     const body = await response.json() as Record<string, unknown>;
@@ -184,13 +186,13 @@ describe('agent authorization', () => {
     expect(larkCliAuth.beginLarkCliLogin).not.toHaveBeenCalled();
   });
 
-  it('refuses a delegated grant when target policy is withdrawn', async () => {
+  it('does not retroactively revoke a delegated grant when live target policy changes', async () => {
     delegate();
     vi.mocked(botRegistry.getBot).mockReturnValue({ config: {
       larkAppId: 'cli_test', larkAppSecret: 'test-secret', triggerUserAuth: { enabled: false, tools: ['lark-cli'] },
     } } as any);
-    expect((await post()).status).toBe(403);
-    expect(larkCliAuth.beginLarkCliLogin).not.toHaveBeenCalled();
+    expect((await post()).status).toBe(200);
+    expect(larkCliAuth.beginLarkCliLogin).toHaveBeenCalledOnce();
   });
 
   it('rejects a delegation replaced while the authorization link is being created', async () => {
@@ -202,7 +204,7 @@ describe('agent authorization', () => {
     expect((await post()).status).toBe(409);
   });
 
-  it('lets the same delegated human finish authorization in a later turn', async () => {
+  it('lets the same delegated human observe completion in a later turn without publishing into it', async () => {
     delegate();
     const request = await (await post()).json();
     const stillAuthorized = latestGrantValidity();
@@ -211,11 +213,7 @@ describe('agent authorization', () => {
     expect(stillAuthorized()).toBe(true);
     poll.mockResolvedValue({ status: 'ready', token: 'target-app-grant' });
     expect((await post('auth-status', { requestId: request.requestId, originTurnId: 'om_next' })).status).toBe(200);
-    expect(cliIdentity.refreshSessionIdentity).toHaveBeenCalledWith(expect.any(String), 'auth-session', {
-      tool: 'lark-cli', mode: 'user-home', home: '/homes/ou_source_human', turnId: 'om_next', openId: 'ou_target_human',
-    },
-    process.platform === 'linux' ? 'proven' : 'single',
-  );
+    expect(cliIdentity.refreshSessionIdentity).not.toHaveBeenCalled();
   });
 
   it('rejects another human behind the same dispatch bot before polling', async () => {
@@ -276,7 +274,8 @@ describe('agent authorization', () => {
     undefined,
     { enabled: false, tools: ['lark-cli'], fallback: 'none' },
     { enabled: true, tools: ['bytedcli'], fallback: 'none' },
-  ])('rejects authorization when Lark identity injection is unavailable: %j', async policy => {
+  ])('does not let live policy enable authorization absent from the exact-turn identity: %j', async policy => {
+    vi.mocked(cliIdentity.sessionIdentityAllowsLarkUserAuthorization).mockReturnValue(false);
     vi.mocked(botRegistry.getBot).mockReturnValue({ config: {
       larkAppId: 'cli_test', larkAppSecret: 'test-secret', triggerUserAuth: policy,
     } } as any);
@@ -321,7 +320,7 @@ describe('agent authorization', () => {
     expect(cliIdentity.refreshSessionIdentity).not.toHaveBeenCalled();
   });
 
-  it('hands the granted token to the same human’s live follow-up turn', async () => {
+  it('reports ready to the same human’s live follow-up turn without publishing into it', async () => {
     requestId = (await (await post()).json()).requestId;
     // The follow-up turn is live BEFORE the waiting CLI polls again, and that
     // CLI presents the new turn tuple — same human, newer turn.
@@ -330,12 +329,7 @@ describe('agent authorization', () => {
     const response = await post('auth-status', { requestId, originTurnId: 'om_next' });
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({ ok: true, status: 'ready' });
-    expect(cliIdentity.refreshSessionIdentity).toHaveBeenCalledWith(expect.any(String), 'auth-session', {
-      tool: 'lark-cli', mode: 'user-home', home: '/homes/ou_sender',
-      turnId: 'om_next', openId: 'ou_sender',
-    },
-    process.platform === 'linux' ? 'proven' : 'single',
-  );
+    expect(cliIdentity.refreshSessionIdentity).not.toHaveBeenCalled();
   });
 
   it('refuses to hand the token to a different human’s live turn', async () => {
@@ -375,7 +369,7 @@ describe('agent authorization', () => {
   );
   });
 
-  it('waits for the matching identity marker and completes after a same-person worker restart', async () => {
+  it('waits for the exact-turn marker, then leaves recovery to the broker after a worker restart', async () => {
     requestId = (await (await post()).json()).requestId;
     poll.mockResolvedValue({ status: 'ready', token: 'test-user-token' });
     vi.mocked(cliIdentity.refreshSessionIdentity).mockReturnValue(false);
@@ -384,9 +378,8 @@ describe('agent authorization', () => {
     session.workerGeneration++;
     const response = await post('auth-status', { requestId });
     expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ ok: true, status: 'pending' });
-    vi.mocked(cliIdentity.refreshSessionIdentity).mockReturnValue(true);
-    expect(await (await post('auth-status', { requestId })).json()).toEqual({ ok: true, status: 'ready' });
+    expect(await response.json()).toEqual({ ok: true, status: 'ready' });
+    expect(cliIdentity.refreshSessionIdentity).not.toHaveBeenCalled();
   });
 
   it('terminates the wait with 409 when the current turn material is gone for good', async () => {
@@ -402,18 +395,20 @@ describe('agent authorization', () => {
     expect(await response.json()).toMatchObject({ ok: false, error: 'auth_identity_snapshot_missing' });
   });
 
-  it('terminates the wait with 409 when a rotated same-person turn has no material', async () => {
-    // Branch 2: the turn rotated to a same-principal follow-up while the human
-    // was authorizing; the live turn's material is missing, so neither a
-    // perpetual pending poll nor publication into a dead turn is acceptable.
+  it('does not inspect or overwrite a rotated same-person turn’s material', async () => {
+    // The new turn owns a separately frozen decision. The old request only
+    // reports that the credential store is ready; its call-time broker decides
+    // whether that new turn may recover it.
     requestId = (await (await post()).json()).requestId;
     poll.mockResolvedValue({ status: 'ready', token: 'test-user-token' });
     vi.mocked(cliIdentity.refreshSessionIdentity).mockReturnValue(false);
     vi.mocked(cliIdentity.sessionIdentityMaterialPresent).mockReturnValue(false);
     session.managedTurnOrigin = { capability: CAP, turnId: 'om_next', callerOpenId: 'ou_sender' };
     const response = await post('auth-status', { requestId, originTurnId: 'om_next' });
-    expect(response.status).toBe(409);
-    expect(await response.json()).toMatchObject({ ok: false, error: 'auth_identity_snapshot_missing' });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ ok: true, status: 'ready' });
+    expect(cliIdentity.refreshSessionIdentity).not.toHaveBeenCalled();
+    expect(cliIdentity.sessionIdentityMaterialPresent).not.toHaveBeenCalled();
   });
 
   it('daemon-side polling completes the grant after the Agent turn ends without a wait call', async () => {
@@ -425,15 +420,12 @@ describe('agent authorization', () => {
     poll.mockResolvedValue({ status: 'ready', token: 'test-user-token' });
     await vi.waitFor(() => expect(poll).toHaveBeenCalled(), { timeout: 3_000 });
     expect(cliIdentity.refreshSessionIdentity).not.toHaveBeenCalled();
-    // The same human's follow-up turn claims the already-completed grant.
+    // The same human's follow-up turn observes completion. Its broker owns any
+    // recovery into that turn's frozen identity.
     session.managedTurnOrigin = { capability: CAP, turnId: 'om_next', callerOpenId: 'ou_sender' };
     const response = await post('auth-status', { requestId, originTurnId: 'om_next' });
     expect(await response.json()).toEqual({ ok: true, status: 'ready' });
-    expect(cliIdentity.refreshSessionIdentity).toHaveBeenCalledWith(expect.any(String), 'auth-session', {
-      tool: 'lark-cli', mode: 'user-home', home: '/homes/ou_sender', turnId: 'om_next', openId: 'ou_sender',
-    },
-    process.platform === 'linux' ? 'proven' : 'single',
-  );
+    expect(cliIdentity.refreshSessionIdentity).not.toHaveBeenCalled();
   });
 
   it('reuses a pending link across turns without extending its deadline', async () => {
@@ -531,6 +523,7 @@ describe.skipIf(process.platform !== 'linux')('agent authorization over a manage
     poll = vi.fn().mockResolvedValue({ status: 'pending' });
     installPersonalLoginFixture();
     vi.spyOn(cliIdentity, 'refreshSessionIdentity').mockReturnValue(true);
+    vi.spyOn(cliIdentity, 'sessionIdentityAllowsLarkUserAuthorization').mockReturnValue(true);
     setIpcAuthSecret(SECRET);
     ipc = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
   });

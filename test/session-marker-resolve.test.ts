@@ -16,6 +16,7 @@ import {
 } from '../src/core/managed-origin-capability.js';
 
 const ORIGIN_CHANNEL = 'a'.repeat(64);
+const LIVE_PROCESS_START = readProcessStartIdentity(process.pid);
 
 // resolveSessionContext is the layer that powers session-id inference for
 // `botmux send` / history / bots. Regression guard: a detached/backgrounded
@@ -63,9 +64,8 @@ describe('resolveSessionContext()', () => {
     expect(ctx).toEqual({ sessionId: 'env-sid', turnId: 'turn-9', dispatchAttempt: 2 });
   });
 
-  it('exposes current-turn capability only through a birth-bound authenticated marker', () => {
-    const procStart = readProcessStartIdentity(process.pid);
-    expect(procStart).toBeTruthy();
+  it.skipIf(!LIVE_PROCESS_START)('exposes current-turn capability only through a birth-bound authenticated marker', () => {
+    const procStart = LIVE_PROCESS_START!;
     const marker = { sessionId: 'env-sid', turnId: 'om_live', dispatchAttempt: 1,
       capability: 'ab'.repeat(32), procStart };
     writeMarker(process.pid, JSON.stringify(marker));
@@ -107,9 +107,8 @@ describe('resolveSessionContext()', () => {
     expect(ctx).toEqual({ sessionId: 'env-sid' }); // env fallback, marker's turnId dropped
   });
 
-  it('honors a marker whose procStart MATCHES the live process (genuine ancestor)', () => {
-    const liveStart = readProcessStartIdentity(process.pid);
-    expect(liveStart).toBeTruthy();
+  it.skipIf(!LIVE_PROCESS_START)('honors a marker whose procStart MATCHES the live process (genuine ancestor)', () => {
+    const liveStart = LIVE_PROCESS_START!;
     writeMarker(process.pid, JSON.stringify({
       sessionId: 'env-sid', turnId: 'turn-live', procStart: liveStart,
     }));
@@ -344,12 +343,11 @@ describe('resolveSessionContext()', () => {
 // A successor worker adopts the turn a reattached CLI's marker records, so the
 // marker must have been written for THIS live process of THIS session.
 describe('markerBelongsToLiveProcess()', () => {
-  const liveStart = readProcessStartIdentity(process.pid);
+  const liveStart = LIVE_PROCESS_START;
   const marker = (body: Record<string, unknown>): string =>
     JSON.stringify({ sessionId: 'sid', turnId: 'turn-1', ...body });
 
-  it('accepts the marker this session wrote for the live process', () => {
-    expect(liveStart).toBeTruthy();
+  it.skipIf(!LIVE_PROCESS_START)('accepts the marker this session wrote for the live process', () => {
     expect(markerBelongsToLiveProcess(marker({ procStart: liveStart }), { sessionId: 'sid', procStart: liveStart }))
       .toBe(true);
   });

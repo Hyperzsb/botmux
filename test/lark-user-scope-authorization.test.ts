@@ -6,6 +6,11 @@ import * as identities from '../src/im/lark/identity-cache.js';
 import * as tokens from '../src/utils/user-token.js';
 import * as larkCliAuth from '../src/services/lark-cli-auth.js';
 import { isKnownLarkUserScope } from '../src/utils/lark-scope-catalog.js';
+import { writeSessionIdentity } from '../src/core/cli-identity.js';
+import { config } from '../src/config.js';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 // Regressions for valid user scopes being rejected with `unknown_scopes` before
 // any authorize URL could be minted because the names were absent from
@@ -16,8 +21,13 @@ import { isKnownLarkUserScope } from '../src/utils/lark-scope-catalog.js';
 const CAP = 'ab'.repeat(32);
 let ipc: IpcServerHandle;
 let session: any;
+let dataDir: string;
+let previousDataDir: string;
 
 beforeEach(async () => {
+  dataDir = mkdtempSync(join(tmpdir(), 'lark-user-scope-auth-'));
+  previousDataDir = config.session.dataDir;
+  config.session.dataDir = dataDir;
   session = {
     session: { sessionId: 'auth-session', status: 'active' },
     larkAppId: 'cli_test', chatId: 'oc_test', chatType: 'p2p',
@@ -32,13 +42,21 @@ beforeEach(async () => {
   vi.spyOn(larkCliAuth, 'beginLarkCliLogin').mockResolvedValue({
     authUrl: 'https://open.feishu.cn/authorize?x', stage: 'user-login',
   });
+  // Auth-request may only extend the exact frozen user/identity turn. A
+  // generic session capability is not authorization to mint credentials.
+  writeSessionIdentity(dataDir, 'auth-session', {
+    tool: 'lark-cli', mode: 'denied', message: 'authorization required',
+    turnId: 'om_turn', openId: 'ou_sender',
+  }, 'single');
   ipc = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
 });
 
 afterEach(async () => {
   await ipc.close();
+  config.session.dataDir = previousDataDir;
   setIpcAuthSecret(null);
   vi.restoreAllMocks();
+  rmSync(dataDir, { recursive: true, force: true });
 });
 
 function post(overrides: Record<string, unknown> = {}) {

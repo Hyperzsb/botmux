@@ -162,22 +162,16 @@ describe('lark-cli argv metadata', () => {
     const invocation = parse(['docs', '+fetch', '--keyword', '--', '--', '--as=user']);
     expect(larkToolExecutionArgs(invocation)).toEqual(['docs', '+fetch', '--keyword', '--', '--as', 'bot', '--', '--as=user']);
   });
-  it('supports --profile switching to another profile as passthrough', () => {
-    const invocation = parse(['docs', '+fetch', '--doc', 'doc-1', '--profile=cli_other']);
-    expect(invocation.passthroughProfile).toBe('cli_other');
-    expect(invocation.args).toEqual(['docs', '+fetch', '--doc', 'doc-1', '--profile=cli_other']);
-    expect(larkToolExecutionArgs(invocation)).toEqual(['docs', '+fetch', '--doc', 'doc-1', '--profile=cli_other']);
+  it('refuses switching to another profile before executing the command', () => {
+    expect(() => parse(['docs', '+fetch', '--doc', 'doc-1', '--profile=cli_other']))
+      .toThrow('Managed lark-cli cannot switch profiles');
   });
-  it('supports --profile with explicit --as user preserved', () => {
-    const invocation = parse(['docs', '+fetch', '--doc', 'doc-1', '--profile', 'cli_other', '--as=user']);
-    expect(invocation.passthroughProfile).toBe('cli_other');
-    expect(invocation.mode).toBe('user');
-    expect(invocation.sawAs).toBe(true);
-    expect(larkToolExecutionArgs(invocation)).toEqual(['docs', '+fetch', '--doc', 'doc-1', '--profile', 'cli_other', '--as', 'user']);
+  it('refuses a foreign profile even when an explicit managed identity is present', () => {
+    expect(() => parse(['docs', '+fetch', '--doc', 'doc-1', '--profile', 'cli_other', '--as=user']))
+      .toThrow('Managed lark-cli cannot switch profiles');
   });
   it('strips --profile when it matches the bound appId and uses managed bot identity', () => {
     const invocation = parse(['docs', '+fetch', '--doc', 'doc-1', '--profile=cli_current']);
-    expect(invocation.passthroughProfile).toBeUndefined();
     expect(invocation.args).toEqual(['docs', '+fetch', '--doc', 'doc-1']);
     expect(larkToolExecutionArgs(invocation)).toEqual(['docs', '+fetch', '--doc', 'doc-1', '--as', 'bot']);
   });
@@ -188,7 +182,6 @@ describe('lark-cli argv metadata', () => {
     [['docs', '+fetch', '--profile=cli_current', '--doc', 'doc-1'], ['docs', '+fetch', '--doc', 'doc-1']],
   ])('accepts the bound app --profile at group or leaf position under bound help metadata: %s', (input, stripped) => {
     const invocation = parse(input);
-    expect(invocation.passthroughProfile).toBeUndefined();
     expect(invocation.args).toEqual(stripped);
     expect(larkToolExecutionArgs(invocation)).toEqual([...stripped, '--as', 'bot']);
   });
@@ -197,17 +190,12 @@ describe('lark-cli argv metadata', () => {
     ['docs', '+fetch', '--doc', 'doc-1', '--profile', 'cli_other'],
     ['docs', '+fetch', '--doc', 'doc-1', '--profile=cli_other'],
     ['docs', '+fetch', '--profile=cli_other', '--doc', 'doc-1', '--dry-run'],
-  ])('passes a foreign --profile through at group or leaf position: %s', (...args) => {
-    const invocation = parse(args);
-    expect(invocation.passthroughProfile).toBe('cli_other');
-    expect(invocation.args).toEqual(args);
-    expect(larkToolExecutionArgs(invocation)).toEqual(args);
+  ])('refuses a foreign --profile at group or leaf position: %s', (...args) => {
+    expect(() => parse(args)).toThrow('Managed lark-cli cannot switch profiles');
   });
-  it('keeps an explicit --as user alongside a trailing foreign profile', () => {
-    const invocation = parse(['docs', '+fetch', '--doc', 'doc-1', '--profile', 'cli_other', '--as=user']);
-    expect(invocation.passthroughProfile).toBe('cli_other');
-    expect(invocation.mode).toBe('user');
-    expect(larkToolExecutionArgs(invocation)).toEqual(['docs', '+fetch', '--doc', 'doc-1', '--profile', 'cli_other', '--as', 'user']);
+  it('does not let --as user make a trailing foreign profile acceptable', () => {
+    expect(() => parse(['docs', '+fetch', '--doc', 'doc-1', '--profile', 'cli_other', '--as=user']))
+      .toThrow('Managed lark-cli cannot switch profiles');
   });
   it('does not inherit root-local help/version flags onto a leaf', () => {
     expect(() => parse(['docs', '+fetch', '--version'])).toThrow('Unknown lark-cli flag');

@@ -2,7 +2,7 @@
 
 Botmux 支持将会话内的 `lark-cli` 绑定到当前 bot 配置中的 App ID 和品牌。该功能为**显式 opt-in**：只有 `larkToolBinding: true` 才安装托管应用绑定；未配置与显式 `false` 都表示不绑定，`lark-cli` 沿用宿主机原生登录态（旧的「未配置时按 `triggerUserAuth` 反向决定绑定」关系已移除）。可以通过 Dashboard（Bot Defaults → 隔离与权限）或斜杠命令 `/config set larkToolBinding on|off` 切换（需新建会话或 `/restart` 生效）。
 
-- **显式开启（`larkToolBinding: true`）**：会话内 `lark-cli` 默认以当前 Bot 的应用凭证以 bot 身份调用，支持 `--as user` 使用当前用户对同一应用的授权；若显式指定 `--profile <profile>`，自动透传按宿主机原生环境及对应 profile 执行，不拦截切换。
+- **显式开启（`larkToolBinding: true`）**：会话内 `lark-cli` 固定使用本轮冻结的应用与执行主体，默认以当前 Bot 身份调用，支持 `--as user` 使用当前用户授权。`--profile` 只接受与绑定 App ID 相同的兼容写法（参数会被消费），任何其他 profile 都会拒绝，不能回落到宿主机凭据。
 - **未配置或显式关闭**：不安装托管绑定包装器，`lark-cli` 完全回落为宿主机原生环境；若同时开启了 `triggerUserAuth`，则遵循按触发人鉴权规则。普通 Bot 无需任何额外配置即可恢复这种原生行为（plan §4.3）。
 
 该绑定依赖支持 `LARKSUITE_CLI_TENANT_ACCESS_TOKEN` 的较新 lark-cli；请使用
@@ -15,7 +15,7 @@ Botmux 提供的短期 bot token。
 
 | `larkToolBinding` | `triggerUserAuth` | `lark-cli` 行为 |
 |---|---|---|
-| 显式开启 | 任意 | 默认使用当前 Bot 身份；`--as user` 使用当轮触发人授权；`--profile <other>` 透传宿主对应 profile |
+| 显式开启 | 任意 | 默认使用当前 Bot 身份；`--as user` 使用本轮冻结用户授权；拒绝切换到其他 `--profile` |
 | 未配置 / 显式关闭 | 开启（含 `lark-cli`） | 保持业务分支的个人应用 HOME / 平台按人凭据，不切换到 Bot 身份 |
 | 未配置 / 显式关闭 | 关闭（默认） | 沿用宿主机默认凭证及用户 profile 切换 |
 
@@ -39,7 +39,7 @@ Botmux 提供的短期 bot token。
 - 平台只返回短期变量（lark 为 user_access_token + app id，bytedcli 为 cloud JWT + code JWT），**永不返回刷新凭据**；返回的变量键按工具白名单校验，多余键一律拒绝。
 - 已绑定的机器**不再自动发起本机扫码**：拒绝消息直接给平台凭据页链接。`auto` 模式下显式的 `/login lark` / `/login bytedcli` 仍可走本机扫码作为兜底；`platform` 模式下它们也只给平台链接。
 - 平台地址来自 `~/.botmux/platform.json`（`botmux bind` 写入），源码不含任何部署专属域名。
-- **codebase-cli 随 bytedcli**：Codebase CLI 读的是 bytedcli 派生的 Codebase JWT（`CODEBASE_CLI_USER_JWT`），所以它不单独授权：bytedcli 的身份一发布，`codebase` 的身份文件与 wrapper 就一起生成；bytedcli 被拒或拿不到 Codebase JWT 时，`codebase` 同样被拒，不会退回机器自己的 Codebase 登录。平台凭据页上它显示为随 bytedcli 的状态。
+- **codebase-cli 随 bytedcli**：Codebase CLI 读的是 bytedcli 派生的 Codebase JWT（`CODEBASE_CLI_USER_JWT`），所以它不单独授权：bytedcli 的身份一发布，`codebase` 的身份与 wrapper 就一起生成；bytedcli 被拒或拿不到 Codebase JWT 时，`codebase` 同样被拒，不会退回机器自己的 Codebase 登录。仅 Codebase JWT 暂时缺失时不影响已取得的 ByteCloud 身份，`codebase` 每次受管调用会按同一 turn/主体/来源限频重取，恢复后只更新这一本轮主体。平台凭据页上它显示为随 bytedcli 的状态。
 - 平台按「发送人与本机所有者至少同属一个团队」且「发送人已对该团队开启同意」签发；不满足时分别返回 `not_teammate` / `consent_missing`，botmux 原样告知发送人，不退回任何其他身份。
 - **显式开启绑定的会话（`larkToolBinding: true`）里的 `--as user` 同样会用平台凭据。** 自建 bot 应用的可用范围通常只有所有者本人，别人打开该应用的授权链接只会看到「你没有使用权限」，所以对他们来说平台是唯一可用的来源。取法：
   - `auto`：该人已有对本 bot 应用的授权就用它（所有者保留 bot 应用更多的权限）；没有则向平台申请，lark-cli 的用户调用改用平台应用的 app id 执行；机器未绑定平台时与以前一致。
@@ -66,7 +66,9 @@ botmux auth request --scope "docx:document:readonly" --json
 botmux auth wait --request-id <返回的请求ID> --json
 ```
 
-授权链接（设备码、OAuth 授权页）只发给发起人本人：谁打开谁确认，身份就授给谁。所以在群聊（含话题群）里，`/login` 的授权链接、`botmux auth request` 生成的链接都由 botmux 私聊发给本轮发起人，群里只回一句「已私聊你授权链接」，`auth request` 的结果里也不含 `authUrl`（返回 `delivery: "dm"`）；私聊发不出去时提示对方先私聊机器人发 `/login`，链接不会出现在群里。群聊里命令被拒时，拒绝文案也不再附设备码链接，而是提示发 `/login`。只有和发起人的单聊会直接回复链接。
+授权链接（设备码、OAuth 授权页）只发给发起人本人：谁打开谁确认，身份就授给谁。所以在群聊（含话题群）里，`/login`、`/subscribe-lark-doc` 与 `botmux auth request` 共用同一投递顺序：先私聊本轮发起人；私聊失败时，尝试在当前群主界面发送仅发起人可见的卡片；两者都失败才提示申请应用使用权限后重试，链接绝不公开出现。`auth request` 的结果不含 `authUrl`，只返回真实的 `delivery: "dm" | "ephemeral"`；并发复用仍在发送中的请求时返回 `auth_link_delivery_pending`，不会谎报已私聊。只有和发起人的单聊会直接回复链接。
+
+执行主体、authority、工具范围和凭据来源在 turn admission 时冻结；凭据“此刻是否可用”在每次受管调用时解析。本轮最初缺权时，用户完成本机或平台授权后，无需新建会话，下一次同一 turn 的工具调用会按 `(session, identity turn, tool, principal, auth epoch)` compare-and-set 恢复。恢复不能换人、扩工具范围或改用另一个来源；旧授权请求也不能把凭据直接写入同一用户的后续 turn，后续 turn 必须按自己的冻结决策解析。
 
 bot 读取失败后，agent 可根据任务与错误尝试 user。包装器不会自动重放业务命令；写入超时或部分成功时，应先确认结果，避免重复创建或发送。
 
@@ -76,7 +78,7 @@ bot 读取失败后，agent 可根据任务与错误尝试 user。包装器不�
 - 当关闭该配置并重启（`/restart`）或恢复时，自动清理会话目录下的 `lark-tool-binding.json`、`lark-config/` 及托管包装脚本 `binDir/lark-cli`，且不会误伤 `triggerUserAuth` 包装脚本（如 `bytedcli` 或 trigger-user `lark-cli`）或其它文件。
 - 绑定入口与 `triggerUserAuth` 包装脚本共用同一个 `binDir`，绑定会话不论是否开启按触发人鉴权都会把它放到 PATH 最前面。因此 `triggerUserAuth` 关闭（或不再覆盖某个工具）时，该工具的 trigger-user 包装脚本必须移除，否则它会继续拦截调用，而 daemon 已不再发布身份，每次调用都被拒绝：worker 每次 spawn 时按当时的配置移除，只移除带 trigger-user 包装脚本标记的文件。与 `triggerUserAuth` 的「下个会话生效」一致，关闭或重新开启都只对之后 spawn 的 worker 生效（新会话、`/restart`、daemon 重启）；运行中的 worker 保持它启动时的包装，不在运行中删除，避免运行中再打开时包装已经不在、工具静默以本机登录态执行。
 - 远端后端、adopt、外部 app-server、workflow 和无飞书通道的会话不使用应用绑定。
-- Linux 本机受管会话的 user 调用须通过当前执行的进程证明，覆盖标准 PTY/Tmux 与托管 RPC（如 Codex）。macOS 保留应用绑定和当前用户解析，不提供旧后台进程跨轮隔离保证。
+- Linux 本机受管会话的 bot 与 user 在线调用都须通过当前执行的进程证明，覆盖标准 PTY/Tmux 与托管 RPC（如 Codex）；注册过的 detached background execution 继续走自己的冻结 authority。macOS 保留应用绑定和当前用户解析，不提供同等级的进程血缘证明。
 
 ## 实现
 
@@ -88,11 +90,11 @@ bot 读取失败后，agent 可根据任务与错误尝试 user。包装器不�
 
 bot 调用从当前应用的 SDK 获取 tenant access token，复用其缓存和到期刷新，再通过 `LARKSUITE_CLI_TENANT_ACCESS_TOKEN` 交给工具；不向工具传递 App Secret，也不在会话启动时固定 token。凭证获取失败时拒绝执行。
 
-工具路径按合并后的 bot `env.PATH` 解析。参数取值类型和 `--as` 支持情况取自该 lark-cli 二进制的本地 `--help`，包括快捷命令和原生 API 命令；无法识别的参数在执行前报错，不能靠猜测删除业务参数。若显式指定 `--profile <profile>` 且 profile 不等于当前 Bot 的 App ID，则直接透传宿主原生环境和对应 profile 执行（使用宿主环境，不受当前 bot 凭证及按触发人鉴权约束）；若等于当前 Bot 的 App ID，则归一化为托管 Bot 身份。`event list/schema`、`doctor --offline` 等本地命令不取凭证，也不追加 `--as`。
+工具路径按合并后的 bot `env.PATH` 解析。参数取值类型和 `--as` 支持情况取自该 lark-cli 二进制的本地 `--help`，包括快捷命令和原生 API 命令；无法识别的参数在执行前报错，不能靠猜测删除业务参数。显式 `--profile` 等于当前 Bot App ID 时作为兼容参数被消费；其他值一律拒绝，不能透传宿主环境。`event list/schema`、`doctor --offline` 等本地命令不取凭证，也不追加 `--as`，但同样不能借 profile 切换身份。
 
 绑定入口、配置和 shell 启动路径使用真实目录路径。Linux 文件沙箱同时保留会话入口和 bot PATH，直接执行、sh、bash 以及通过符号链接配置的数据根使用同一绑定。
 
-已有 signed dispatch 验证通过的跨机器人任务保留其原请求者：新入口按原 turn 使用已验证的目标应用用户和工具许可，再查询目标应用自己的用户授权。缺少用户授权时，目标 Agent 可用 `botmux auth request --scope "<本次所需权限>" --json` 为原请求者申请目标应用的授权，并在任务话题将链接提供给该真人；授权后用 `auth wait` 确认，再以 `--as user` 重试原操作。不会把来源应用的 token 用于目标应用，也不要求派发机器人授权。目标访问/工具许可被拒、授权失败或撤销时沿原任务回报阻塞；后续普通消息不继承该委派。授权等待期间切换到另一位真人时，原请求不能用于该人的回合。
+已有 signed dispatch 验证通过的跨机器人任务保留其原请求者：新入口按原 turn 使用已验证的目标应用用户和工具许可，再查询目标应用自己的用户授权。缺少用户授权时，目标 Agent 可用 `botmux auth request --scope "<本次所需权限>" --json` 为原请求者申请目标应用授权；群聊中的链接由 botmux 私下投递给该真人，授权后用 `auth wait` 确认，再以 `--as user` 重试原操作。不会把来源应用的 token 用于目标应用，也不要求派发机器人授权。目标访问/工具许可被拒、授权失败或撤销时沿原任务回报阻塞；后续普通消息不继承该委派。授权等待期间切换到另一位真人时，原请求不能用于该人的回合。
 
 该功能解决标准新会话默认身份不明确的问题。文件沙箱、既有访问控制和独立 MCP 的凭证规则仍按原有机制运行。
 

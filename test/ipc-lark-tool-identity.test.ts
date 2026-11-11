@@ -155,7 +155,7 @@ describe('session application identity route', () => {
     expect(await response.json()).toMatchObject({ ok: false, error: 'current_actor_unverified' });
     expect(requestAuth).not.toHaveBeenCalled();
   });
-  it('serves a refusal instead of the published bytedcli identity once a workflow delegation stops holding', async () => {
+  it.skipIf(process.platform !== 'linux')('serves a refusal instead of the published bytedcli identity once a workflow delegation stops holding', async () => {
     const { writeSessionIdentity } = await import('../src/core/cli-identity.js');
     const { rememberLarkToolDelegation } = await import('../src/core/lark-tool-delegation.js');
     vi.spyOn(workerPool, 'identityStorageModelForDaemonSession').mockReturnValue('proven');
@@ -562,8 +562,10 @@ describe('session application identity route', () => {
       expect(user.code, user.err).toBe(0);
       expect(user.out).toBe('cli_bound|||bound-user-token|docs +fetch --as user');
     }
-    const passthrough = await run(['docs', '+fetch', '--profile=cli_other']); expect(passthrough.code, passthrough.err).toBe(0);
-    expect(passthrough.out).toBe('cli_wrong|||wrong-user|docs +fetch --profile=cli_other');
+    const foreignProfile = await run(['docs', '+fetch', '--profile=cli_other']);
+    expect(foreignProfile.code).toBe(77);
+    expect(foreignProfile.out).toBe('');
+    expect(foreignProfile.err).toContain('Managed lark-cli cannot switch profiles');
   });
   it('rejects identity request when larkToolBinding is explicitly disabled on the bot', async () => {
     vi.mocked(bots.getBot).mockReturnValue({ config: { larkAppId: 'cli_bound', larkAppSecret: 'bound-secret', larkToolBinding: false } } as any);

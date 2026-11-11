@@ -36,8 +36,9 @@ const {
   retryTransientTurnIdentity,
   __resetTransientRefusalsForTest,
   TRANSIENT_REFUSAL_RETRY_INTERVAL_MS,
-  TRANSIENT_REFUSAL_MAX_RETRIES,
   TRANSIENT_REFUSAL_WAIT_CAP_MS,
+  TRANSIENT_REFUSAL_TTL_MS,
+  NOT_AUTHORIZED_RETRY_INTERVAL_MS,
 } = await import('../src/core/turn-cli-identity.js');
 const { recallProvenIdentityContent, forgetProvenIdentityContent, writeSessionIdentity } = await import('../src/core/cli-identity.js');
 const { parseTriggerUserAuthConfig } = await import('../src/services/trigger-user-auth.js');
@@ -141,17 +142,24 @@ describe('transient platform refusal within a turn', () => {
     expect(grantCalls).toBe(3);
   });
 
-  it('an answer about the person (not authorized) is final and is never re-asked', async () => {
-    responses = [{ ok: false, reason: 'not_authorized', error: 'credential_not_found' }];
+  it('an initial not-authorized answer recovers after the person completes platform authorization', async () => {
+    responses = [
+      { ok: false, reason: 'not_authorized', error: 'credential_not_found' },
+      GRANTED,
+    ];
     const out = await prepare();
     expect(out.find(o => o.tool === 'bytedcli')?.state).toBe('needs-authorization');
-    later();
     await retry();
-    expect(grantCalls).toBe(1);
+    expect(grantCalls).toBe(2);
+    expect(current()).toContain("BYTEDCLI_USER_CLOUD_JWT='cloud-jwt'");
   });
 
-  it('a retry that now gets a definite answer publishes it and stops retrying', async () => {
-    responses = [NETWORK_DOWN, { ok: false, reason: 'not_authorized', error: 'credential_not_found', authorizeUrl: 'https://platform.example.test/credentials' }];
+  it('a retry that reaches consent state publishes it and uses the longer consent interval', async () => {
+    responses = [
+      NETWORK_DOWN,
+      { ok: false, reason: 'not_authorized', error: 'credential_not_found', authorizeUrl: 'https://platform.example.test/credentials' },
+      GRANTED,
+    ];
     await prepare();
     const transient = current();
     later();
@@ -159,9 +167,13 @@ describe('transient platform refusal within a turn', () => {
     expect(grantCalls).toBe(2);
     expect(current()).not.toBe(transient);
     expect(current()).toContain('https://platform.example.test/credentials');
-    later();
+    later(NOT_AUTHORIZED_RETRY_INTERVAL_MS - 1);
     await retry();
     expect(grantCalls).toBe(2);
+    later(1);
+    await retry();
+    expect(grantCalls).toBe(3);
+    expect(current()).toContain("BYTEDCLI_USER_CLOUD_JWT='cloud-jwt'");
   });
 
   it('never overwrites a publication that replaced the refusal while the retry was in flight', async () => {
@@ -233,20 +245,13 @@ describe('transient platform refusal within a turn', () => {
     expect(grantCalls).toBe(2);
   });
 
-  it('a policy changed mid-turn ends the re-asks instead of fetching under the old one', async () => {
+  it('a live policy change does not replace the credential source frozen for this turn', async () => {
     responses = [NETWORK_DOWN, GRANTED];
     await prepare();
     const nowLocal = { ...config, triggerUserAuth: parseTriggerUserAuthConfig({ enabled: true, tools: ['bytedcli'], credentialSource: 'local' }) };
     await retry(nowLocal);
-    expect(grantCalls).toBe(1);
-    await retry();
-    expect(grantCalls).toBe(1);
-    const off = { ...config, triggerUserAuth: undefined };
-    responses = [NETWORK_DOWN, GRANTED];
-    await prepare();
-    await retry(off);
     expect(grantCalls).toBe(2);
-    expect(current()).toContain("BOTMUX_IDENTITY_MODE='denied'");
+    expect(current()).toContain("BYTEDCLI_USER_CLOUD_JWT='cloud-jwt'");
   });
 
   it('a revocation of the person\'s credentials during the turn ends the re-asks', async () => {
@@ -270,11 +275,12 @@ describe('transient platform refusal within a turn', () => {
     expect(current()).not.toContain('cloud-jwt');
   });
 
-  // ─── The in-flight window: the policy is re-read AFTER the platform answers ───
+  // ─── The in-flight window: live policy cannot alter frozen admission ───
   //
-  // Dashboard replaces the whole bot config object, so a snapshot cannot observe
-  // an edit made while an attempt is waiting on the platform. These cases hold
-  // the platform request open, change the policy, then release it.
+  // These compatibility arguments used to re-read Dashboard policy after the
+  // provider returned. They are deliberately ignored now: source, principal and
+  // tool scope belong to the identity turn. These cases hold the provider open,
+  // mutate the live policy, then prove the frozen request still wins.
 
   /** Prepare a turn, start a re-ask and hold it in flight; returns the release. */
   const startHeldRetry = async (opts: { botConfig?: any; currentPolicy: () => any }) => {
@@ -290,65 +296,57 @@ describe('transient platform refusal within a turn', () => {
   const platformPolicy = () => parseTriggerUserAuthConfig({ enabled: true, tools: ['bytedcli'], credentialSource: 'platform' });
   const toolOffPolicy = () => parseTriggerUserAuthConfig({ enabled: true, tools: ['lark-cli'], credentialSource: 'platform' });
 
-  it('does not write a grant acquired while the bot was switched to local credentials', async () => {
+  it('keeps the frozen platform source when the live bot is switched to local credentials', async () => {
     let policy = platformPolicy();
     const { release, pending } = await startHeldRetry({ currentPolicy: () => policy });
     policy = localPolicy();     // operator switches the bot mid-flight
-    const before = current();
     release(GRANTED);
     await pending;
-    expect(current()).not.toContain('cloud-jwt');
-    expect(current()).toBe(before);   // the turn keeps the refusal it had
+    expect(current()).toContain("BYTEDCLI_USER_CLOUD_JWT='cloud-jwt'");
   });
 
-  it('does not write a grant acquired while the tool was taken out of the policy', async () => {
+  it('keeps the frozen tool scope when the live policy removes the tool', async () => {
     let policy = platformPolicy();
     const { release, pending } = await startHeldRetry({ currentPolicy: () => policy });
     policy = toolOffPolicy();   // bytedcli no longer governed
-    const before = current();
     release(GRANTED);
     await pending;
-    expect(current()).not.toContain('cloud-jwt');
-    expect(current()).toBe(before);
+    expect(current()).toContain("BYTEDCLI_USER_CLOUD_JWT='cloud-jwt'");
   });
 
-  it('does not write a grant acquired while the whole policy was switched off', async () => {
+  it('keeps the frozen admission when the live policy is switched off', async () => {
     let policy: any = platformPolicy();
     const { release, pending } = await startHeldRetry({ currentPolicy: () => policy });
     policy = undefined;         // triggerUserAuth.enabled = false
-    const before = current();
     release(GRANTED);
     await pending;
-    expect(current()).not.toContain('cloud-jwt');
-    expect(current()).toBe(before);
+    expect(current()).toContain("BYTEDCLI_USER_CLOUD_JWT='cloud-jwt'");
   });
 
-  it('stops asking (and drops the entry) when the bot no longer governs the tool', async () => {
+  it('continues resolving the frozen source when the live bot no longer governs the tool', async () => {
     let policy: any = platformPolicy();
     const { release, pending } = await startHeldRetry({ currentPolicy: () => policy });
     policy = localPolicy();
-    release(GRANTED);
+    release(NETWORK_DOWN);
     await pending;
-    // The entry is gone: a later call must not re-ask at all.
-    const callsBefore = grantCalls;
+    __setPlatformCredentialDepsForTest({
+      readBinding: () => BINDING,
+      resolveUnionId: async () => 'on_alice',
+      requestGrant: async () => { grantCalls++; return GRANTED as any; },
+    });
     later();
     await retry(config, () => policy);
-    expect(grantCalls).toBe(callsBefore);
+    expect(grantCalls).toBe(3);
+    expect(current()).toContain("BYTEDCLI_USER_CLOUD_JWT='cloud-jwt'");
   });
 
-  it('a bot config reader that throws (bot removed) is treated as no longer governed', async () => {
-    // Both windows refuse. Before an attempt: no platform call is made at all.
+  it('a throwing compatibility policy reader cannot cancel a frozen broker entry', async () => {
     responses = [NETWORK_DOWN, GRANTED];
     await prepare();
-    const before = current();
     const throwing = () => { throw new Error('Bot not registered: cli_bot'); };
     await retry(config, throwing);
-    expect(grantCalls).toBe(1);
-    expect(current()).toBe(before);
-    // And a later call cannot revive it: the entry was dropped.
-    await retry(config, () => platformPolicy());
-    expect(grantCalls).toBe(1);
-    expect(current()).toBe(before);
+    expect(grantCalls).toBe(2);
+    expect(current()).toContain("BYTEDCLI_USER_CLOUD_JWT='cloud-jwt'");
   });
 
   it('still writes the grant when the source was switched to auto mid-flight', async () => {
@@ -398,21 +396,26 @@ describe('transient platform refusal within a turn', () => {
     });
     await retry();
     expect(readBindingCalls).toBe(1);
-    expect(current()).toBe(before);
+    expect(current()).not.toBe(before);
+    expect(current()).toContain("BOTMUX_IDENTITY_MODE='denied'");
+    expect(current()).toContain('platform_unbound');
     later();
     await retry();
     expect(readBindingCalls).toBe(1);
   });
 
-  it('stops after a bounded number of re-asks while the platform stays down', async () => {
+  it('keeps rate-limited re-asks beyond the old hard cap, then expires at the turn TTL', async () => {
     responses = [NETWORK_DOWN];
     await prepare();
-    for (let i = 0; i < TRANSIENT_REFUSAL_MAX_RETRIES + 3; i++) {
+    for (let i = 0; i < 8; i++) {
       later();
       await retry();
     }
-    expect(grantCalls).toBe(1 + TRANSIENT_REFUSAL_MAX_RETRIES);
+    expect(grantCalls).toBe(9);
     expect(current()).toContain("BOTMUX_IDENTITY_MODE='denied'");
+    later(TRANSIENT_REFUSAL_TTL_MS + 1);
+    await retry();
+    expect(grantCalls).toBe(9);
   });
 
   it('the single-file model publishes the refusal as before and registers nothing', async () => {

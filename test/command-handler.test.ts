@@ -751,7 +751,7 @@ import * as sessionStore from '../src/services/session-store.js';
 import { resetSessionCodexModelSelection } from '../src/core/worker-pool.js';
 import * as scheduleStore from '../src/services/schedule-store.js';
 import * as scheduler from '../src/core/scheduler.js';
-import { deleteMessage, sendMessage, sendUserMessage, replyMessage, listChatBotMembers, getChatModeStrict, getMessageThreadId, getMessageDetail, UserTokenMissingError } from '../src/im/lark/client.js';
+import { deleteMessage, sendMessage, sendUserMessage, sendEphemeralCard, replyMessage, listChatBotMembers, getChatModeStrict, getMessageThreadId, getMessageDetail, UserTokenMissingError } from '../src/im/lark/client.js';
 import { recordP2pForceTopicRoot, removeP2pForceTopicRoot } from '../src/services/p2p-force-topic-store.js';
 import { buildAdoptSelectCard, buildRepoSelectCard, buildSlashListCard, buildSessionClosedCard } from '../src/im/lark/card-builder.js';
 import { createGroupWithBots } from '../src/services/group-creator.js';
@@ -3384,14 +3384,20 @@ describe('handleCommand', () => {
       expect(posted).toBe(t('auth_link.sent_privately', undefined, 'zh'));
 
       vi.mocked(sendUserMessage).mockRejectedValueOnce(new Error('230013'));
+      vi.mocked(sendEphemeralCard).mockClear();
       const failed = makeDeps(makeDaemonSession({ chatType: 'group' }));
       await handleCommand(
         '/subscribe-lark-doc', ROOT_ID,
         makeLarkMessage('/subscribe-lark-doc https://example.feishu.cn/docx/AbCdEf12345678901234'),
         failed, LARK_APP_ID,
       );
-      expect((failed.sessionReply as ReturnType<typeof vi.fn>).mock.calls.map(c => c[1]).join('\n'))
-        .toBe(t('auth_link.dm_failed', { command: '/subscribe-lark-doc' }, 'zh'));
+      expect(sendEphemeralCard).toHaveBeenCalledTimes(1);
+      const [appId, chatId, openId, cardJson] = vi.mocked(sendEphemeralCard).mock.calls[0]!;
+      expect([appId, chatId, openId]).toEqual(['app-1', CHAT_ID, 'ou_sender']);
+      expect(cardJson).toContain('https://open.feishu.cn/auth/v1/test');
+      const fallbackPosted = (failed.sessionReply as ReturnType<typeof vi.fn>).mock.calls.map(c => c[1] as string).join('\n');
+      expect(fallbackPosted).toBe(t('auth_link.sent_ephemeral', undefined, 'zh'));
+      expect(fallbackPosted).not.toContain('https://');
     });
 
     it('/watch-comment works without a User Token and records the comment watch', async () => {
@@ -7657,7 +7663,10 @@ describe('handleCommand', () => {
         ({ teamId: 't1', teamName: 'T', groupChatIds: [], bots: [], memberUnionIds });
       const groupReplies = (deps: any) =>
         (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls.map(c => c[1] as string);
-      beforeEach(() => { vi.mocked(sendUserMessage).mockClear(); });
+      beforeEach(() => {
+        vi.mocked(sendUserMessage).mockClear();
+        vi.mocked(sendEphemeralCard).mockClear();
+      });
       afterEach(() => {
         vi.mocked(readPlatformTeamSync).mockReturnValue(null);
         vi.mocked(platformMachineOwner).mockReturnValue({});
@@ -7864,12 +7873,16 @@ describe('handleCommand', () => {
         expect(replies(deps).join('\n')).not.toContain('https://');
       });
 
-      it('DM fails: tells the sender to message the bot privately, never posts the link', async () => {
+      it('DM fails: sends a requester-only card, never posts the link publicly', async () => {
         vi.mocked(sendUserMessage).mockRejectedValueOnce(new Error('230013'));
         const deps = makeDeps(makeDaemonSession({ chatType: 'group' }));
         await handleCommand('/login', ROOT_ID, makeLarkMessage('/login bytedcli cn'), deps, LARK_APP_ID);
         const text = replies(deps).join('\n');
-        expect(text).toBe(t('auth_link.dm_failed', { command: '/login bytedcli cn' }, 'zh'));
+        expect(sendEphemeralCard).toHaveBeenCalledTimes(1);
+        const [appId, chatId, openId, cardJson] = vi.mocked(sendEphemeralCard).mock.calls[0]!;
+        expect([appId, chatId, openId]).toEqual(['app-1', CHAT_ID, 'ou_sender']);
+        expect(cardJson).toContain('https://cloud.example.com/auth?state=x');
+        expect(text).toBe(t('auth_link.sent_ephemeral', undefined, 'zh'));
         expect(text).not.toContain('https://');
       });
 

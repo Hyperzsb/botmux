@@ -8,6 +8,7 @@
  * importing the whole dashboard server.
  */
 import type { requestUserAuthorization } from '../utils/user-token.js';
+import type { PrivateAuthLinkDelivery } from './auth-link-delivery.js';
 
 /** Provider poll handle; the store never inspects it. */
 export type SessionAuthPoll = () => Promise<
@@ -33,6 +34,8 @@ export interface SessionAuthRequest {
   isCurrent: () => boolean;
   /** Session/app liveness used to keep or retire the daemon-side background poll. */
   isValid: () => boolean;
+  /** Confirmed private delivery; absent while sending (or for inline requests). */
+  delivery?: PrivateAuthLinkDelivery;
   status: 'pending' | 'ready' | 'failed';
   expiresAt: number;
   poll: SessionAuthPoll;

@@ -22,8 +22,8 @@ export interface PendingCliInput {
   /** Admission-frozen mode for the exact queued turn. */
   linkRefMode?: Exclude<LinkRefMode, 'disabled'>;
   /** Open id of the human whose turn this is. The worker publishes it beside
-   *  the live-turn marker so the identity wrapper can keep a same-principal
-   *  credential across consecutive turns. */
+   *  the live-turn marker for exact-principal audit/revocation; credential
+   *  selection remains bound to the logical identity turn. */
   turnCallerOpenId?: string;
   codexAppDispatchId?: string;
   /** Explicit positive steer authorization copied from the daemon ledger entry

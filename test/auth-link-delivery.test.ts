@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { deliverAuthLink } from '../src/core/auth-link-delivery.js';
+import { authLinkCard, deliverAuthLink } from '../src/core/auth-link-delivery.js';
 import { t } from '../src/i18n/index.js';
 
 const LINK = 'https://accounts.example/device/verify?user_code=ABCD';
@@ -7,10 +7,12 @@ const LINK = 'https://accounts.example/device/verify?user_code=ABCD';
 function harness(dm: () => Promise<unknown> = async () => 'om_dm') {
   const inPlace: string[] = [];
   const direct: Array<[string, string]> = [];
+  const ephemeral: Array<[string, string]> = [];
   return {
-    inPlace, direct,
+    inPlace, direct, ephemeral,
     replyInPlace: async (text: string) => { inPlace.push(text); },
     sendDirect: vi.fn(async (openId: string, text: string) => { direct.push([openId, text]); return dm(); }),
+    sendEphemeral: vi.fn(async (openId: string, card: string) => { ephemeral.push([openId, card]); return 'om_ephemeral'; }),
   };
 }
 
@@ -29,8 +31,19 @@ describe('deliverAuthLink', () => {
     expect(h.inPlace).toEqual([t('auth_link.sent_privately', undefined, 'zh')]);
   });
 
-  it('group, DM fails: asks for a private /login and never posts the link', async () => {
+  it('group, DM fails: falls back to a card visible only to the initiator', async () => {
     const h = harness(async () => { throw new Error('230013'); });
+    expect(await deliverAuthLink({
+      privateChat: false, openId: 'ou_a', text: LINK, ...h, locale: 'zh', privateCommand: '/login bytedcli',
+    })).toBe('ephemeral');
+    expect(h.ephemeral).toEqual([['ou_a', authLinkCard(LINK)]]);
+    expect(h.inPlace).toEqual([t('auth_link.sent_ephemeral', undefined, 'zh')]);
+    expect(h.inPlace.join('')).not.toContain(LINK);
+  });
+
+  it('group, both private channels fail: asks for a private /login and never posts the link', async () => {
+    const h = harness(async () => { throw new Error('230013'); });
+    h.sendEphemeral.mockRejectedValueOnce(new Error('18053'));
     expect(await deliverAuthLink({
       privateChat: false, openId: 'ou_a', text: LINK, ...h, locale: 'zh', privateCommand: '/login bytedcli',
     })).toBe('dm_failed');

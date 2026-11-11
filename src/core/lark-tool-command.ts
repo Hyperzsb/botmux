@@ -7,7 +7,6 @@ export interface LarkToolInvocation {
   showHelp: boolean;
   /** Index of the actual flag terminator, excluding '--' used as a value. */
   literalIndex: number;
-  passthroughProfile?: string;
 }
 
 interface CommandHelp {
@@ -67,7 +66,6 @@ export function parseLarkToolInvocation(
   const inheritedFlags = new Map([...metadata.flags].filter(([, flag]) => flag.name !== '--help' && flag.name !== '--version'));
   let mode = binding.defaultAs, sawAs = false, sawProfile = false;
   let showHelp = false, version = false, doctorOffline = false, literalIndex = -1;
-  let passthroughProfile: string | undefined;
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
     if (arg === '--') {
@@ -104,10 +102,7 @@ export function parseLarkToolInvocation(
         if (value === binding.appId) {
           continue;
         }
-        passthroughProfile = value;
-        output.push(arg);
-        if (flag.takesValue && inlineValue === undefined) output.push(value);
-        continue;
+        throw new Error('Managed lark-cli cannot switch profiles; use an explicit host-mode turn for another profile');
       }
       if (flag.name === '--help') showHelp = value !== 'false';
       if (flag.name === '--version') version = value !== 'false';
@@ -135,21 +130,17 @@ export function parseLarkToolInvocation(
     || root === 'doctor' && doctorOffline;
   const supportsAs = metadata.flags.has('--as');
   if (sawAs && !supportsAs && !showHelp) throw new Error('This lark-cli command does not accept --as');
-  if (!offline && !passthroughProfile && ['auth', 'profile', 'config', 'update'].includes(root)
+  if (!offline && ['auth', 'profile', 'config', 'update'].includes(root)
     && !(root === 'auth' && sub === 'status')) {
     throw new Error('Managed lark-cli cannot change accounts. For this application authorization use botmux auth request --scope "<required scopes>" --json');
   }
-  return { args: output, mode, sawAs, offline, supportsAs, showHelp, literalIndex, passthroughProfile };
+  return { args: output, mode, sawAs, offline, supportsAs, showHelp, literalIndex };
 }
 
 export function larkToolExecutionArgs(invocation: LarkToolInvocation): string[] {
   const args = [...invocation.args];
-  if (!invocation.offline) {
-    if (!invocation.passthroughProfile && invocation.supportsAs) {
-      args.splice(invocation.literalIndex < 0 ? args.length : invocation.literalIndex, 0, '--as', invocation.mode);
-    } else if (invocation.passthroughProfile && invocation.sawAs && invocation.supportsAs) {
-      args.splice(invocation.literalIndex < 0 ? args.length : invocation.literalIndex, 0, '--as', invocation.mode);
-    }
+  if (!invocation.offline && invocation.supportsAs) {
+    args.splice(invocation.literalIndex < 0 ? args.length : invocation.literalIndex, 0, '--as', invocation.mode);
   }
   return args;
 }

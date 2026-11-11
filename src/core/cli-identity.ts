@@ -191,13 +191,11 @@ function dropMatchingEnvFiles(dir: string, openId: string): number {
 /**
  * Drop published trigger-user identities stamped for `openId`.
  *
- * The same-principal wrapper keeps a credential when `BOTMUX_IDENTITY_OPEN_ID`
- * still matches the live caller, so deleting the token store is not enough
- * until the next publish overwrites the snapshot. Proven bodies live in this
- * process; single-snapshot `.env` files live under the session data dir.
- * Denial files have no open-id line and are left alone, except a codebase
- * companion whose bytedcli body was just removed and which does not name a
- * different person.
+ * Proven bodies live in this process; single-snapshot `.env` files live under
+ * the session data dir. Every new denial is principal-stamped too, so revoke
+ * can remove both grants and refusals without guessing from prose. Legacy
+ * unstamped denials are left alone, except a codebase companion whose bytedcli
+ * body was just removed and which does not name a different person.
  */
 export function dropPublishedIdentitiesForOpenId(sessionDataDir: string, openId: string): number {
   if (!isUsableOpenId(openId)) return 0;
@@ -368,11 +366,12 @@ function identityTurnKey(turnId: string): string {
  * *accepted*, the worker writes this when a turn actually *starts*. The gap
  * between those is the whole problem — see {@link renderIdentityWrapper}.
  *
- * Plain text, four lines: turn, caller, sha256(identity turn), identity turn.
- * The single-model wrapper reads the record once in `/bin/sh` on every
- * invocation (the first two lines plus the file); the proven-model wrapper
- * selects no identity from disk and does not read it. Daemon refresh checks
- * use line 4 as a liveness gate.
+ * Plain text, four lines: execution turn, caller, sha256(identity turn),
+ * identity turn. The single-model wrapper reads the record once in `/bin/sh`
+ * on every invocation and compares its snapshot with line 4; line 1 may name
+ * a newer envelope whose input was merged into the still-running identity
+ * turn. The proven-model wrapper selects no identity from disk and does not
+ * read it. Daemon refresh checks use the same line 4 liveness gate.
  */
 export function sessionActiveTurnPath(sessionDataDir: string, sessionId: string): string {
   return join(sessionIdentityDataDir(sessionDataDir, sessionId), 'turn');
@@ -507,8 +506,9 @@ export function identityToolsFor(tools: readonly TriggerUserAuthTool[]): Identit
 }
 
 /** Common to every variant: the turn these credentials were published FOR.
- *  The wrapper refuses to use them during any other turn. Absent ⇒ no binding
- *  (the pre-turn-binding paths, and tests that do not exercise it). */
+ *  The wrapper refuses to use them during any other turn. The field remains
+ *  optional for pure rendering/storage helpers, but an executable single-file
+ *  identity without it is denied because it carries no turn authority. */
 interface TurnBound {
   turnId?: string;
 }
@@ -517,9 +517,8 @@ export interface LarkCliIdentity extends TurnBound {
   tool: 'lark-cli';
   appId: string;
   userAccessToken: string;
-  /** Open id this token acts for. Lets the wrapper keep a turn-mismatched but
-   *  same-principal credential usable — a person's own follow-up turn must not
-   *  be denied while their previous turn is still draining. */
+  /** Open id this token acts for. Used for exact-principal audit and
+   *  compare-and-set refresh; it never relaxes exact-turn binding. */
   openId?: string;
 }
 
@@ -601,6 +600,10 @@ export interface DeniedIdentity extends TurnBound {
   tool: IdentityTool;
   mode: 'denied';
   message: string;
+  /** Principal frozen for this turn. A refusal is still an identity decision:
+   * stamping it prevents a later recovery from silently granting a different
+   * person when a queued turn or login completes concurrently. */
+  openId?: string;
 }
 
 /** Explicit native execution, bound to one daemon-admitted turn. Absence of
@@ -915,8 +918,43 @@ export function sessionIdentityMaterialPresent(
   turnId: string,
   model: IdentityStorageModel,
 ): boolean {
-  if (model === 'proven') return recallProvenIdentityContent(sessionDataDir, sessionId, turnId, tool) !== undefined;
-  return existsSync(join(sessionIdentityDataDir(sessionDataDir, sessionId), `${tool}.env`));
+  const body = model === 'proven'
+    ? recallProvenIdentityContent(sessionDataDir, sessionId, turnId, tool)
+    : (() => {
+        try { return readFileSync(join(sessionIdentityDataDir(sessionDataDir, sessionId), `${tool}.env`), 'utf8'); }
+        catch { return undefined; }
+      })();
+  return body !== undefined
+    && body.split('\n').includes(`${TURN_VAR}=${quoteFor(TURN_VAR, turnId)}`);
+}
+
+/** Whether this exact turn admitted a managed lark-cli user decision that may
+ * request additional OAuth scopes. Dashboard policy is intentionally absent:
+ * a live edit applies to later turns and must neither expand a host turn nor
+ * revoke a denial/user decision already frozen for this one. */
+export function sessionIdentityAllowsLarkUserAuthorization(
+  sessionDataDir: string,
+  sessionId: string,
+  turnId: string,
+  principalOpenId: string,
+  model: IdentityStorageModel,
+): boolean {
+  const body = model === 'proven'
+    ? recallProvenIdentityContent(sessionDataDir, sessionId, turnId, 'lark-cli')
+    : (() => {
+        try { return readFileSync(join(sessionIdentityDataDir(sessionDataDir, sessionId), 'lark-cli.env'), 'utf8'); }
+        catch { return undefined; }
+      })();
+  if (!body) return false;
+  const lines = body.split('\n');
+  if (!lines.includes(`${TURN_VAR}=${quoteFor(TURN_VAR, turnId)}`)) return false;
+  // A generic/no-sender denial is not a user decision. The principal in the
+  // current execution proof must be the exact principal frozen in this body;
+  // otherwise an automatic turn with no assigned user could turn its denial
+  // into whichever human happened to interact with the session later.
+  if (!lines.includes(identityOpenIdLine(principalOpenId))) return false;
+  return ['denied', 'user', 'user-home'].some(mode =>
+    lines.includes(`${MODE_VAR}=${quoteFor(MODE_VAR, mode)}`));
 }
 
 function isDeniedIdentity(identity: CliIdentity): identity is DeniedIdentity {
@@ -932,13 +970,20 @@ export function codebaseCompanionOf(identity: BytedCliIdentity | DeniedIdentity 
     return { tool: CODEBASE_COMPANION_TOOL, mode: 'host', ...turn };
   }
   if (isDeniedIdentity(identity)) {
-    return { tool: CODEBASE_COMPANION_TOOL, mode: 'denied', message: identity.message, ...turn };
+    return {
+      tool: CODEBASE_COMPANION_TOOL,
+      mode: 'denied',
+      message: identity.message,
+      ...turn,
+      ...(identity.openId ? { openId: identity.openId } : {}),
+    };
   }
   if (!identity.codeJwt) {
     return {
       tool: CODEBASE_COMPANION_TOOL,
       mode: 'denied',
       ...turn,
+      ...(identity.openId ? { openId: identity.openId } : {}),
       message: 'botmux: ByteCloud 已授权，但本轮未能换取 Codebase 身份（Codebase JWT），codebase 命令未执行；请稍后重试，不会改用机器自己的 Codebase 登录。',
     };
   }
@@ -975,15 +1020,12 @@ export function refreshSessionIdentity(
     // completed the device grant.
     const stamped = lines.find(line => line.startsWith(`${OPEN_ID_VAR}=`));
     if (stamped && stamped !== `${OPEN_ID_VAR}=${quoteFor(OPEN_ID_VAR, openId ?? '')}`) return false;
-    // Proven content is addressed by execution proof, so the live turn marker
-    // only has to still name this identity turn. The single-snapshot model
-    // compares its first line (envelope turn), as before.
+    // Identity material is bound to the logical identity turn, which can be
+    // older than the current execution envelope when a supplement is merged
+    // into in-flight work. Both storage models therefore gate on marker line
+    // 4; line 1 is execution attribution and must not select credentials.
     const active = readFileSync(sessionActiveTurnPath(sessionDataDir, sessionId), 'utf8').split('\n');
-    if (model === 'proven') {
-      if ((active[3] ?? active[0]) !== identity.turnId) return false;
-    } else if ((active[0] ?? '').trim() !== identity.turnId) {
-      return false;
-    }
+    if ((active[3] ?? '').trim() !== identity.turnId) return false;
   } catch {
     return false;
   }
@@ -1350,34 +1392,24 @@ export function renderIdentityWrapper(
     '    eval "$__botmux_cred_body"',
     '  fi',
     '  if [ -f "$__botmux_d/turn" ]; then',
-    '    { read -r __botmux_live; read -r __botmux_live_caller; } < "$__botmux_d/turn" || true',
+    '    { read -r __botmux_live; read -r __botmux_live_caller; read -r __botmux_live_identity_key; read -r __botmux_live_identity; } < "$__botmux_d/turn" || true',
     '  fi',
     '  unset __botmux_d __botmux_cred',
     'fi',
-    // Only enforced when both sides state a turn. An identity published without
-    // one predates turn binding; a session with no live turn file has nothing to
-    // contradict. Neither is evidence of a mismatch, so neither refuses here.
-    `if [ -n "$${TURN_VAR}" ] && [ -n "$__botmux_live" ] \\`,
-    `   && [ "$${TURN_VAR}" != "$__botmux_live" ]; then`,
-    `  __botmux_published_mode=$${MODE_VAR}`,
-    `  ${MODE_VAR}=turn-mismatch`,
-    // Same human across consecutive turns (their follow-up was accepted while
-    // the previous turn is still draining): the credential acts for exactly the
-    // person the worker is now executing, so keep it. Only a NAMED match on both
-    // sides relaxes; anything missing stays a refusal. Restore the published
-    // mode (user/user-home/bot) so the case dispatch below runs normally.
-    `  if [ -n "$${OPEN_ID_VAR}" ] && [ -n "$__botmux_live_caller" ] \\`,
-    `     && [ "$${OPEN_ID_VAR}" = "$__botmux_live_caller" ]; then`,
-    `    ${MODE_VAR}=$__botmux_published_mode`,
-    '  fi',
-    'fi',
-    // Native execution is new and carries no legacy unbound credentials.
-    // Require the live turn explicitly: idle/finished single-model sessions
-    // retain their snapshot, but must never keep host authority in background.
-    `if [ "$${MODE_VAR}" = host ] && { [ -z "$${TURN_VAR}" ] || [ -z "$__botmux_live" ] || [ "$${TURN_VAR}" != "$__botmux_live" ]; }; then`,
+    // The single-snapshot fallback has no daemon lineage proof, so both sides
+    // must state the SAME identity turn. Missing is not legacy permission: it
+    // is absent authority. The execution envelope (line 1) can legitimately
+    // rotate while the frozen identity turn (line 4) keeps running, but even
+    // the same person cannot reuse material from any other identity turn.
+    // Preserve the distinct "nothing was published yet" diagnostic when the
+    // file is absent/empty. Once any recognized identity decision exists, a
+    // missing or different turn is an authority mismatch and must refuse as
+    // such (including legacy unbound identities).
+    `if [ -n "$${MODE_VAR}" ] && { [ -z "$${TURN_VAR}" ] || [ -z "$__botmux_live_identity" ] \\`,
+    `   || [ "$${TURN_VAR}" != "$__botmux_live_identity" ]; }; then`,
     `  ${MODE_VAR}=turn-mismatch`,
     'fi',
-    'unset __botmux_live __botmux_live_caller __botmux_published_mode',
+    'unset __botmux_live __botmux_live_caller __botmux_live_identity_key __botmux_live_identity',
   ];
   return [
     '#!/bin/sh',
@@ -1391,9 +1423,8 @@ export function renderIdentityWrapper(
     `${MODE_VAR}=`,
     `${DENY_MSG_VAR}=`,
     // Clear inherited copies before loading: a parent process that exports a
-    // forged OPEN_ID/TURN could otherwise flip a cross-principal refusal into
-    // the same-principal allowance. The values are re-set below from the
-    // daemon-provided identity when it carries them.
+    // forged OPEN_ID/TURN could otherwise falsify audit state. The values are
+    // re-set below from the daemon-provided identity when it carries them.
     `${TURN_VAR}=`,
     `${OPEN_ID_VAR}=`,
     // Same for the per-exec HOME: an inherited value must not redirect an
@@ -1401,6 +1432,8 @@ export function renderIdentityWrapper(
     `${HOME_VAR}=`,
     '__botmux_live=',
     '__botmux_live_caller=',
+    '__botmux_live_identity_key=',
+    '__botmux_live_identity=',
     // Function only; it runs AFTER identity resolution at each exec site, with
     // the HOME that exec will use (per-person scratch HOME or machine HOME).
     ...(tool === 'bytedcli' ? BYTEDCLI_LOGIN_GUARD_FN : []),
@@ -1413,6 +1446,24 @@ export function renderIdentityWrapper(
     `  unset ${MODE_VAR} ${DENY_MSG_VAR} ${TURN_VAR} ${OPEN_ID_VAR} ${HOME_VAR} __botmux_cred_body`,
     `  exec ${shellSingleQuote(realBinaryPath)} "$@"`,
     'fi',
+    // Profiles are credential selectors in the governed CLIs. They remain
+    // valid in explicit host mode above, but a managed turn may not use one to
+    // replace the daemon-selected principal while keeping the same command
+    // syntax otherwise.
+    `case "$${MODE_VAR}" in`,
+    '  user|bot|user-home|bytedcli-user|larkdev-user)',
+    '    for __botmux_profile_arg in "$@"; do',
+    '      case "$__botmux_profile_arg" in',
+    '        --) break ;;',
+    '        --profile|--profile=*)',
+    `          printf '%s\\n' 'botmux: 当前工具身份由本轮执行主体固定，受管模式不能通过 --profile 切换凭据；命令未执行。' >&2`,
+    `          exit ${IDENTITY_DENIED_EXIT_CODE}`,
+    '          ;;',
+    '      esac',
+    '    done',
+    '    unset __botmux_profile_arg',
+    '    ;;',
+    'esac',
     `__botmux_resolved_mode="$${MODE_VAR}"`,
     // BYTEDCLI_CLOUD_SITE selects which current-turn token is required. Capture
     // it before the ambient identity scrub below, then keep it shell-local so
@@ -1868,6 +1919,25 @@ export function installIdentityWrapper(
   return path;
 }
 
+/** Reserve a governed command name even when its real binary is absent. This
+ * keeps a later PATH/login-shell lookup from falling through to an ungoverned
+ * machine binary while preserving the normal "not installed" exit category. */
+export function installUnavailableIdentityWrapper(
+  binDir: string,
+  tool: IdentityTool,
+): string {
+  mkdirSync(binDir, { recursive: true, mode: 0o700 });
+  const path = join(binDir, tool);
+  atomicWriteFileSync(path, [
+    '#!/bin/sh',
+    IDENTITY_WRAPPER_MARKER,
+    `printf '%s\\n' 'botmux: ${tool} 未安装或不在会话 PATH 中，命令未执行。' >&2`,
+    'exit 127',
+    '',
+  ].join('\n'), { mode: 0o755 });
+  return path;
+}
+
 /**
  * Git credential helper, so a push is attributed to the person who asked for it.
  *
@@ -2222,54 +2292,36 @@ export function prepareTriggerUserCliEnv(
       model,
     );
   } catch (e) {
-    log(`[trigger-user-auth] WARN could not initialize identity storage: ${(e as Error).message}`);
+    throw new Error(`[trigger-user-auth] could not initialize identity storage: ${(e as Error).message}`, { cause: e });
   }
-  let installedAny = false;
   for (const tool of identityTools) {
     try {
       const real = findRealToolBinary(tool, childEnv.PATH, [wrapperDir]);
       if (!real) {
-        log(`[trigger-user-auth] ${tool} is not installed; no wrapper written`);
+        installUnavailableIdentityWrapper(wrapperDir, tool);
+        log(`[trigger-user-auth] ${tool} is not installed; fail-closed placeholder written`);
         continue;
       }
       const realInSession = sessionVisiblePath(real, canonicalPaths);
       installIdentityWrapper(wrapperDir, tool, realInSession, model, identityResolver);
-      installedAny = true;
       log(`[trigger-user-auth] wrapping ${tool} -> ${realInSession}`);
     } catch (e) {
-      // A missing wrapper means the tool keeps its previous behavior; it must
-      // not stop the session from starting.
-      log(`[trigger-user-auth] WARN could not wrap ${tool}: ${(e as Error).message}`);
+      // A governed real binary without its wrapper would silently use the
+      // machine account. Identity enforcement is a launch prerequisite.
+      throw new Error(`[trigger-user-auth] could not enforce ${tool} wrapper: ${(e as Error).message}`, { cause: e });
     }
   }
-  // Every governed tool failed to wrap, yet the policy is on. The session
-  // then runs completely unprotected while the operator believes otherwise —
-  // the failure mode observed in production, where the agent cheerfully
-  // reported `identity: user` (the machine account) as "normal". Absence of a
-  // wrapper is invisible by nature, so it has to be said out loud.
-  if (!installedAny) {
-    log('[trigger-user-auth] WARN no tool wrapper installed — this session is NOT running under '
-      + 'trigger-user identity; calls will use whatever credentials the machine has');
-  }
-  if (installedAny) {
-    childEnv.PATH = [wrapperDir, ...(childEnv.PATH ?? '').split(delimiter).filter(p => p !== wrapperDir)].join(delimiter);
-    // A prepend alone loses to path_helper in the login shell the agent's
-    // tool calls run through — see installLoginShellPathShim. These three
-    // vars put the wrapper dir back in front after the system startup files
-    // have run, without touching the user's dotfiles.
-    try {
-      const { zdotdir, bashEnv } = installLoginShellPathShim(wrapperDir);
-      childEnv.BOTMUX_IDENTITY_BIN = wrapperDir;
-      childEnv.BOTMUX_WRAPPER_BIN = resolveBotmuxWrapperBinDir(childEnv);
-      childEnv.ZDOTDIR = zdotdir;
-      childEnv.BASH_ENV = bashEnv;
-    } catch (e) {
-      // Without the shim a login shell resolves the REAL tool, which is the
-      // silent-bypass this feature exists to prevent. Say so loudly rather
-      // than letting the session look protected while it is not.
-      log(`[trigger-user-auth] WARN login-shell PATH shim not installed (${(e as Error).message}); `
-        + `tool calls made through a login shell may bypass the identity wrapper`);
-    }
+  childEnv.PATH = [wrapperDir, ...(childEnv.PATH ?? '').split(delimiter).filter(p => p !== wrapperDir)].join(delimiter);
+  // A prepend alone loses to path_helper in the login shell the agent's tool
+  // calls run through. Without this shim, wrapper enforcement is not real.
+  try {
+    const { zdotdir, bashEnv } = installLoginShellPathShim(wrapperDir);
+    childEnv.BOTMUX_IDENTITY_BIN = wrapperDir;
+    childEnv.BOTMUX_WRAPPER_BIN = resolveBotmuxWrapperBinDir(childEnv);
+    childEnv.ZDOTDIR = zdotdir;
+    childEnv.BASH_ENV = bashEnv;
+  } catch (e) {
+    throw new Error(`[trigger-user-auth] login-shell PATH enforcement unavailable: ${(e as Error).message}`, { cause: e });
   }
   // Git attribution: a push over HTTPS to Codebase authenticates with a
   // Codebase JWT, which git mints via GIT_ASKPASS and which reads none of the
@@ -2304,7 +2356,7 @@ export function prepareTriggerUserCliEnv(
         }
       }
     } catch (e) {
-      log(`[trigger-user-auth] WARN could not install the git credential helper: ${(e as Error).message}`);
+      throw new Error(`[trigger-user-auth] could not enforce git credential attribution: ${(e as Error).message}`, { cause: e });
     }
   }
   return gitConfigPairs;

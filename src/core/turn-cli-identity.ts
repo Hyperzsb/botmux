@@ -31,8 +31,6 @@ import { isLarkToolBound } from './lark-tool-binding.js';
 import { rememberLarkToolDelegation } from './lark-tool-delegation.js';
 import { registerActiveIdentityTurn } from './active-identity-turns.js';
 import {
-  credentialSourceOf,
-  triggerUserAuthApplies,
   TRIGGER_USER_AUTH_TOOLS,
   type TriggerUserAuthConfig,
   type TriggerUserAuthTool,
@@ -49,10 +47,13 @@ import {
   type PlatformIdentityResolution,
 } from './platform-credential-source.js';
 import {
+  CODEBASE_COMPANION_TOOL,
+  codebaseCompanionOf,
   writeSessionIdentity,
   clearSessionIdentity,
   recallProvenIdentityContent,
   type CliIdentity,
+  type IdentityTool,
 } from './cli-identity.js';
 import { trackBytedcliIdentityRenewal } from './bytedcli-identity-renewal.js';
 
@@ -261,8 +262,18 @@ async function publishTurnCliIdentityNow(
   const identityPolicy = args.policy ?? normalizeToolIdentityPolicy(botConfig);
   const outcomes: ToolIdentityOutcome[] = [];
   // Record before the new-entry shortcut (and before first worker spawn).
-  // The daemon has already verified the signed dispatch and target access.
-  rememberLarkToolDelegation(sessionDataDir, sessionId, turnId, args.delegatedIdentity);
+  // The daemon has already verified the signed dispatch and target access. The
+  // receiver's per-turn governance is intersected NOW as an admission fact:
+  // the managed Lark route must not re-read a Dashboard policy edit mid-turn
+  // and thereby expand or revoke this already-frozen delegation.
+  const rememberedDelegation = args.delegatedIdentity
+    ? {
+        ...args.delegatedIdentity,
+        tools: args.delegatedIdentity.tools.filter(tool =>
+          tool !== 'lark-cli' || identityPolicy.perTurnTools.includes('lark-cli')),
+      }
+    : undefined;
+  rememberLarkToolDelegation(sessionDataDir, sessionId, turnId, rememberedDelegation);
   // Anchor the published turn in the terminal-GC retention ledger for the whole
   // accept→queue→execute window. The worker's own queue marker is CLI-writable
   // and cannot serve as that anchor.
@@ -405,6 +416,7 @@ function denyDelegated(tool: TriggerUserAuthTool, args: PublishTurnIdentityArgs,
   try {
     writeSessionIdentity(args.sessionDataDir, args.sessionId, {
       tool, mode: 'denied', ...(args.turnId ? { turnId: args.turnId } : {}),
+      ...(user.targetOpenId ? { openId: user.targetOpenId } : {}),
       message: `botmux: delegated ${tool} execution refused for the requesting user. `
         + `Report this blocker with botmux report --dispatch-root ${user.dispatchRoot}; `
         + reason + ' Do not ask a bot to log in or use another identity.',
@@ -416,8 +428,36 @@ function denyDelegated(tool: TriggerUserAuthTool, args: PublishTurnIdentityArgs,
 }
 
 async function publishDelegated(tool: TriggerUserAuthTool, args: PublishTurnIdentityArgs, user: DelegatedCliIdentity, source: TriggerUserAuthCredentialSource): Promise<ToolIdentityOutcome> {
-  if (!user.tools.includes(tool)) return denyDelegated(tool, args, user);
+  // The selector exposes `permitted`, but publication must enforce the grant
+  // itself too: this is the last boundary before a credential is materialized.
+  // A denied validation, inactive handoff, missing target principal or excluded
+  // tool is never allowed to reach either platform or local credential stores.
+  if (user.denialReason || !user.targetOpenId || !user.tools.includes(tool)) {
+    return denyDelegated(tool, args, user);
+  }
   let identity: CliIdentity | null = null;
+  let platformRefusal: Exclude<PlatformIdentityResolution, { state: 'granted' }> | undefined;
+  const remember = (kind: RefreshableCredentialRefusalKind, consent?: boolean) => {
+    if (!args.turnId || args.storageModel !== 'proven' || !user.targetOpenId) return;
+    rememberRefreshableCredentialRefusal({
+      botConfig: args.botConfig,
+      sessionSandbox: args.sessionSandbox ?? args.botConfig.sandbox,
+      tool,
+      publishedTool: tool,
+      sessionDataDir: args.sessionDataDir,
+      sessionId: args.sessionId,
+      turnId: args.turnId,
+      principalOpenId: user.targetOpenId,
+      credentialOpenId: user.credentialOpenId,
+      unionId: user.unionId,
+      credentialSource: source,
+      locale: args.locale,
+      privateChat: args.privateChat === true,
+      delegated: user,
+      kind,
+      ...(consent !== undefined ? { consent } : {}),
+    });
+  };
   // Platform first, keyed by the union_id in the verified dispatch record. The
   // issuer-scoped credentialOpenId means nothing to this bot's app, and
   // re-deriving the union_id from targetOpenId would hang the grant on a
@@ -430,40 +470,76 @@ async function publishDelegated(tool: TriggerUserAuthTool, args: PublishTurnIden
       sessionId: args.sessionId, ...(args.turnId ? { turnId: args.turnId } : {}),
     });
     if (platform.state === 'granted') identity = platform.identity;
-    else if (source === 'platform') return denyDelegated(tool, args, user);
+    else platformRefusal = platform;
   }
+  const platformAuthoritative = !!platformRefusal
+    && (source === 'platform' || platformRefusal.state !== 'unbound');
   let localMint = false;
-  if (!identity && tool === 'bytedcli') {
-    // Keep the issuer-scoped credential key; do not copy a source open_id into
-    // the target app or duplicate/extend the lifetime of the user's login.
-    const cloudJwts = await mintByteCloudUserJwts(user.credentialOpenId);
-    if (cloudJwts) {
-      const codeJwt = await codebaseJwtFor(user.credentialOpenId, cloudJwts);
-      identity = { tool, cloudJwts, ...(codeJwt ? { codeJwt } : {}) };
-      localMint = true;
+  if (!identity && source !== 'platform') {
+    try {
+      identity = await resolveIdentityFor(
+        tool, args.botConfig, args.sessionSandbox ?? args.botConfig.sandbox,
+        args.sessionDataDir, args.sessionId, user.credentialOpenId,
+      );
+      localMint = !!identity;
+    } catch (error) {
+      logger.warn(`[trigger-user-auth] delegated local ${tool} provider unavailable for session ${args.sessionId}: ${
+        error instanceof Error ? error.message : String(error)}`);
+      if (!platformAuthoritative) {
+        const outcome = user.targetOpenId
+          ? refuseLocalProviderUnavailable(
+              tool, args.botConfig, args.sessionDataDir, args.sessionId, user.targetOpenId,
+              args.locale, args.turnId, args.storageModel,
+            )
+          : denyDelegated(tool, args, user);
+        remember('local_unavailable');
+        return outcome;
+      }
     }
-  } else if (!identity && tool === 'lark-cli') {
-    const home = await larkCliHomeForExecution(
-      args.sessionSandbox ?? args.botConfig.sandbox,
-      args.sessionDataDir,
-      args.sessionId,
-      user.credentialOpenId,
-    );
-    if (home) identity = { tool, mode: 'user-home', home };
-    // No bot-app OAuth fallback. Delegation may carry the original human's
-    // personal lark-cli HOME, but it must never turn a receiving Bot's shared
-    // app into that person's OAuth client.
-  } else if (!identity && tool === 'larkdev') {
-    const cloudJwts = await mintByteCloudUserJwts(user.credentialOpenId);
-    if (cloudJwts) identity = { tool, cloudJwts };
   }
-  if (!identity) return denyDelegated(tool, args, user);
+  if (!identity) {
+    if (platformRefusal && platformAuthoritative && user.targetOpenId) {
+      const retryable = (platformRefusal.state === 'unavailable' || platformRefusal.state === 'not_authorized')
+        && !!args.turnId && args.storageModel === 'proven';
+      const outcome = refuseViaPlatform(
+        tool, args.botConfig, args.sessionDataDir, args.sessionId, user.targetOpenId,
+        args.locale, args.turnId, args.storageModel, platformRefusal, retryable,
+      );
+      if (retryable) {
+        remember(
+          platformRefusal.state === 'not_authorized' ? 'platform_not_authorized' : 'platform_unavailable',
+          platformRefusal.state === 'not_authorized' ? platformRefusal.consent : undefined,
+        );
+      }
+      return outcome;
+    }
+    const outcome = denyDelegated(tool, args, user);
+    remember('local_not_authorized');
+    return outcome;
+  }
   const stamped = {
     ...identity,
     ...(args.turnId ? { turnId: args.turnId } : {}),
     ...(user.targetOpenId ? { openId: user.targetOpenId } : {}),
   };
   writeSessionIdentity(args.sessionDataDir, args.sessionId, stamped, args.storageModel);
+  if (args.turnId && args.storageModel === 'proven' && user.targetOpenId) {
+    rememberCodebaseCompanionRefusal({
+      botConfig: args.botConfig,
+      sessionSandbox: args.sessionSandbox ?? args.botConfig.sandbox,
+      tool,
+      principalOpenId: user.targetOpenId,
+      credentialOpenId: user.credentialOpenId,
+      unionId: user.unionId,
+      credentialSource: source,
+      delegated: user,
+      sessionDataDir: args.sessionDataDir,
+      sessionId: args.sessionId,
+      locale: args.locale,
+      privateChat: args.privateChat === true,
+      turnId: args.turnId,
+    }, stamped);
+  }
   if (localMint && args.turnId && args.storageModel === 'proven' && stamped.tool === 'bytedcli' && !('mode' in stamped)) {
     trackBytedcliIdentityRenewal({
       sessionDataDir: args.sessionDataDir, sessionId: args.sessionId,
@@ -490,6 +566,19 @@ async function publishOne(
   const withheld = async () =>
     withholdIdentity(tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId, storageModel, privateChat);
 
+  const remember = (kind: RefreshableCredentialRefusalKind, consent?: boolean) => {
+    if (!turnId || storageModel !== 'proven' || !senderOpenId) return;
+    rememberRefreshableCredentialRefusal({
+      botConfig, sessionSandbox, tool, sessionDataDir, sessionId, turnId,
+      publishedTool: tool,
+      principalOpenId: senderOpenId, credentialOpenId: senderOpenId,
+      credentialSource: source, locale, privateChat,
+      ...(unionId ? { unionId } : {}),
+      kind,
+      ...(consent !== undefined ? { consent } : {}),
+    });
+  };
+
   // No human sender (scheduled run, hook, meeting event, bot-to-bot handoff):
   // there is no "trigger user" to act as. Withhold — never reach for the session
   // creator's or the owner's credentials to fill the gap.
@@ -498,6 +587,22 @@ async function publishOne(
   const publish = (identity: CliIdentity, localMint = false): ToolIdentityOutcome => {
     const stamped = { ...identity, ...(turnId ? { turnId } : {}), openId: senderOpenId };
     writeSessionIdentity(sessionDataDir, sessionId, stamped, storageModel);
+    if (turnId && storageModel === 'proven') {
+      rememberCodebaseCompanionRefusal({
+        botConfig,
+        sessionSandbox,
+        tool,
+        principalOpenId: senderOpenId,
+        credentialOpenId: senderOpenId,
+        ...(unionId ? { unionId } : {}),
+        credentialSource: source,
+        sessionDataDir,
+        sessionId,
+        locale,
+        privateChat,
+        turnId,
+      }, stamped);
+    }
     if (localMint && turnId && storageModel === 'proven' && stamped.tool === 'bytedcli' && !('mode' in stamped)) {
       trackBytedcliIdentityRenewal({
         sessionDataDir, sessionId, credentialOpenId: senderOpenId, identity: { ...stamped, turnId },
@@ -520,38 +625,58 @@ async function publishOne(
     if (platform.state === 'granted') return publish(platform.identity);
     if (source === 'platform' || platform.state !== 'unbound') {
       if (source === 'auto') {
-        const local = await resolveIdentityFor(tool, botConfig, sessionSandbox, sessionDataDir, sessionId, senderOpenId);
-        if (local) return publish(local, tool === 'bytedcli');
+        try {
+          const local = await resolveIdentityFor(tool, botConfig, sessionSandbox, sessionDataDir, sessionId, senderOpenId);
+          if (local) return publish(local, tool === 'bytedcli');
+        } catch (error) {
+          // The platform answer remains authoritative for this attempt. In
+          // `auto`, a local store outage must not turn a platform refusal into
+          // a different identity or suppress its actionable authorization URL.
+          logger.debug(`[trigger-user-auth] local ${tool} fallback unavailable for session ${sessionId}: ${
+            error instanceof Error ? error.message : String(error)}`);
+        }
       }
       // Proven model only: the wrapper asks the daemon on every invocation, so
-      // a transient refusal can be re-asked there (see retryTransientTurnIdentity).
-      const retryable = platform.state === 'unavailable' && !!turnId && storageModel === 'proven';
+      // a refusal that can change while the turn runs is resolved again by the
+      // call-time credential broker. The principal itself remains frozen.
+      const retryable = (platform.state === 'unavailable' || platform.state === 'not_authorized')
+        && !!turnId && storageModel === 'proven';
       const outcome = refuseViaPlatform(tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId, storageModel, platform, retryable);
       if (retryable) {
-        rememberTransientRefusal({ botConfig, tool, sessionDataDir, sessionId, senderOpenId, locale, turnId: turnId! });
+        remember(platform.state === 'not_authorized' ? 'platform_not_authorized' : 'platform_unavailable',
+          platform.state === 'not_authorized' ? platform.consent : undefined);
       }
       return outcome;
     }
   }
 
-  const identity = await resolveIdentityFor(tool, botConfig, sessionSandbox, sessionDataDir, sessionId, senderOpenId);
-  if (!identity) return await withheld();
-  return publish(identity, true);
+  try {
+    const identity = await resolveIdentityFor(tool, botConfig, sessionSandbox, sessionDataDir, sessionId, senderOpenId);
+    if (identity) return publish(identity, true);
+  } catch (error) {
+    logger.warn(`[trigger-user-auth] local ${tool} credential provider unavailable for session ${sessionId}: ${
+      error instanceof Error ? error.message : String(error)}`);
+    const outcome = refuseLocalProviderUnavailable(
+      tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId, storageModel,
+    );
+    remember('local_unavailable');
+    return outcome;
+  }
+  const outcome = await withheld();
+  remember('local_not_authorized');
+  return outcome;
 }
 
-// ─── Transient platform refusals: give the turn's next call another chance ───
+// ─── Call-time credential broker: principal frozen, credentials refreshable ──
 //
-// A grant is fetched once when the turn is prepared. If the platform could not
-// be reached at that moment, the refusal published for the turn used to stand
-// for the whole turn, so one network blip spoiled every bytedcli / lark-cli
-// call the turn made. For the proven model (the wrapper asks the daemon for
-// each invocation) the daemon instead re-asks the platform when the wrapper
-// next fetches that refusal — rate-limited, and only while the refusal it
-// published is still what is in force (compare-and-set right before writing,
-// so a newer publication or a revocation is never overwritten).
-//
-// Only `unavailable` qualifies: an HTTP answer about the person (not
-// authorized, no consent, not a teammate, forbidden) is final for the turn.
+// Preparing a turn freezes WHO a governed tool may act as; it must not freeze
+// WHETHER that person had already completed authorization at that instant.
+// Proven wrappers therefore ask this broker before every invocation whenever
+// the frozen principal currently has a refreshable refusal. The broker resolves
+// the same credential source again and compare-and-sets only the exact
+// (session, turn, tool, principal, auth epoch) it registered. It can turn a
+// refusal into credentials, or update one refusal category into another; it can
+// never select a different account.
 
 /** Minimum spacing between re-asks for one turn/tool. The FIRST re-ask is not
  *  spaced: preparing the turn already waited out a full grant budget, and the
@@ -562,19 +687,46 @@ export const TRANSIENT_REFUSAL_RETRY_INTERVAL_MS = 10_000;
  *  past this the current refusal is served and the attempt finishes in the
  *  background for the next call. */
 export const TRANSIENT_REFUSAL_WAIT_CAP_MS = 10_000;
-/** Re-asks per turn/tool; an agent stuck in a retry loop cannot hammer the platform. */
-export const TRANSIENT_REFUSAL_MAX_RETRIES = 5;
-/** Forget an entry after this long even if its turn's material is still held. */
-const TRANSIENT_REFUSAL_TTL_MS = 2 * 60 * 60 * 1000;
+/** A person needs time to complete central-platform consent. Rate-limit this
+ * path independently from provider recovery while keeping the same turn live. */
+export const NOT_AUTHORIZED_RETRY_INTERVAL_MS = 30_000;
+/** Local `/login … done` is explicit and cheap to observe. A short interval
+ * makes the next governed CLI call see it without spinning on every shell exec. */
+export const LOCAL_AUTH_RETRY_INTERVAL_MS = 1_000;
+/** Forget an entry after this long even if its turn's material is still held.
+ * Intervals, rather than a smaller hard attempt count, bound provider traffic:
+ * a person who finishes authorization late in a long turn must still recover. */
+export const TRANSIENT_REFUSAL_TTL_MS = 2 * 60 * 60 * 1000;
 const TRANSIENT_REFUSAL_MAX_ENTRIES = 1000;
 
-interface TransientRefusal {
+type RefreshableCredentialRefusalKind =
+  | 'platform_unavailable'
+  | 'platform_not_authorized'
+  | 'local_unavailable'
+  | 'local_not_authorized'
+  | 'codebase_unavailable';
+
+interface RefreshableCredentialRefusal {
   botConfig: BotConfig;
+  sessionSandbox: BotConfig['sandbox'];
+  /** Credential family re-resolved by the broker. Codebase uses bytedcli. */
   tool: TriggerUserAuthTool;
+  /** Exact wrapper identity body guarded and eventually replaced. */
+  publishedTool: IdentityTool;
+  /** Frozen execution principal stamped into every denial and grant. */
+  principalOpenId: string;
+  /** Key of this person's machine-local credential store. Usually the same as
+   * principalOpenId; delegated cross-app turns deliberately keep them apart. */
+  credentialOpenId: string;
+  unionId?: string;
+  credentialSource: TriggerUserAuthCredentialSource;
+  delegated?: DelegatedCliIdentity;
+  kind: RefreshableCredentialRefusalKind;
+  consent?: boolean;
   sessionDataDir: string;
   sessionId: string;
-  senderOpenId: string;
   locale: Locale | undefined;
+  privateChat: boolean;
   turnId: string;
   /** The refusal body this module published; the CAS token. */
   body: string;
@@ -583,75 +735,123 @@ interface TransientRefusal {
   authEpoch: number;
   createdAt: number;
   lastAttemptAt: number;
-  retries: number;
   inFlight?: Promise<void>;
 }
 
-const transientRefusals = new Map<string, TransientRefusal>();
+const refreshableCredentialRefusals = new Map<string, RefreshableCredentialRefusal>();
 
-function transientKey(sessionDataDir: string, sessionId: string, turnId: string, tool: TriggerUserAuthTool): string {
+function transientKey(
+  sessionDataDir: string,
+  sessionId: string,
+  turnId: string,
+  tool: IdentityTool,
+): string {
+  // One identity body exists for one (session, identity turn, tool). A
+  // republication replaces that body, so it must replace the broker entry too
+  // even when the newly admitted principal differs. Principal remains part of
+  // the CAS through the stamped body plus auth epoch; it is not a second entry
+  // dimension that can leave a stale candidate in front of the current one.
   return JSON.stringify([sessionDataDir, sessionId, turnId, tool]);
 }
 
-function rememberTransientRefusal(entry: Omit<TransientRefusal, 'body' | 'authEpoch' | 'createdAt' | 'lastAttemptAt' | 'retries'>): void {
-  const body = recallProvenIdentityContent(entry.sessionDataDir, entry.sessionId, entry.turnId, entry.tool);
+function retryIntervalOf(entry: RefreshableCredentialRefusal): number {
+  if (entry.kind === 'platform_not_authorized') return NOT_AUTHORIZED_RETRY_INTERVAL_MS;
+  if (entry.kind.startsWith('local_')) return LOCAL_AUTH_RETRY_INTERVAL_MS;
+  return TRANSIENT_REFUSAL_RETRY_INTERVAL_MS;
+}
+
+type RefreshableCredentialContext = Pick<RefreshableCredentialRefusal,
+  | 'botConfig' | 'sessionSandbox' | 'tool' | 'principalOpenId' | 'credentialOpenId'
+  | 'unionId' | 'credentialSource' | 'delegated' | 'sessionDataDir' | 'sessionId'
+  | 'locale' | 'privateChat' | 'turnId'>;
+
+type RefreshableCredentialRefusalSeed = RefreshableCredentialContext & Pick<RefreshableCredentialRefusal,
+  'publishedTool' | 'kind' | 'consent'>;
+
+function rememberRefreshableCredentialRefusal(entry: RefreshableCredentialRefusalSeed): void {
+  const body = recallProvenIdentityContent(entry.sessionDataDir, entry.sessionId, entry.turnId, entry.publishedTool);
   if (!body) return; // the refusal did not land; nothing to compare against
   const now = Date.now();
-  const key = transientKey(entry.sessionDataDir, entry.sessionId, entry.turnId, entry.tool);
-  transientRefusals.delete(key);
-  transientRefusals.set(key, {
-    ...entry, body, authEpoch: readCliAuthEpoch(entry.senderOpenId),
-    createdAt: now, lastAttemptAt: Number.NEGATIVE_INFINITY, retries: 0,
+  const key = transientKey(entry.sessionDataDir, entry.sessionId, entry.turnId, entry.publishedTool);
+  refreshableCredentialRefusals.delete(key);
+  refreshableCredentialRefusals.set(key, {
+    ...entry,
+    // Registry updates replace BotConfig today, but the broker must not rely
+    // on that implementation detail. Keep the admission snapshot rather than
+    // a mutable object whose app/brand could drift underneath an in-flight
+    // provider request. A delegated record gets the same treatment while its
+    // recheck callback (when present) deliberately remains the frozen one.
+    botConfig: { ...entry.botConfig },
+    ...(entry.delegated
+      ? { delegated: { ...entry.delegated, tools: [...entry.delegated.tools] } }
+      : {}),
+    body, authEpoch: readCliAuthEpoch(entry.credentialOpenId),
+    createdAt: now,
+    // The first governed call always gets one immediate re-resolution. It may
+    // arrive after a fast browser approval; serving the just-published refusal
+    // for another 30 seconds made successful authorization look ineffective.
+    lastAttemptAt: Number.NEGATIVE_INFINITY,
   });
-  while (transientRefusals.size > TRANSIENT_REFUSAL_MAX_ENTRIES) {
-    const oldest = transientRefusals.keys().next().value;
+  while (refreshableCredentialRefusals.size > TRANSIENT_REFUSAL_MAX_ENTRIES) {
+    const oldest = refreshableCredentialRefusals.keys().next().value;
     if (oldest === undefined) break;
-    transientRefusals.delete(oldest);
+    refreshableCredentialRefusals.delete(oldest);
   }
+}
+
+/** A successful ByteCloud grant may temporarily lack its optional Codebase JWT.
+ * Keep bytedcli usable, but let the companion wrapper re-resolve the SAME
+ * credential source/principal at call time instead of remaining denied for the
+ * rest of a long turn. */
+function rememberCodebaseCompanionRefusal(
+  context: RefreshableCredentialContext,
+  identity: CliIdentity,
+): void {
+  if (context.tool !== 'bytedcli' || identity.tool !== 'bytedcli'
+    || 'mode' in identity || identity.codeJwt) return;
+  rememberRefreshableCredentialRefusal({
+    ...context,
+    publishedTool: CODEBASE_COMPANION_TOOL,
+    kind: 'codebase_unavailable',
+  });
 }
 
 /**
  * Called by the proven identity route before it serves a turn's identity. When
- * what is in force is a transient platform refusal this module published, ask
- * the platform again (the first time right away, then at most once per
- * {@link TRANSIENT_REFUSAL_RETRY_INTERVAL_MS}) and publish the answer if the
- * refusal is still the one in force. Concurrent callers share one attempt; no
- * caller waits longer than {@link TRANSIENT_REFUSAL_WAIT_CAP_MS}. Never throws.
+ * what is in force is a refreshable refusal this module published, resolve the
+ * frozen credential source again and publish the answer only if the exact
+ * refusal is still in force. Concurrent callers share one attempt; no caller
+ * waits longer than {@link TRANSIENT_REFUSAL_WAIT_CAP_MS}. Never throws.
  *
- * `currentPolicy` — not `botConfig` — is what decides whether a re-ask may run
- * and whether its answer may be written: a bot policy changed mid-turn (tool no
- * longer governed, source switched to local) ends the re-asks instead of
- * publishing under the policy the turn started with. `botConfig` is only the
- * fallback for a caller with no registry reader.
+ * The deprecated policy arguments remain source-compatible for older callers,
+ * but are deliberately not consulted: source and principal are admission facts
+ * frozen for the turn. A Dashboard edit applies to later turns; changing an
+ * in-flight turn's provider would violate the same invariant this broker exists
+ * to enforce.
  */
 export async function retryTransientTurnIdentity(args: {
   sessionDataDir: string;
   sessionId: string;
   turnId: string;
-  tool: TriggerUserAuthTool;
+  tool: IdentityTool;
+  /** @deprecated Admission policy is frozen in the broker entry. */
   botConfig?: BotConfig;
-  /** Reads the LIVE policy for this bot. Must be supplied by whoever holds the
-   *  bot registry: a mid-turn Dashboard edit replaces the whole config object,
-   *  so any snapshot (including `botConfig`) stays stale and would let an
-   *  in-flight attempt publish under a policy the operator already left. */
+  /** @deprecated Admission policy is frozen in the broker entry. */
   currentPolicy?: () => TriggerUserAuthConfig | undefined;
 }): Promise<void> {
   const key = transientKey(args.sessionDataDir, args.sessionId, args.turnId, args.tool);
-  const entry = transientRefusals.get(key);
+  const entry = refreshableCredentialRefusals.get(key);
   if (!entry) return;
   if (!entry.inFlight) {
     const now = Date.now();
     if (!stillInForce(entry)
-      || now - entry.createdAt > TRANSIENT_REFUSAL_TTL_MS
-      || entry.retries >= TRANSIENT_REFUSAL_MAX_RETRIES
-      || !policyStillWants(args.currentPolicy, entry, args.botConfig)) {
-      transientRefusals.delete(key);
+      || now - entry.createdAt > TRANSIENT_REFUSAL_TTL_MS) {
+      refreshableCredentialRefusals.delete(key);
       return;
     }
-    if (now - entry.lastAttemptAt < TRANSIENT_REFUSAL_RETRY_INTERVAL_MS) return;
+    if (now - entry.lastAttemptAt < retryIntervalOf(entry)) return;
     entry.lastAttemptAt = now;
-    entry.retries++;
-    entry.inFlight = runTransientRetry(key, entry, args.currentPolicy, args.botConfig)
+    entry.inFlight = runTransientRetry(key, entry)
       .finally(() => { entry.inFlight = undefined; });
   }
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -664,78 +864,217 @@ export async function retryTransientTurnIdentity(args: {
 
 /** The refusal this entry published is still what the turn has, and the
  *  person has not revoked their credentials since. */
-function stillInForce(entry: TransientRefusal): boolean {
-  return recallProvenIdentityContent(entry.sessionDataDir, entry.sessionId, entry.turnId, entry.tool) === entry.body
-    && readCliAuthEpoch(entry.senderOpenId) === entry.authEpoch;
+function stillInForce(entry: RefreshableCredentialRefusal): boolean {
+  return recallProvenIdentityContent(entry.sessionDataDir, entry.sessionId, entry.turnId, entry.publishedTool) === entry.body
+    && readCliAuthEpoch(entry.credentialOpenId) === entry.authEpoch;
 }
 
-/** Does the bot's policy — read NOW, not when the refusal was published — still
- *  take this tool's credentials from the platform?
- *
- *  Dashboard writes replace the whole bot config object
- *  (`bots.set(appId, { config: cfg, … })`), so a snapshot taken at publication
- *  time (the entry's `botConfig`) can never observe a mid-turn edit: only a
- *  reader supplied by whoever holds the registry can.
- *
- *  A reader that throws means the bot is gone; that is "no longer governed", so
- *  the re-ask stops rather than publishing under a policy nobody stated. */
-function policyStillWants(
-  live: (() => TriggerUserAuthConfig | undefined) | undefined,
-  entry: TransientRefusal,
-  fallbackConfig: BotConfig | undefined,
-): boolean {
-  let policy: TriggerUserAuthConfig | undefined;
-  if (live) {
-    try { policy = live(); } catch { return false; }
-  } else {
-    policy = (fallbackConfig ?? entry.botConfig).triggerUserAuth;
+type RefreshableCredentialResolution =
+  | { state: 'granted'; identity: CliIdentity; localMint: boolean }
+  | { state: 'platform_refusal'; platform: Exclude<PlatformIdentityResolution, { state: 'granted' }> }
+  | { state: 'local_not_authorized' }
+  | { state: 'local_unavailable' };
+
+/** Re-resolve credentials without re-deciding the principal or provider mode. */
+async function resolveRefreshableCredential(
+  entry: RefreshableCredentialRefusal,
+): Promise<RefreshableCredentialResolution> {
+  if (entry.credentialSource !== 'local') {
+    const platform = await resolvePlatformIdentity({
+      botConfig: entry.botConfig,
+      tool: entry.tool,
+      ...(entry.unionId ? { unionId: entry.unionId } : { openId: entry.credentialOpenId }),
+      sessionId: entry.sessionId,
+      turnId: entry.turnId,
+    });
+    if (platform.state === 'granted') {
+      return { state: 'granted', identity: platform.identity, localMint: false };
+    }
+    if (entry.credentialSource === 'platform') {
+      return { state: 'platform_refusal', platform };
+    }
+    // `auto` on a bound machine permits an already-provisioned personal HOME
+    // as fallback, but never a host/machine identity.
+    if (platform.state !== 'unbound') {
+      try {
+        const local = await resolveIdentityFor(
+          entry.tool, entry.botConfig, entry.sessionSandbox,
+          entry.sessionDataDir, entry.sessionId, entry.credentialOpenId,
+        );
+        if (local) return { state: 'granted', identity: local, localMint: true };
+      } catch {
+        // Preserve the more actionable platform answer. A local cache outage
+        // must not obscure central consent or teammate failures.
+      }
+      return { state: 'platform_refusal', platform };
+    }
   }
-  return triggerUserAuthApplies(policy, entry.tool) && credentialSourceOf(policy) !== 'local';
+
+  try {
+    const local = await resolveIdentityFor(
+      entry.tool, entry.botConfig, entry.sessionSandbox,
+      entry.sessionDataDir, entry.sessionId, entry.credentialOpenId,
+    );
+    return local
+      ? { state: 'granted', identity: local, localMint: true }
+      : { state: 'local_not_authorized' };
+  } catch {
+    return { state: 'local_unavailable' };
+  }
+}
+
+function replaceRefreshableRefusal(
+  entry: RefreshableCredentialRefusal,
+  kind: RefreshableCredentialRefusalKind,
+  consent?: boolean,
+): void {
+  const body = recallProvenIdentityContent(entry.sessionDataDir, entry.sessionId, entry.turnId, entry.publishedTool);
+  if (!body) return;
+  entry.body = body;
+  entry.kind = kind;
+  entry.consent = consent;
+  entry.authEpoch = readCliAuthEpoch(entry.credentialOpenId);
+  entry.lastAttemptAt = Date.now();
+}
+
+function publishRefreshedRefusal(
+  key: string,
+  entry: RefreshableCredentialRefusal,
+  resolved: Exclude<RefreshableCredentialResolution, { state: 'granted' }>,
+): void {
+  const drop = () => {
+    if (refreshableCredentialRefusals.get(key) === entry) refreshableCredentialRefusals.delete(key);
+  };
+  // This entry exists only because an otherwise valid bytedcli grant lacked
+  // its optional Codebase JWT. Preserve the current, principal-stamped denial
+  // for every non-grant outcome; replacing it with a platform/local refusal
+  // would incorrectly revoke the still-usable ByteCloud identity.
+  if (entry.publishedTool === CODEBASE_COMPANION_TOOL) return;
+  if (resolved.state === 'platform_refusal') {
+    const platform = resolved.platform;
+    if (platform.state === 'unavailable' && entry.kind === 'platform_unavailable') return;
+    if (platform.state === 'not_authorized'
+      && entry.kind === 'platform_not_authorized'
+      && entry.consent === platform.consent) return;
+    refuseViaPlatform(
+      entry.tool, entry.botConfig, entry.sessionDataDir, entry.sessionId,
+      entry.principalOpenId, entry.locale, entry.turnId, 'proven', platform,
+      platform.state === 'unavailable' || platform.state === 'not_authorized',
+    );
+    if (platform.state === 'unavailable') {
+      replaceRefreshableRefusal(entry, 'platform_unavailable');
+      return;
+    }
+    if (platform.state === 'not_authorized') {
+      replaceRefreshableRefusal(entry, 'platform_not_authorized', platform.consent);
+      return;
+    }
+    // Unbound in strict platform mode, teammate denial, and forbidden are
+    // durable policy outcomes for this turn; do not keep polling credentials.
+    drop();
+    return;
+  }
+
+  if (resolved.state === 'local_unavailable') {
+    if (entry.kind === 'local_unavailable') return;
+    refuseLocalProviderUnavailable(
+      entry.tool, entry.botConfig, entry.sessionDataDir, entry.sessionId,
+      entry.principalOpenId, entry.locale, entry.turnId, 'proven',
+    );
+    replaceRefreshableRefusal(entry, 'local_unavailable');
+    return;
+  }
+
+  if (entry.kind === 'local_not_authorized') return;
+  if (entry.delegated) {
+    denyDelegated(entry.tool, {
+      botConfig: entry.botConfig,
+      sessionSandbox: entry.sessionSandbox,
+      sessionDataDir: entry.sessionDataDir,
+      sessionId: entry.sessionId,
+      senderOpenId: entry.principalOpenId,
+      delegatedIdentity: entry.delegated,
+      locale: entry.locale,
+      turnId: entry.turnId,
+      storageModel: 'proven',
+      privateChat: entry.privateChat,
+    }, entry.delegated);
+  } else {
+    // Call-time retry already crossed its last asynchronous provider boundary
+    // and passed CAS. Do not invoke withholdIdentity here: in a private chat it
+    // starts another async device flow before writing, which could overwrite a
+    // login/revocation/republication that wins during that await.
+    writeDenial(
+      entry.sessionDataDir, entry.sessionId, entry.tool, entry.principalOpenId,
+      entry.botConfig, entry.locale, entry.turnId, 'proven', undefined, undefined,
+      'not_authorized',
+    );
+  }
+  replaceRefreshableRefusal(entry, 'local_not_authorized');
 }
 
 async function runTransientRetry(
   key: string,
-  entry: TransientRefusal,
-  live: (() => TriggerUserAuthConfig | undefined) | undefined,
-  fallbackConfig: BotConfig | undefined,
+  entry: RefreshableCredentialRefusal,
 ): Promise<void> {
   // Only ever drop THIS entry: a republication of the same turn registers a
   // fresh one under the same key, which an older attempt must not erase.
-  const drop = () => { if (transientRefusals.get(key) === entry) transientRefusals.delete(key); };
+  const drop = () => {
+    if (refreshableCredentialRefusals.get(key) === entry) refreshableCredentialRefusals.delete(key);
+  };
   try {
-    const platform = await resolvePlatformIdentity({
-      botConfig: entry.botConfig, tool: entry.tool, openId: entry.senderOpenId,
-      sessionId: entry.sessionId, turnId: entry.turnId,
-    });
+    const resolved = await resolveRefreshableCredential(entry);
     // Compare-and-set: synchronous from here to the write. The policy check
-    // belongs INSIDE this window: the attempt took a whole grant budget, and an
-    // operator switching this bot to local credentials (or turning the tool off)
-    // during it must not end with platform credentials on disk.
-    if (transientRefusals.get(key) !== entry
-      || !stillInForce(entry)
-      || !policyStillWants(live, entry, fallbackConfig)) {
+    // belongs after every async provider operation. Principal and auth epoch are
+    // part of `stillInForce`; a login/revoke or republication cannot be crossed.
+    if (refreshableCredentialRefusals.get(key) !== entry || !stillInForce(entry)) {
       drop();
       return;
     }
-    if (platform.state === 'granted') {
+    if (resolved.state === 'granted') {
+      if (entry.publishedTool === CODEBASE_COMPANION_TOOL
+        && (resolved.identity.tool !== 'bytedcli'
+          || 'mode' in resolved.identity
+          || !resolved.identity.codeJwt)) {
+        // ByteCloud is still usable but the companion credential is not ready.
+        // Keep the denial and the rate-limited broker entry for a later call.
+        return;
+      }
+      const stamped = {
+        ...resolved.identity,
+        turnId: entry.turnId,
+        openId: entry.principalOpenId,
+      } as CliIdentity;
+      if (entry.publishedTool === CODEBASE_COMPANION_TOOL) {
+        // This entry CAS-guards only the companion body. Do not let a Codebase
+        // retry overwrite bytedcli: that tool may have independently renewed or
+        // republished its identity after the companion denial was registered.
+        // The checks above narrow this to a bytedcli grant carrying codeJwt.
+        writeSessionIdentity(
+          entry.sessionDataDir,
+          entry.sessionId,
+          codebaseCompanionOf(stamped as Extract<CliIdentity, { tool: 'bytedcli' }>),
+          'proven',
+        );
+        drop();
+        logger.info(`[trigger-user-auth] ${entry.publishedTool} credential recovered for session ${entry.sessionId} during turn`);
+        return;
+      }
       writeSessionIdentity(entry.sessionDataDir, entry.sessionId,
-        { ...platform.identity, turnId: entry.turnId, openId: entry.senderOpenId }, 'proven');
+        stamped, 'proven');
+      if (resolved.localMint && entry.tool === 'bytedcli' && stamped.tool === 'bytedcli' && !('mode' in stamped)) {
+        trackBytedcliIdentityRenewal({
+          sessionDataDir: entry.sessionDataDir, sessionId: entry.sessionId,
+          credentialOpenId: entry.credentialOpenId,
+          identity: { ...stamped, turnId: entry.turnId },
+        });
+      }
+      rememberCodebaseCompanionRefusal(entry, stamped);
       drop();
-      logger.info(`[trigger-user-auth] platform ${entry.tool} grant recovered for session ${entry.sessionId} on retry`);
+      logger.info(`[trigger-user-auth] ${entry.publishedTool} credential recovered for session ${entry.sessionId} during turn`);
       return;
     }
-    if (platform.state === 'unavailable') return; // keep the refusal; retry later
-    if (platform.state === 'unbound') {
-      // Unbound mid-turn: what applies now depends on the source (auto falls
-      // back to local logins) and is the next turn's decision. Keep the
-      // refusal the turn has; stop asking a platform that is gone.
-      drop();
-      return;
-    }
-    // The platform now answered about the person: publish that answer, final.
-    refuseViaPlatform(entry.tool, entry.botConfig, entry.sessionDataDir, entry.sessionId, entry.senderOpenId,
-      entry.locale, entry.turnId, 'proven', platform);
-    drop();
+    publishRefreshedRefusal(key, entry, resolved);
   } catch (e) {
     logger.warn(`[trigger-user-auth] retry of ${entry.tool} identity failed for session ${entry.sessionId}: `
       + `${e instanceof Error ? e.message : String(e)}`);
@@ -744,7 +1083,7 @@ async function runTransientRetry(
 
 /** @internal test-only */
 export function __resetTransientRefusalsForTest(): void {
-  transientRefusals.clear();
+  refreshableCredentialRefusals.clear();
 }
 
 /**
@@ -797,6 +1136,31 @@ function refuseViaPlatform(
   writeDenial(sessionDataDir, sessionId, tool, senderOpenId, botConfig, locale, turnId, storageModel, undefined, tail,
     platformRefusalReason(platform));
   return { tool, state };
+}
+
+/** Local personal credential store/provider could not be inspected. This is
+ * categorically different from "the person has not authorized": retry later,
+ * do not generate another login challenge or fall back to host credentials. */
+function refuseLocalProviderUnavailable(
+  tool: TriggerUserAuthTool,
+  botConfig: BotConfig,
+  sessionDataDir: string,
+  sessionId: string,
+  principalOpenId: string,
+  locale: Locale | undefined,
+  turnId: string | undefined,
+  storageModel: IdentityStorageModel,
+): ToolIdentityOutcome {
+  const provider = isByteCloudTool(tool)
+    ? 'ByteCloud'
+    : t('trigger_user_auth.provider_lark', undefined, locale);
+  writeDenial(
+    sessionDataDir, sessionId, tool, principalOpenId, botConfig, locale,
+    turnId, storageModel, undefined,
+    [t('trigger_user_auth.denied_platform_unavailable_retryable', { tool, provider }, locale)],
+    'provider_unavailable',
+  );
+  return { tool, state: 'unavailable' };
 }
 
 /**
@@ -913,6 +1277,7 @@ function writeDenial(
       tool,
       mode: 'denied',
       ...(turnId ? { turnId } : {}),
+      ...(senderOpenId ? { openId: senderOpenId } : {}),
       message: [
         head,
         // A ready device-code link for either tool: lead with the self-serve,

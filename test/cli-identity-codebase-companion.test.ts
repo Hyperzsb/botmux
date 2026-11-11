@@ -21,6 +21,7 @@ import {
   prepareTriggerUserCliEnv,
   identityWrapperInstalled,
   recallProvenIdentityContent,
+  publishActiveTurn,
   IDENTITY_ENV_KEYS,
 } from '../src/core/cli-identity.js';
 
@@ -88,7 +89,10 @@ describe('companion wrapper', () => {
     chmodSync(real, 0o755);
     const wrapper = join(dir, 'codebase');
     writeFileSync(wrapper, renderIdentityWrapper('codebase', real, 'single'));
-    writeSessionIdentity(dir, SESSION, { tool: 'bytedcli', cloudJwt: 'cloud', codeJwt: 'code-jwt' }, 'single');
+    writeSessionIdentity(dir, SESSION, {
+      tool: 'bytedcli', cloudJwt: 'cloud', codeJwt: 'code-jwt', turnId: 'om_wrapper', openId: 'ou_wrapper',
+    }, 'single');
+    publishActiveTurn(dir, SESSION, 'om_wrapper', undefined, 'ou_wrapper');
     const out = execFileSync('/bin/sh', [wrapper, 'mr', 'list'], {
       encoding: 'utf8', env: { PATH: '/usr/bin:/bin', SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION },
     });
@@ -101,7 +105,11 @@ describe('companion wrapper', () => {
     chmodSync(real, 0o755);
     const wrapper = join(dir, 'codebase');
     writeFileSync(wrapper, renderIdentityWrapper('codebase', real, 'single'));
-    writeSessionIdentity(dir, SESSION, { tool: 'bytedcli', mode: 'denied', message: 'botmux: 需要授权 bytedcli' }, 'single');
+    writeSessionIdentity(dir, SESSION, {
+      tool: 'bytedcli', mode: 'denied', message: 'botmux: 需要授权 bytedcli',
+      turnId: 'om_denied', openId: 'ou_denied',
+    }, 'single');
+    publishActiveTurn(dir, SESSION, 'om_denied', undefined, 'ou_denied');
     let status = 0; let stderr = ''; let stdout = '';
     try {
       stdout = execFileSync('/bin/sh', [wrapper, 'mr', 'list'], {
@@ -112,7 +120,10 @@ describe('companion wrapper', () => {
     expect(stderr).toContain('需要授权 bytedcli');
     expect(stdout).not.toContain('RAN_AS_MACHINE');
     // Same when bytedcli was granted but no Codebase JWT came with it.
-    writeSessionIdentity(dir, SESSION, { tool: 'bytedcli', cloudJwt: 'cloud' }, 'single');
+    writeSessionIdentity(dir, SESSION, {
+      tool: 'bytedcli', cloudJwt: 'cloud', turnId: 'om_no_codebase', openId: 'ou_denied',
+    }, 'single');
+    publishActiveTurn(dir, SESSION, 'om_no_codebase', undefined, 'ou_denied');
     let status2 = 0;
     try { execFileSync('/bin/sh', [wrapper], { encoding: 'utf8', env: { PATH: '/usr/bin:/bin', SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION }, stdio: ['ignore', 'pipe', 'pipe'] }, 'single'); }
     catch (e: any) { status2 = e.status; }
