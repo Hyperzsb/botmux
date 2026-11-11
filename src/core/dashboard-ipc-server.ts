@@ -3593,8 +3593,17 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
   // The session access key selects the configured application; it is not turn
   // authority. On Linux every online managed call (bot and user alike) must
   // also descend from the exact process tree the daemon attested for this turn.
+  // A durable CLI-headless session has no Lark chat transport by construction;
+  // its already-validated provenance only waives that transport predicate, not
+  // any live-turn/process proof. User mode was rejected above for this shape.
   const executionInput = (ds && peer?.ok)
-    ? { sessionId: params.sessionId, peer: peer.peer, findSession: findActiveBySessionId } : undefined;
+    ? {
+        sessionId: params.sessionId,
+        peer: peer.peer,
+        findSession: findActiveBySessionId,
+        ...(validHeadlessSession ? { allowHeadlessSession: true } : {}),
+      }
+    : undefined;
   const execution = executionInput ? attestCurrentExecutionLoopbackPeer(executionInput) : undefined;
   if (process.platform === 'linux' && ds && !execution && !detachedScheduled) {
     return jsonRes(res, 403, { ok: false, error: 'current_execution_unverified' });

@@ -328,6 +328,12 @@ export interface CurrentTurnPeerAttestationInput {
   findSession: (sessionId: string) => DaemonSession | undefined;
   procRoot?: string;
   expectedScheduledTurnId?: string;
+  /**
+   * A caller that already verified durable CLI-headless provenance may attest
+   * that session's exact process tree without a Lark chat transport. This does
+   * not waive the live turn, worker, capability, PID-birth or lineage checks.
+   */
+  allowHeadlessSession?: boolean;
 }
 
 /**
@@ -359,7 +365,8 @@ export function attestCurrentExecutionLoopbackPeer(
     ? ds?.scheduledTurnCallers?.get(input.expectedScheduledTurnId)
     : undefined;
   if (!ds || ds.session.status !== 'active'
-    || !larkTransportEnabled({ chatId: ds.chatId, apiOnly: ds.initConfig?.apiOnly })
+    || (!larkTransportEnabled({ chatId: ds.chatId, apiOnly: ds.initConfig?.apiOnly })
+      && input.allowHeadlessSession !== true)
     || !turnId || generation === undefined
     || !workerPid || !workerProcStart || ds.worker?.killed === true
     || attestation?.workerGeneration !== generation
