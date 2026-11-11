@@ -20,21 +20,56 @@
 - 部署前确认目标机器、实际 checkout、当前分支、提交和工作区状态。保护已有未提交改动；不要将 online 切到 dev、临时 review 分支或即将删除的 worktree。
 - 远端名称按各机器的 `git remote -v` 确认，不能假设 `origin` 一定指向本 fork；本 fork 的业务部署分支与上游 npm 发版所用的 `master` 是不同约定。
 
-### 登录与每日访问权限
+### Preview / Online 远程交互（最小流程）
 
-两台 ByteBox 都需要通过 `jump.byted.org` 跳板机登录，且**每天都需要用户人工申请/审批访问权限**。此前登录成功不代表当天权限仍然有效。
+两台 ByteBox 都通过 `jump.byted.org` 登录，且每天都需要用户人工申请/审批访问权限。此前登录成功不代表当天权限仍有效。
+
+每个任务对每台目标机最多开启一个 interactive SSH Panel；同一任务的所有命令复用这条 PTY，不为每条命令重复登录。Agent 必须在非 Sandbox 的 TTY 中启动 SSH，进入目标机后再把命令逐条作为键盘输入发送，等待提示符返回后再发下一条。
 
 ```bash
-# online
-ssh -K jump.byted.org -tt ssh -6 root@2605:340:cd52:700:4b1d:5870:1031:4ba0
-
 # preview
-ssh -K jump.byted.org -tt ssh -6 root@2605:340:cd52:700:bf87:dee0:bd61:d0ef
+ssh -K -tt -o IdentitiesOnly=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=6 jump.byted.org ssh -6 root@2605:340:cd52:700:bf87:dee0:bd61:d0ef
+
+# online
+ssh -K -tt -o IdentitiesOnly=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=6 jump.byted.org ssh -6 root@2605:340:cd52:700:4b1d:5870:1031:4ba0
 ```
 
-该环境下不支持通过跳板机传递任意命令至实际远端机器，需要构造一个 interactive TTY 作为入口，把实际的命令作为键盘输入发送到这个入口中，才能正常和远端机器交互。不要在 Sandbox 中执行 SSH 命令，会无法解析跳板机地址。
+第二跳必须保持 `ssh -6 user@ip` 的简单形态；不要给内层 SSH 添加选项，也不要把构建、测试或部署命令拼在 SSH 命令尾部。keepalive 只减少空闲断线，不会自动重连或绕过每日审批。连接失败时说明是 preview 还是 online、保留原始错误，并提醒用户申请或续期当天权限；不能改去另一台机器继续。
 
-如果任一机器无法访问，明确告知用户是 online 还是 preview、给出连接错误，并提醒用户申请或续期对应机器当天的人工访问权限。不要将连接失败误判为 Botmux 故障，也不要把访问不了 preview 当成可以改在线上开发的理由。
+#### 默认：短任务直接使用 SSH
+
+查询 Hash、状态、日志、配置或执行其它分钟级操作时，不进入 tmux：
+
+1. 登录后先确认 `hostname`；只读查询再确认目标路径即可。
+2. 写代码、构建、重启或部署前，再确认 `pwd`、分支、`git rev-parse HEAD` 和 `git status --short`，保护已有未提交改动。
+3. 在同一 PTY 中逐条执行命令；任务完成后按下文统一收尾。
+
+#### 仅需断线续跑时使用 tmux
+
+全量测试、长构建、迁移或其它必须在 SSH 断开后继续的任务，才进入独立维护 server；普通只读查询和短命令不要使用 tmux。
+
+```bash
+# 先查看现状；无 server 时的报错可忽略
+tmux -L botmux-maint list-sessions -F '#{session_name} attached=#{session_attached} windows=#{session_windows}'
+
+# preview
+tmux -L botmux-maint new-session -A -s preview-dev
+
+# online
+tmux -L botmux-maint new-session -A -s online-release
+```
+
+- 只使用固定会话名；禁止按日期、任务或重连次数新建 session，也不要触碰 Botmux fleet 的 `-L botmux` server。
+- 若固定会话显示 `attached=1`、存在其它名字或用途不明的 pane，停止并先协调；不要用 `-d`、`send-keys`、`kill-session` 或 `kill-server` 猜测处理。
+- SSH 断开后重新登录并 attach 同名会话，先确认原 job 状态，不要重复启动。
+- 只有在 `list-sessions` 明确无 server、`pgrep -af botmux-maint` 无输出且精确 socket 仍阻塞启动时，才删除 `/tmp/tmux-0/botmux-maint`；禁止 glob。
+
+#### 统一收尾
+
+- 直接 SSH：清理本任务的临时文件和后台 job，然后从目标机 shell 正常 `exit`。
+- 使用 tmux：先运行 `jobs -l`。任务已完成时，正常退出本任务创建的 pane/shell；任务仍需续跑时才 `Ctrl-b d`，并在最终答复说明保留原因。只 attach 到既有现场时不得关闭用途不明的 pane。
+- 回到外层后 `exit`，等待 JumpServer SSH 与工具 PTY/session 结束。每个任务结束前必须关闭该任务创建的全部 SSH Panel，不能只关闭可见界面或把长运行 exec 留在后台。
+- 若工具调用中断或 PTY 丢失，只按本任务记录的精确 session id、PID、JumpServer 和目标地址发送 `TERM`，并确认 SSH 进程及其终端 wrapper 均已消失。禁止模糊 `pkill`，不得关闭 Flux 隧道、其它任务或用户已有连接。
 
 ### IPv6 兼容
 
@@ -96,7 +131,7 @@ bun run build:bun            # 打自包含单文件二进制（scripts/build-bu
 
 **测试里 spawn 子进程必须走 `test/helpers/ts-runner.ts`**，不要写 `spawn(process.execPath, ['--import','tsx', …])`：那是 Node-only 形态，Bun 下 `process.execPath` 是 bun 二进制、`bun --import tsx` 不合法，子进程会全部起不来。helper 按运行时解析（Node 加 tsx loader、Bun 原生跑 TS）。片段里 import 仓库模块（`.js` specifier 实际是 `.ts`）时用 `spawnTsEvalWithRepoImports`，普通 `spawnTsEval` 在 Node 下会 ERR_MODULE_NOT_FOUND。
 
-**临时探针 / 变异脚本 / 自写的 vitest 配置一律套 `bun scripts/fenced-run.ts -- <命令>`。** 仓库的 HOME 围栏和 tmux 围栏只挂在 `vitest.config.ts` 与 `bunfig.toml` 上：`bun /tmp/probe.ts` 直接调真实模块、或自写一个不带 setupFiles 的 vitest 配置，都**没有围栏**，会写真实 `~/.botmux`、`~/.config/systemd/user` 和 fleet 的 `-L botmux` tmux。2026-11-06 一个评审探针不带 HOME 调了 `enableAutostart()`，把真实 botmux.service / watchdog 改成 `ExecStart=/opt/botmux`，崩溃守护静默失效 5 小时。fenced-run 给子进程临时 HOME、私有 TMUX_TMPDIR + 拒绝宿主 socket 的 tmux shim、把 SESSION_DATA_DIR 指到临时 HOME 并清掉继承的会话身份标记和 daemon IPC 端口，并默认去掉 user bus（`systemctl --user` 碰不到真实 user manager；botmux 的 scope 代码看到 `BOTMUX_FENCED_RUN=1` 时只用环境里给出的总线变量、不再从 `/run/user/<uid>/bus` 推导，strict envPolicy 也保留这个标记；确需时加 `--keep-user-bus`）；触到宿主 socket 以退出码 3 失败。围栏只拦住经 PATH 解析的 tmux 和继承来的环境：探针里不要用绝对路径调 tmux（如 `/usr/bin/tmux`）、不要 `env -i` 清空环境后再 spawn tmux——这两种写法绕过 shim，能直达 fleet 的默认 socket；需要碰 tmux 时只用私有 `-L`/`-S` 目标或仓库 test helper。仓库根目录新增 `vitest*.config.ts` 必须挂 tmux 围栏，`test/vitest-config-fences.test.ts` 守着。
+**临时探针 / 变异脚本 / 自写的 vitest 配置一律套 `bun scripts/fenced-run.ts -- -- <命令>`。** 使用当前钉定的 Bun 运行 `.ts` 脚本时，第一个 `--` 会被 Bun 自己消费，第二个才会进入 `fenced-run`；尤其子命令自己还带 `--`（如 `bun run test -- <files>`）时，少一个分隔符会让围栏报 `unknown option(s)`，并以退出码 2 结束。变异复验不能只看非零退出码，必须检查日志确认子测试实际启动且因预期行为断言失败。仓库的 HOME 围栏和 tmux 围栏只挂在 `vitest.config.ts` 与 `bunfig.toml` 上：`bun /tmp/probe.ts` 直接调真实模块、或自写一个不带 setupFiles 的 vitest 配置，都**没有围栏**，会写真实 `~/.botmux`、`~/.config/systemd/user` 和 fleet 的 `-L botmux` tmux。2026-11-06 一个评审探针不带 HOME 调了 `enableAutostart()`，把真实 botmux.service / watchdog 改成 `ExecStart=/opt/botmux`，崩溃守护静默失效 5 小时。fenced-run 给子进程临时 HOME、私有 TMUX_TMPDIR + 拒绝宿主 socket 的 tmux shim、把 SESSION_DATA_DIR 指到临时 HOME 并清掉继承的会话身份标记和 daemon IPC 端口，并默认去掉 user bus（`systemctl --user` 碰不到真实 user manager；botmux 的 scope 代码看到 `BOTMUX_FENCED_RUN=1` 时只用环境里给出的总线变量、不再从 `/run/user/<uid>/bus` 推导，strict envPolicy 也保留这个标记；确需时加 `--keep-user-bus`）；触到宿主 socket 以退出码 3 失败。围栏只拦住经 PATH 解析的 tmux 和继承来的环境：探针里不要用绝对路径调 tmux（如 `/usr/bin/tmux`）、不要 `env -i` 清空环境后再 spawn tmux——这两种写法绕过 shim，能直达 fleet 的默认 socket；需要碰 tmux 时只用私有 `-L`/`-S` 目标或仓库 test helper。仓库根目录新增 `vitest*.config.ts` 必须挂 tmux 围栏，`test/vitest-config-fences.test.ts` 守着。
 
 **单测里不碰真实 systemd。** vitest unit 项目和 bun 腿另挂 systemd 围栏（`test/helpers/systemd-fence.ts`）：测试进程自己调 `systemd-run`、`busctl`、`systemctl --user`（含 `env …`、`sh -c` 包装和绝对路径）就让该测试失败，被测代码吞掉异常也一样；子进程经 PATH 上的 shim 被拒（退出码 1）。scope / fleet-scope 代码一律注入 `run`、`readlink` 或 `pidNamespace` 假实现，不要为了测它去连真实 user manager——在独立 PID 命名空间里，交出去的 PID 会被宿主 systemd 解释成另一个进程。
 
@@ -199,6 +234,42 @@ daemon 两条入口（`handleNewTopicAdmitted` / `handleThreadReplyAdmitted`）�
 - 测试进程使用隔离的配置、数据目录与临时环境变量，避免污染 preview 的运行中 Bot；遵守下文共享依赖与 worktree 的安装限制。
 - preview 当天访问权限不可用时，停止依赖测试的验收，报告连接错误并提醒用户申请或续期权限；不能改在本地或 online 补跑。
 - 验证记录注明 preview 环境、实际待测提交及未提交改动、命令和结果。缺少依赖、凭据或浏览器状态的用例应明确记录为未完成，不得宣称全量测试通过。
+
+### Preview 测试的最小执行协议
+
+测试统一按“需断线续跑”的任务处理：进入 `-L botmux-maint` 的固定 `preview-dev` 会话，在单一 pane 中串行执行；不要为不同测试新建 session，也不要并行跑全量 Vitest、Bun runner 或 e2e。
+
+会 spawn CLI / PTY / watcher 的测试和所有全量测试统一使用下面的模板，避免子进程读取控制终端后收到 `SIGTTIN`：
+
+```bash
+test_log=/tmp/botmux-test-<task>.log
+setsid --wait env NO_COLOR=1 bun run test </dev/null >"$test_log" 2>&1
+test_rc=$?
+tail -n 200 "$test_log"
+printf 'test exit=%s log=%s\n' "$test_rc" "$test_log"
+```
+
+将 `bun run test` 替换为本次所需的定向命令即可。`setsid --wait`、`/dev/null` 和明确日志缺一不可；命令保持前台运行，不加 `&` / `nohup`。需要暂离时 detach tmux，重连后恢复同一 job，不要重启一套。
+
+全量测试前只做两个快速资源检查：当前维护 shell 执行 `ulimit -n 8192`，再运行一次 `bun scripts/fenced-run.ts -- -- bun -e 'const fs=require("node:fs"); const w=fs.watch("."); w.close()'`。任一步失败或出现 `EMFILE` 就停止并报告 Preview 资源不足；不要设置 `CI=1`、`BOTMUX_TEST_GATE=0`、降低 worker 或绕过仓库并发闸。
+
+退出码为 0 且日志包含完整汇总才算通过；`Stopped (tty input)`、SSH 中断、部分文件计数或缺少最终汇总都算未完成。结束后删除本任务的精确日志路径，并按远程交互的统一收尾规则关闭 SSH Panel。
+
+#### 按影响面选择命令
+
+`test:all` 不是默认验收命令；它包含可能需要浏览器、外部服务或凭据的其它 project。选择覆盖当前改动的最小完整集合：
+
+| 变更范围 | 必跑命令 |
+| --- | --- |
+| 任意 TypeScript / 构建产物改动 | `bun run build` |
+| 已修改模块及直接回归路径 | 对应 `vitest run --project unit <files...>` |
+| 公共层、daemon、worker、身份/授权、调度、IM、适配器或跨 CLI 改动 | `bun run test` 与 `bun run test:bun`，串行执行 |
+| e2e 覆盖的行为或用户明确要求 e2e | 对应 e2e 文件；先确认真实 CLI、PostgreSQL URL、Chrome 等前置条件 |
+| 新增或修改持久状态语义 | 前述集合 + fenced mutation / 探针 + 独立对抗复核 |
+
+- e2e 前先用显式文件 allowlist 对账并运行可满足依赖的文件；缺少前置条件的用例如实记录为未完成，不用重复 `--exclude` 或伪称通过。
+- 涉及 user namespace、Bubblewrap、mount namespace 或 sandbox bind 的隔离 checkout 放在 `/root/<task-worktree>`，不要放 `/tmp`；继续复用 canonical `node_modules`，禁止在 worktree 中 install。新增未跟踪源码/fixture 在测试 worktree 中只按精确路径 `git add`，避免被 sandbox mask。
+- 失败时先从完整日志定位并定向重跑；本次改动相关失败必须修复，独立环境或历史失败要记录命令、日志和与当前 diff 的关系。
 
 测试要证明**行为**，不是给实现拍照。下面几类已经集中治理过，不要再新增：
 
