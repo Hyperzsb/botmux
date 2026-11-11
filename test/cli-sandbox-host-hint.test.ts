@@ -10,7 +10,13 @@ import {
   explainFleetWriteError,
 } from '../src/cli/sandbox-host-hint.js';
 import { linuxIsolationLaunch } from '../src/core/linux-isolation.js';
-import { IDENTITY_DENIED_EXIT_CODE, renderIdentityWrapper, writeSessionIdentity, bytedcliTurnHome } from '../src/core/cli-identity.js';
+import {
+  IDENTITY_DENIED_EXIT_CODE,
+  bytedcliTurnHome,
+  publishActiveTurn,
+  renderIdentityWrapper,
+  writeSessionIdentity,
+} from '../src/core/cli-identity.js';
 import { ensureSessionTempDir } from '../src/core/session-temp.js';
 import { tsRunnerPrefix } from './helpers/ts-runner.js';
 import { checkoutIsUnderSystemTemp } from './helpers/environment-capabilities.js';
@@ -287,6 +293,7 @@ describe.skipIf(!canRunBwrap || checkoutHiddenByPrivateTmp)('fleet commands insi
 describe('managed bytedcli wrapper: local login guard with a granted identity', () => {
   const SID = 'sess-bd-login';
   const OPEN = 'ou_bd_login_check';
+  const TURN = 'turn-bd-login';
 
   /** Publishes a real granted bytedcli user identity (so the post-identity
    *  guard is reachable) and returns the per-person scratch HOME #2550
@@ -316,7 +323,10 @@ exit 0
       // ensureSessionTempRoot's private-dir fail-closed (and polluting every
       // other session-temp test in the same shard).
       ensureSessionTempDir(dataDir, SID);
-      writeSessionIdentity(dataDir, SID, { tool: 'bytedcli', cloudJwt: 'jwt-x', openId: OPEN }, 'single');
+      writeSessionIdentity(dataDir, SID, {
+        tool: 'bytedcli', cloudJwt: 'jwt-x', openId: OPEN, turnId: TURN,
+      }, 'single');
+      publishActiveTurn(dataDir, SID, TURN, undefined, OPEN, TURN);
       turnHome = bytedcliTurnHome(dataDir, SID, { openId: OPEN });
     } finally {
       if (prevHome === undefined) delete process.env.HOME; else process.env.HOME = prevHome;
@@ -395,6 +405,7 @@ exit 0
 describe.skipIf(!canRunBwrap)('bytedcli login guard vs the per-person scratch HOME (#2550 interaction)', () => {
   const SID = 'sess-bd-cross';
   const OPEN = 'ou_cross_pr_check';
+  const TURN = 'turn-bd-cross';
 
   /** Real bwrap: machine HOME read-only; the published per-person HOME is a
    *  scratch dir. extraBinds add carve-outs on top of the read-only machine
@@ -429,7 +440,10 @@ describe.skipIf(!canRunBwrap)('bytedcli login guard vs the per-person scratch HO
     let turnHome = '';
     try {
       ensureSessionTempDir(dataDir, SID);
-      writeSessionIdentity(dataDir, SID, { tool: 'bytedcli', cloudJwt: 'jwt-x', openId: OPEN }, 'single');
+      writeSessionIdentity(dataDir, SID, {
+        tool: 'bytedcli', cloudJwt: 'jwt-x', openId: OPEN, turnId: TURN,
+      }, 'single');
+      publishActiveTurn(dataDir, SID, TURN, undefined, OPEN, TURN);
       turnHome = bytedcliTurnHome(dataDir, SID, { openId: OPEN });
     } finally {
       if (prevHome === undefined) delete process.env.HOME; else process.env.HOME = prevHome;

@@ -17,7 +17,7 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { renderIdentityEnv, renderIdentityWrapper } from '../src/core/cli-identity.js';
+import { publishActiveTurn, renderIdentityEnv, renderIdentityWrapper } from '../src/core/cli-identity.js';
 import { NAMESPACE_UID, privateTmpAvailable, runWithPrivateTmp } from './helpers/session-temp-ns-probe.js';
 import { tsRunnerPrefix } from './helpers/ts-runner.js';
 import { checkoutIsUnderSystemTemp } from './helpers/environment-capabilities.js';
@@ -66,6 +66,8 @@ function runInNs(script: string | string[]): { status: number | null; stdout: st
 }
 
 const SESSION = 'sess-ns';
+const TURN = 'turn-ns-probe';
+const OPEN = 'ou_ns_probe';
 const repoRoot = process.cwd();
 // NOT process.getuid(): the probes run inside a user namespace where the boot
 // code sees NAMESPACE_UID, and every planted path must agree with it.
@@ -79,7 +81,8 @@ function writeWrapper(home: string): string {
   const envDir = join(dir, 'data', 'cli-identity', `${SESSION}.bin`, '.data');
   mkdirSync(envDir, { recursive: true });
   writeFileSync(join(envDir, 'bytedcli.env'),
-    renderIdentityEnv({ tool: 'bytedcli', cloudJwt: 'jwt-probe', home }));
+    renderIdentityEnv({ tool: 'bytedcli', cloudJwt: 'jwt-probe', home, turnId: TURN, openId: OPEN }));
+  publishActiveTurn(join(dir, 'data'), SESSION, TURN, undefined, OPEN, TURN);
   return wrapper;
 }
 
@@ -100,11 +103,13 @@ function bootArgv(): string[] {
 function publishAndRunArgv(): string[] {
   const probe = join(dir, 'publish-and-run.ts');
   writeFileSync(probe, [
-    `import { renderIdentityWrapper, writeSessionIdentity } from ${JSON.stringify(join(repoRoot, 'src/core/cli-identity.ts'))};`,
+    `import { publishActiveTurn, renderIdentityWrapper, writeSessionIdentity } from ${JSON.stringify(join(repoRoot, 'src/core/cli-identity.ts'))};`,
     `import { spawnSync } from 'node:child_process';`,
     `import { writeFileSync } from 'node:fs';`,
     `writeSessionIdentity(${JSON.stringify(join(dir, 'data'))}, ${JSON.stringify(SESSION)},`,
-    `  { tool: 'bytedcli', cloudJwt: 'jwt-probe', openId: 'ou_alice' }, 'single');`,
+    `  { tool: 'bytedcli', cloudJwt: 'jwt-probe', openId: ${JSON.stringify(OPEN)}, turnId: ${JSON.stringify(TURN)} }, 'single');`,
+    `publishActiveTurn(${JSON.stringify(join(dir, 'data'))}, ${JSON.stringify(SESSION)},`,
+    `  ${JSON.stringify(TURN)}, undefined, ${JSON.stringify(OPEN)}, ${JSON.stringify(TURN)});`,
     `const wrapper = ${JSON.stringify(join(dir, 'published-wrapper'))};`,
     `writeFileSync(wrapper, renderIdentityWrapper('bytedcli', '/bin/true', 'single'));`,
     `spawnSync('/bin/sh', [wrapper], { env: { ...process.env, SESSION_DATA_DIR: ${JSON.stringify(join(dir, 'data'))}, BOTMUX_SESSION_ID: ${JSON.stringify(SESSION)} } });`,

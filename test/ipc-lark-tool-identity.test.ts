@@ -347,19 +347,21 @@ describe('session application identity route', () => {
     expect((await request('bot')).status).toBe(403);
     expect(botToken).not.toHaveBeenCalled();
   });
-  it('gives a bound headless runner only its own bot token', async () => {
+  it('gives an exact-turn-proven headless runner only its own bot token', async () => {
     markHeadless();
-    session.managedTurnOrigin = undefined;
     const response = await request('bot');
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({ appId: 'cli_bound', mode: 'bot',
       credentialType: 'tenant_access_token', credential: 'bound-bot-token' });
     expect((await request('user')).status).toBe(403);
     expect(tokens.resolveUserToken).not.toHaveBeenCalled();
-    // Even a stale human origin cannot turn a headless runner into a user session.
-    session.managedTurnOrigin = { turnId: 'om_turn', capability: 'cap', callerOpenId: 'ou_sender' };
-    expect((await request('user')).status).toBe(403);
-    expect(tokens.resolveUserToken).not.toHaveBeenCalled();
+    // The binding key only selects the app. Without the exact live execution
+    // proof it cannot recover even the bot token from a headless session.
+    session.managedTurnOrigin = undefined;
+    const unproven = await request('bot');
+    expect(unproven.status).toBe(403);
+    expect(await unproven.json()).toMatchObject({ error: 'current_execution_unverified' });
+    expect(botToken).toHaveBeenCalledTimes(1);
   });
   it.each(['http_async_runner', 'http_wait_runner'])('keeps other virtual chats without tool credentials (%s)', async chatId => {
     session.chatId = chatId;
@@ -537,7 +539,6 @@ describe('session application identity route', () => {
   it.each([false, true])('runs the real tool process with only the selected application credentials (headless=%s)', async headless => {
     if (headless) {
       markHeadless();
-      session.managedTurnOrigin = undefined;
     }
     const real = join(dir, 'real-lark');
     writeFileSync(real, '#!/usr/bin/env node\n' + fakeLarkHelpScript() + 'process.stdout.write([process.env.LARKSUITE_CLI_APP_ID,process.env.LARKSUITE_CLI_APP_SECRET,process.env.LARKSUITE_CLI_TENANT_ACCESS_TOKEN,process.env.LARKSUITE_CLI_USER_ACCESS_TOKEN,process.argv.slice(2).join(" ")].map(x=>x||"").join("|"));\n'); chmodSync(real, 0o755);

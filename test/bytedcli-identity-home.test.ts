@@ -61,6 +61,10 @@ function runWrapper(wrapperPath: string, args: string[] = []): string {
   });
 }
 
+function publishSingleTurn(turnId: string, openId?: string): void {
+  publishActiveTurn(dataDir(), SESSION, turnId, undefined, openId, turnId);
+}
+
 describe('bytedcli per-person HOME', () => {
   it('lives in the session scratch, one directory per person', () => {
     const alice = bytedcliTurnHome(dataDir(), SESSION, { openId: 'ou_alice' });
@@ -116,7 +120,10 @@ describe('bytedcli per-person HOME', () => {
     ensureSessionTempDir(dataDir(), SESSION);
     const wrapperPath = join(dir, 'bytedcli');
     writeFileSync(wrapperPath, renderIdentityWrapper('bytedcli', stubTool(), 'single'));
-    writeSessionIdentity(dataDir(), SESSION, { tool: 'bytedcli', cloudJwts: { cn: 'jwt-a' }, openId: 'ou_alice' }, 'single');
+    writeSessionIdentity(dataDir(), SESSION, {
+      tool: 'bytedcli', cloudJwts: { cn: 'jwt-a' }, openId: 'ou_alice', turnId: 'turn-alice',
+    }, 'single');
+    publishSingleTurn('turn-alice', 'ou_alice');
     const home = bytedcliTurnHome(dataDir(), SESSION, { openId: 'ou_alice' });
 
     expect(runWrapper(wrapperPath, ['auth', 'userinfo'])).toBe(`${home}|jwt-a|auth userinfo`);
@@ -125,18 +132,25 @@ describe('bytedcli per-person HOME', () => {
     expect(existsSync(join(process.env.HOME!, '.local'))).toBe(false);
 
     // Next person in the same session writes into their own directory.
-    writeSessionIdentity(dataDir(), SESSION, { tool: 'bytedcli', cloudJwts: { cn: 'jwt-b' }, openId: 'ou_bob' }, 'single');
+    writeSessionIdentity(dataDir(), SESSION, {
+      tool: 'bytedcli', cloudJwts: { cn: 'jwt-b' }, openId: 'ou_bob', turnId: 'turn-bob',
+    }, 'single');
+    publishSingleTurn('turn-bob', 'ou_bob');
     const bobHome = bytedcliTurnHome(dataDir(), SESSION, { openId: 'ou_bob' });
     expect(runWrapper(wrapperPath)).toBe(`${bobHome}|jwt-b|`);
     expect(existsSync(join(bobHome, '.local/share/bytedcli/data/userinfo.json'))).toBe(true);
   });
 
   it('an identity published without a HOME uses a disposable isolated HOME', () => {
+    const turnId = 'turn-legacy-home';
     const wrapperPath = join(dir, 'bytedcli-legacy');
     writeFileSync(wrapperPath, renderIdentityWrapper('bytedcli', stubTool(), 'single'));
     const envDir = join(dataDir(), 'cli-identity', `${SESSION}.bin`, '.data');
     mkdirSync(envDir, { recursive: true });
-    writeFileSync(join(envDir, 'bytedcli.env'), renderIdentityEnv({ tool: 'bytedcli', cloudJwt: 'jwt-old' }));
+    writeFileSync(join(envDir, 'bytedcli.env'), renderIdentityEnv({
+      tool: 'bytedcli', cloudJwt: 'jwt-old', turnId,
+    }));
+    publishSingleTurn(turnId);
     const used = runWrapper(wrapperPath).split('|');
     expect(used[0]).toContain('botmux-bytedcli-home/invocation.');
     expect(used.slice(1).join('|')).toBe('jwt-old|');
@@ -147,10 +161,11 @@ describe('bytedcli per-person HOME', () => {
     const forged = join(dir, 'forged-home');
     const envDir = join(dataDir(), 'cli-identity', `${SESSION}.bin`, '.data');
     mkdirSync(envDir, { recursive: true });
-    const run = (tool: 'bytedcli' | 'lark-cli' | 'codebase', body: string) => {
+    const run = (tool: 'bytedcli' | 'lark-cli' | 'codebase', body: string, turnId: string) => {
       const wrapperPath = join(dir, `wrapper-${tool}`);
       writeFileSync(wrapperPath, renderIdentityWrapper(tool, stubTool(), 'single'));
       writeFileSync(join(envDir, `${tool}.env`), body);
+      publishSingleTurn(turnId);
       return execFileSync('/bin/sh', [wrapperPath], {
         encoding: 'utf8',
         env: {
@@ -159,11 +174,19 @@ describe('bytedcli per-person HOME', () => {
         },
       }).split('|')[0];
     };
-    expect(run('bytedcli', renderIdentityEnv({ tool: 'bytedcli', cloudJwt: 'jwt-old' })))
+    expect(run('bytedcli', renderIdentityEnv({
+      tool: 'bytedcli', cloudJwt: 'jwt-old', turnId: 'turn-bytedcli-legacy',
+    }), 'turn-bytedcli-legacy'))
       .toContain('botmux-bytedcli-home/invocation.');
-    expect(run('lark-cli', renderIdentityEnv({ tool: 'lark-cli', appId: 'cli_app', userAccessToken: 'u' }))).toBe(process.env.HOME);
-    expect(run('lark-cli', renderIdentityEnv({ tool: 'lark-cli', mode: 'bot', appId: 'cli_app', appSecret: 's' }))).toBe(process.env.HOME);
-    expect(run('codebase', renderIdentityEnv({ tool: 'codebase', codeJwt: 'c' }))).toBe(process.env.HOME);
+    expect(run('lark-cli', renderIdentityEnv({
+      tool: 'lark-cli', appId: 'cli_app', userAccessToken: 'u', turnId: 'turn-lark-user',
+    }), 'turn-lark-user')).toBe(process.env.HOME);
+    expect(run('lark-cli', renderIdentityEnv({
+      tool: 'lark-cli', mode: 'bot', appId: 'cli_app', appSecret: 's', turnId: 'turn-lark-bot',
+    }), 'turn-lark-bot')).toBe(process.env.HOME);
+    expect(run('codebase', renderIdentityEnv({
+      tool: 'codebase', codeJwt: 'c', turnId: 'turn-codebase',
+    }), 'turn-codebase')).toBe(process.env.HOME);
     expect(existsSync(forged)).toBe(false);
   });
 
