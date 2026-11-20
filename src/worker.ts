@@ -36185,6 +36185,7 @@ process.on('message', (raw: unknown, handle: unknown) => {
   }
   const execution = msg.sessionCommand?.execution;
   if (execution) workerSessionEventScope?.rememberExecution(execution);
+  if (msg.type === 'raw_input' && msg.followUpExecution) workerSessionEventScope?.rememberExecution(msg.followUpExecution);
   if (binding && workerSessionEventScope && msg.type !== 'init') return workerSessionEventScope.run(binding, () => handleContractDaemonMessage(msg, handle), execution, msg.sessionCommand?.operationId);
   return handleContractDaemonMessage(msg, handle);
 });

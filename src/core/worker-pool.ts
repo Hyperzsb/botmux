@@ -3457,8 +3457,10 @@ export function ensureReadonlyTaskContinuationAttached(
     canEnqueue: () => {
       const workerGeneration = ds.workerGeneration;
       const proof = ds.taskContinuationRpcProof;
+      const controller = controllerForSession(ds);
       return readonlyTaskContinuationEligible(ds)
         && ordinaryTurnRecoveryStillOwnsSession(ds)
+        && (!controller || controller.acceptsUserInput())
         && !!ds.worker
         && !ds.worker.killed
         && ds.worker.connected !== false
@@ -3472,6 +3474,8 @@ export function ensureReadonlyTaskContinuationAttached(
       if (!readonlyTaskContinuationEligible(ds) || !ordinaryTurnRecoveryStillOwnsSession(ds)) {
         return false;
       }
+      const controller = controllerForSession(ds);
+      if (controller && !controller.acceptsUserInput()) return false;
       const workerGeneration = ds.workerGeneration;
       const proof = ds.taskContinuationRpcProof;
       if (!ds.worker || ds.worker.killed || ds.worker.connected === false
@@ -3491,11 +3495,15 @@ export function ensureReadonlyTaskContinuationAttached(
         || (current.trustedController
           && current.trustedController.requestLarkAppId !== ds.larkAppId)) return false;
       try {
+        const execution = controller && dispatch.turnId
+          ? controller.admitInput(dispatch.turnId, dispatch.dispatchAttempt)
+          : undefined;
         ds.worker.send({
           type: 'message',
           content: dispatch.prompt,
           turnId: dispatch.turnId,
           dispatchAttempt: dispatch.dispatchAttempt,
+          ...(execution ? { sessionCommand: { version: 2 as const, execution } } : {}),
           ...(ds.crashDiagnosticParked ? { model: latestModelForRespawn(ds), ...latestLaunchCommandsForRespawn(ds), ...latestPinEffortForRespawn(ds) } : {}),
           trustedCaller: current.trustedCaller,
           ...(turnCallerOpenIdFor(ds, dispatch.turnId)
@@ -12399,9 +12407,25 @@ export function sendWorkerSessionInput(
   }
   const controller = controllerForSession(ds);
   if (controller && !controller.acceptsUserInput()) return false;
-  const scoped = controller && message.type === 'message' && message.turnId
-    ? { ...message, sessionCommand: { version: 2 as const, execution: controller.admitInput(message.turnId, message.dispatchAttempt) } }
-    : message;
+  let scoped: TransferBufferedInput = message;
+  if (controller) {
+    if (message.type === 'message' && message.turnId) {
+      scoped = {
+        ...message,
+        sessionCommand: { version: 2 as const, execution: controller.admitInput(message.turnId, message.dispatchAttempt) },
+      };
+    } else if (message.type === 'raw_input') {
+      // Admit raw_input turns in the contract store, but leave sessionCommand
+      // to sessionController.command() at send time so it always carries the
+      // live runtime target required by admitSessionCommand('raw_input') even
+      // across a routing-transfer buffer replay.
+      if (message.turnId) controller.admitInput(message.turnId);
+      if (message.followUpTurnId) {
+        const followUpExecution = controller.admitInput(message.followUpTurnId);
+        scoped = { ...message, followUpExecution };
+      }
+    }
+  }
   const annotated = withTurnCaller(ds, scoped);
   if (bufferTransferInput(ds, annotated)) return true;
   const worker = ds.worker;
@@ -14427,7 +14451,13 @@ export function sendWorkerInput(
   // inside the same protected send so a tracked delivery still rolls back.
   const performSend = (): boolean => {
     if (!transferGate && shouldTrackOrdinaryImDelivery(ds, message)) {
-      return sendOrdinaryImDeliveryTracked(ds, message);
+      const controller = controllerForSession(ds);
+      if (controller && !controller.acceptsUserInput()) return false;
+      const scoped = controller && message.turnId
+        ? { ...message, sessionCommand: { version: 2 as const, execution: controller.admitInput(message.turnId, message.dispatchAttempt) } }
+        : message;
+      const annotated = withTurnCaller(ds, scoped) as Extract<DaemonToWorker, { type: 'message' }>;
+      return sendOrdinaryImDeliveryTracked(ds, annotated);
     }
     return sendWorkerSessionInput(ds, message);
   };
@@ -14700,8 +14730,9 @@ export function promoteQueuedActivationTail(
   opts: { send?: boolean } = {},
 ): boolean {
   if (ds.session.queuedActivationPending) return true;
+  const controller = opts.send !== false ? controllerForSession(ds) : undefined;
   if (opts.send !== false
-    && (!ds.worker || ds.worker.killed)) return false;
+    && (!ds.worker || ds.worker.killed || (controller && !controller.acceptsUserInput()))) return false;
   const ordered = [...(ds.session.queuedActivationTail ?? [])]
     .sort((a, b) => a.order - b.order || a.id.localeCompare(b.id));
   const head = ordered[0];
@@ -14818,9 +14849,13 @@ export function promoteQueuedActivationTail(
 
   if (opts.send === false) return true;
   try {
+    const execution = controller && head.turnId
+      ? controller.admitInput(head.turnId, head.dispatchAttempt)
+      : undefined;
     ds.worker!.send({
       type: 'message',
       content: exactInput.content,
+      ...(execution ? { sessionCommand: { version: 2 as const, execution } } : {}),
       // Same parked-worker launch-snapshot refresh as the ordinary send.
       ...(ds.crashDiagnosticParked ? { model: latestModelForRespawn(ds), ...latestPinEffortForRespawn(ds) } : {}),
       ...(ds.crashDiagnosticParked ? { larkToolBinding: latestLarkToolBindingForRespawn(ds) } : {}),
