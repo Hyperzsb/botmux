@@ -2449,10 +2449,10 @@ export type WorkerToDaemonBase =
   | { type: 'protected_mcp_secret_channel_request'; requestId: string; capabilityId: string }
   | ({ type: 'codex_app_effort_result'; requestId: string } & CodexAppEffortResult)
   | ({ type: 'codex_cli_effort_result'; requestId: string } & CodexAppEffortResult)
-  | { type: 'runtime_binding_started'; bindingId: string; operationId?: string }
+  | { type: 'runtime_binding_started'; bindingId: string; operationId?: string; refinesBindingId?: string; physicalLineageId?: string; refinementProof?: import('./services/session-contract.js').RuntimeRefinementProof }
   | { type: 'runtime_binding_probe'; probeId: string }
   | { type: 'runtime_binding_aborted'; bindingId: string; operationId?: string }
-  | { type: 'runtime_binding'; bindingId: string; identity: import('./services/session-contract.js').RuntimeIdentity; operationId?: string }
+  | { type: 'runtime_binding'; bindingId: string; identity: import('./services/session-contract.js').RuntimeIdentity; operationId?: string; refinesBindingId?: string; physicalLineageId?: string; refinementProof?: import('./services/session-contract.js').RuntimeRefinementProof }
   | { type: 'worker_ipc_ready' }
   | ({ type: 'link_ref_register'; requestId: string } & import('./core/link-ref-ipc.js').McpLinkRefRegistrationRequest)
   | ({ type: 'link_ref_resolve'; requestId: string } & import('./core/link-ref-ipc.js').McpHostDeliveryLinkRefRequest)

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { WorkerSessionEventScope, type RuntimeEventBinding, type CapturedSessionOrigin } from './services/session-event-scope.js';
 import { admitSessionCommand } from './services/session-command-gateway.js';
-import { confirmedRuntimeIdentityChanged, contractTerminalStatus, reusableRuntimeIdentity, samePhysicalRuntimeIdentity, type RuntimeIdentity } from './services/session-contract.js';
+import { confirmedRuntimeIdentityChanged, contractTerminalStatus, reusableRuntimeIdentity, samePhysicalRuntimeIdentity, type RuntimeIdentity, type RuntimeRefinementProof } from './services/session-contract.js';
 import { applyWorkerLaunchModel } from './core/worker-launch-model.js';
 import { readTraexEffortComposer, validateTraexTopicEffortRestart, type TraexTopicEffortRestart } from './utils/traex-session-effort.js';
 import { deploymentContinuationTemplate } from './services/deployment-continuation.js';
@@ -1974,6 +1974,8 @@ const pendingRuntimeReservations = new Map<string, (mayStart: boolean) => void>(
 interface ObservedRuntimeBindingHandshake {
   scope: WorkerSessionEventScope;
   physicalId: string;
+  predecessorPhysicalId?: string;
+  refinementProof?: RuntimeRefinementProof;
   backend: SessionBackend | null;
   spawnGeneration: number;
   identity: RuntimeIdentity;
@@ -1992,13 +1994,14 @@ function clearObservedRuntimeBindingTimer(handshake: ObservedRuntimeBindingHands
 }
 function observedRuntimeBindingStillCurrent(handshake: ObservedRuntimeBindingHandshake): boolean {
   const current = handshake.scope.currentBinding();
+  const expectedPhysicalId = handshake.binding ? handshake.physicalId : handshake.predecessorPhysicalId ?? handshake.physicalId;
   if (observedRuntimeBindingHandshakes.get(handshake.physicalId) !== handshake
       || workerSessionEventScope !== handshake.scope
       || backend !== handshake.backend
       || cliSpawnGeneration !== handshake.spawnGeneration
       || closeRequested
       || !current
-      || current.physicalId !== handshake.physicalId) return false;
+      || current.physicalId !== expectedPhysicalId) return false;
   // nativeSessionId is a one-shot observation. After a refusal restores the
   // launcher binding it may no longer be derivable from that predecessor, so
   // fence the still-live physical executor here and keep the frozen native id
@@ -2083,8 +2086,14 @@ function publishObservedRuntimeBindingAttempt(handshake: ObservedRuntimeBindingH
   }
   handshake.scope.run(binding, () => {
     send({ type: 'runtime_binding_started', bindingId: binding.bindingId,
+      physicalLineageId: binding.physicalId,
+      ...(binding.refinesBindingId ? { refinesBindingId: binding.refinesBindingId } : {}),
+      ...(binding.refinementProof ? { refinementProof: binding.refinementProof } : {}),
       ...(handshake.operationId ? { operationId: handshake.operationId } : {}) });
     send({ type: 'runtime_binding', bindingId: binding.bindingId, identity: binding.identity!,
+      physicalLineageId: binding.physicalId,
+      ...(binding.refinesBindingId ? { refinesBindingId: binding.refinesBindingId } : {}),
+      ...(binding.refinementProof ? { refinementProof: binding.refinementProof } : {}),
       ...(handshake.operationId ? { operationId: handshake.operationId } : {}) });
   });
   if (handshake.binding !== binding) return;
@@ -2099,7 +2108,7 @@ function startObservedRuntimeBindingAttempt(handshake: ObservedRuntimeBindingHan
     return;
   }
   const operationId = activeRestartAttemptId;
-  const binding = handshake.scope.beginRuntime(operationId, handshake.physicalId);
+  const binding = handshake.scope.beginRuntime(operationId, handshake.physicalId, handshake.refinementProof);
   binding.identity = handshake.identity;
   handshake.binding = binding;
   handshake.operationId = operationId;
@@ -2228,7 +2237,9 @@ function observeContractNativeSession(nativeSessionId: string): void {
   // that is still live, otherwise the daemon correctly classifies the new
   // runtime as historical/retiring under the stale operation id.
   if (confirmedRuntimeIdentityChanged(active.identity, identity)) {
-    const previous = observedRuntimeBindingHandshakes.get(active.physicalId);
+    const refinementProof = takeRuntimeRefinementProof(active, active.identity!, identity);
+    const physicalId = refinementProof ? active.physicalId : randomUUID();
+    const previous = observedRuntimeBindingHandshakes.get(physicalId);
     if (previous && reusableRuntimeIdentity(previous.identity, identity)
         && previous.scope === scope && previous.backend === backend
         && previous.spawnGeneration === cliSpawnGeneration) {
@@ -2238,16 +2249,21 @@ function observeContractNativeSession(nativeSessionId: string): void {
     if (previous) finishObservedRuntimeBindingHandshake(previous, true);
     const handshake: ObservedRuntimeBindingHandshake = {
       scope,
-      physicalId: active.physicalId,
+      physicalId,
+      predecessorPhysicalId: active.physicalId,
+      ...(refinementProof ? { refinementProof } : {}),
       backend,
       spawnGeneration: cliSpawnGeneration,
       identity,
     };
-    observedRuntimeBindingHandshakes.set(active.physicalId, handshake);
+    observedRuntimeBindingHandshakes.set(physicalId, handshake);
     startObservedRuntimeBindingAttempt(handshake);
   } else {
     active.identity = identity;
     send({ type: 'runtime_binding', bindingId: active.bindingId, identity: active.identity,
+      physicalLineageId: active.physicalId,
+      ...(active.refinesBindingId ? { refinesBindingId: active.refinesBindingId } : {}),
+      ...(active.refinementProof ? { refinementProof: active.refinementProof } : {}),
       ...(activeRestartAttemptId ? { operationId: activeRestartAttemptId } : {}) });
   }
 }
@@ -2295,22 +2311,61 @@ function runtimeIdentityForContract(binding: RuntimeEventBinding): RuntimeIdenti
   }
   return opaque();
 }
+function authorizedRefinementTargetMatches(authorized: RuntimeIdentity, observed: RuntimeIdentity): boolean {
+  return authorized.proof !== 'opaque' && authorized.backend === observed.backend
+    && authorized.proof === observed.proof && authorized.physicalId === observed.physicalId
+    && (authorized.nativeSessionId === undefined || authorized.nativeSessionId === observed.nativeSessionId)
+    && (authorized.nativeGeneration === undefined || authorized.nativeGeneration === observed.nativeGeneration);
+}
+function takeRuntimeRefinementProof(binding: RuntimeEventBinding, previous: RuntimeIdentity,
+  next: RuntimeIdentity): RuntimeRefinementProof | undefined {
+  const authorization = binding.identityRefinementAuthorization;
+  if (authorization && reusableRuntimeIdentity(authorization.from, previous)
+      && authorizedRefinementTargetMatches(authorization.to, next)) {
+    binding.identityRefinementAuthorization = undefined;
+    return 'attested_spawn_descendant';
+  }
+  if (authorization) binding.identityRefinementAuthorization = undefined;
+  return undefined;
+}
+/** The caller must be a bounded launcher→descendant resolver. Generic backend
+ * PID/native-generation changes never mint this one-shot transfer proof. */
+function applyAttestedRuntimeIdentityRefinement(apply: () => void): void {
+  const scope = workerSessionEventScope; const binding = scope?.currentBinding();
+  const previous = binding?.identity;
+  apply();
+  if (!scope || !binding || !previous || scope.currentBinding() !== binding || previous.proof !== 'process_start') return;
+  const next = runtimeIdentityForContract(binding);
+  if (next.proof === 'process_start' && next.backend === previous.backend
+      && confirmedRuntimeIdentityChanged(previous, next)) {
+    binding.identityRefinementAuthorization = { from: structuredClone(previous), to: structuredClone(next) };
+  }
+}
 async function publishRuntimeContract(binding: RuntimeEventBinding): Promise<void> {
   if (!workerSessionEventScope || workerSessionEventScope.currentBinding() !== binding) return;
   const identity = runtimeIdentityForContract(binding);
   const previous = binding.identity;
   if (confirmedRuntimeIdentityChanged(previous, identity)) {
     const scope = workerSessionEventScope;
+    const refinementProof = takeRuntimeRefinementProof(binding, previous!, identity);
     // A binding keeps the operation that created it for historical event
     // attribution, but an identity refinement is a new semantic binding. Do
     // not let a restart that has already settled retire the live CLI again.
     const operationId = binding.operationId === activeRestartAttemptId ? binding.operationId : undefined;
-    binding = scope.beginRuntime(operationId, binding.physicalId);
+    binding = scope.beginRuntime(operationId, refinementProof ? binding.physicalId : undefined, refinementProof);
     scope.enterRuntime(binding);
-    send({ type: 'runtime_binding_started', bindingId: binding.bindingId, ...(binding.operationId ? { operationId: binding.operationId } : {}) });
+    send({ type: 'runtime_binding_started', bindingId: binding.bindingId,
+      physicalLineageId: binding.physicalId,
+      ...(binding.refinesBindingId ? { refinesBindingId: binding.refinesBindingId } : {}),
+      ...(binding.refinementProof ? { refinementProof: binding.refinementProof } : {}),
+      ...(binding.operationId ? { operationId: binding.operationId } : {}) });
   }
   binding.identity = identity;
-  send({ type: 'runtime_binding', bindingId: binding.bindingId, identity: binding.identity, ...(binding.operationId ? { operationId: binding.operationId } : {}) });
+  send({ type: 'runtime_binding', bindingId: binding.bindingId, identity: binding.identity,
+    physicalLineageId: binding.physicalId,
+    ...(binding.refinesBindingId ? { refinesBindingId: binding.refinesBindingId } : {}),
+    ...(binding.refinementProof ? { refinementProof: binding.refinementProof } : {}),
+    ...(binding.operationId ? { operationId: binding.operationId } : {}) });
 }
 let cliSpawnGeneration = 0;
 
@@ -23290,7 +23345,11 @@ async function spawnCli(
       timer.unref?.();
       pendingRuntimeReservations.set(binding.bindingId, mayStart => { clearTimeout(timer); pendingRuntimeReservations.delete(binding.bindingId); resolve(mayStart); });
     });
-    send({ type: 'runtime_binding_started', bindingId: binding.bindingId, ...(binding.operationId ? { operationId: binding.operationId } : {}) });
+    send({ type: 'runtime_binding_started', bindingId: binding.bindingId,
+      physicalLineageId: binding.physicalId,
+      ...(binding.refinesBindingId ? { refinesBindingId: binding.refinesBindingId } : {}),
+      ...(binding.refinementProof ? { refinementProof: binding.refinementProof } : {}),
+      ...(binding.operationId ? { operationId: binding.operationId } : {}) });
     if (!await reserved || closeRequested || workerSessionEventScope?.currentBinding() !== binding) {
       workerSessionEventScope?.restoreAfterAbortedStart(binding, previousBinding);
       workerSessionEventScope?.reportAbortedStart(binding, () => send({ type: 'runtime_binding_aborted', bindingId: binding.bindingId, ...(binding.operationId ? { operationId: binding.operationId } : {}) }));
@@ -28493,11 +28552,13 @@ async function spawnCliBody(
   // ancestor of an in-CLI `botmux send`, and the env fallback covers it too).
   const applyResolvedCliPid = (realPid: number, label: string, launcherPid: number): void => {
     log(`${label}: resolved real CLI pid ${realPid} under launcher ${launcherPid} (cliId=${cfg.cliId}); rewiring session discovery + bridge`);
-    (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = realPid;
-    // Per-tick maybeFollowSessionRotationViaPid (bridge 1s poller) reads the
-    // module-level bridgeCliPid and re-points to the real CLI's jsonl.
-    bridgeCliPid = realPid;
-    publishLocalProcessAttestation(realPid);
+    applyAttestedRuntimeIdentityRefinement(() => {
+      (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = realPid;
+      // Per-tick maybeFollowSessionRotationViaPid (bridge 1s poller) reads the
+      // module-level bridgeCliPid and re-points to the real CLI's jsonl.
+      bridgeCliPid = realPid;
+      publishLocalProcessAttestation(realPid);
+    });
   };
   // wrapperCli launcher → real CLI by comm. `panePid` is what the backend
   // reports while this spawn is current (equal to launcherPid unless a relay
@@ -28603,12 +28664,14 @@ async function spawnCliBody(
       getChildPid: () => backend?.getChildPid?.(),
       applyRealPid: (realPid) => {
         log(`TRAE launcher: resolved real traex leaf pid ${realPid} under launcher ${launcherPid}; rewiring ownership pid`);
-        (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = realPid;
-        (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliCwd = cfg.workingDir;
-        // Same pair applyResolvedCliPid keeps in step: a launch-payload binding
-        // may already have pointed the bridge pid at a layer above this leaf.
-        bridgeCliPid = realPid;
-        publishLocalProcessAttestation(realPid);
+        applyAttestedRuntimeIdentityRefinement(() => {
+          (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = realPid;
+          (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliCwd = cfg.workingDir;
+          // Same pair applyResolvedCliPid keeps in step: a launch-payload binding
+          // may already have pointed the bridge pid at a layer above this leaf.
+          bridgeCliPid = realPid;
+          publishLocalProcessAttestation(realPid);
+        });
       },
       schedule: (fn, ms) => { setTimeout(fn, ms); },
     });
@@ -28639,10 +28702,12 @@ async function spawnCliBody(
       getChildPid: () => lastSpawnCodexLauncherPid,
       applyRealPid: (realPid) => {
         log(`Codex launcher: resolved real codex leaf pid ${realPid} under launcher ${launcherPid}; rewiring ownership pid`);
-        (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = realPid;
-        (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliCwd = cfg.workingDir;
-        bridgeCliPid = realPid;
-        codexOwnershipAttestationPending = !publishLocalProcessAttestation(realPid);
+        applyAttestedRuntimeIdentityRefinement(() => {
+          (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = realPid;
+          (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliCwd = cfg.workingDir;
+          bridgeCliPid = realPid;
+          codexOwnershipAttestationPending = !publishLocalProcessAttestation(realPid);
+        });
       },
       schedule: (fn, ms) => { setTimeout(fn, ms); },
     });
@@ -28681,8 +28746,10 @@ async function spawnCliBody(
       : cfg.cliId === 'codex'
         ? resolveCodexOwnershipPid(ownershipPid, codexLauncherActive, codexFilterExecutable)
         : ownershipPid;
-    (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = wiredPid;
-    (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliCwd = cfg.workingDir;
+    applyAttestedRuntimeIdentityRefinement(() => {
+      (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = wiredPid;
+      (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliCwd = cfg.workingDir;
+    });
     if (cfg.cliId === 'traex' && traexLauncherActive) startTraexLauncherPidResolve(cliPid);
     if (cfg.cliId === 'codex' && codexLauncherActive) startCodexLauncherPidResolve(cliPid);
   }
@@ -28718,8 +28785,10 @@ async function spawnCliBody(
             : cfg.cliId === 'codex'
               ? resolveCodexOwnershipPid(ownershipPid, codexLauncherActive, codexFilterExecutable)
               : ownershipPid;
-          (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = wiredPid;
-          (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliCwd = cfg.workingDir;
+          applyAttestedRuntimeIdentityRefinement(() => {
+            (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = wiredPid;
+            (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliCwd = cfg.workingDir;
+          });
           if (cfg.cliId === 'traex' && traexLauncherActive) startTraexLauncherPidResolve(pid);
           if (cfg.cliId === 'codex' && codexLauncherActive) startCodexLauncherPidResolve(pid);
         }

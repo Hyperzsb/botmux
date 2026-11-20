@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync, copyFileSync, renameSync } from 'node:fs';
+import { mkdtempSync, rmSync, copyFileSync, renameSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { SessionContractStore, SessionContractConflict, sessionContractStore } from '../src/services/session-contract-store.js';
@@ -14,6 +14,21 @@ function open(directory = mkdtempSync(join(tmpdir(), 'session-contract-'))) { if
 function bind(store: SessionContractStore, owner = worker, physical = identity) { store.bindWorker(ref, owner); const runtime = store.reserveRuntime(ref, owner); return store.bindRuntime(ref, runtime, owner, physical); }
 afterEach(() => { vi.useRealTimers(); for (const store of stores.splice(0)) try { store.close(); } catch {} for (const dir of directories.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 describe('session identity and state contract', () => {
+  it('adds refinement provenance columns to a pre-change runtime binding table', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'contract-schema-upgrade-')); directories.push(dir);
+    const appDir = join(dir, 'session-stores', ref.appId); mkdirSync(appDir, { recursive: true });
+    const db = openDatabaseSyncOrThrow(join(appDir, 'sessions.db'));
+    db.exec(`CREATE TABLE runtime_bindings(
+      session_key TEXT NOT NULL,binding_id TEXT NOT NULL,runtime_id TEXT NOT NULL,
+      worker_id TEXT NOT NULL,generation INTEGER NOT NULL,PRIMARY KEY(session_key,binding_id));`);
+    db.close();
+    const upgraded = new SessionContractStore(dir, ref.appId); stores.push(upgraded);
+    const columns = openDatabaseSyncOrThrow(upgraded.filename);
+    try {
+      expect((columns.prepare('PRAGMA table_info(runtime_bindings)').all() as Array<{ name: string }>).map(column => column.name))
+        .toEqual(expect.arrayContaining(['lineage_id', 'predecessor_binding_id', 'refinement_proof']));
+    } finally { columns.close(); }
+  });
   it.each(['suspend', 'cancel'] as const)('retains an uncertain %s record while a reopened store starts one recovery restart', kind => {
     const store = open(); bind(store);
     const execution = store.admitExecution(ref, 'old-turn');
@@ -101,6 +116,35 @@ describe('session identity and state contract', () => {
       expect(store.read(ref)?.lifecycle).toBe('active');
     } finally { target.close(); }
   });
+  it('round-trips a pre-lineage checkpoint and seeds fresh provenance on worker reattach', () => {
+    const store = open(); store.bindWorker(ref, worker);
+    const old = store.reserveRuntime(ref, worker, 'old-binding', undefined, 'old-lineage');
+    store.bindRuntime(ref, old, worker, identity, undefined, 'old-binding');
+    store.apply(ref, { type: 'runtime_ready', runtime: old });
+    const execution = store.admitExecution(ref, 'live-turn'); store.bindQueuedExecution(ref, execution.ref, old);
+    store.apply(ref, { type: 'execution_phase', execution: execution.ref, runtime: old, phase: 'running' });
+    const legacy = store.snapshot(ref);
+    expect(legacy.version).toBe(3);
+    legacy.version = 2;
+    for (const row of legacy.tables.runtime_bindings) {
+      delete row.lineage_id; delete row.predecessor_binding_id; delete row.refinement_proof;
+    }
+    store.restore(legacy);
+
+    const nextWorker = { workerId: 'worker_two', generation: 2 }; store.bindWorker(ref, nextWorker);
+    const reattach = store.reserveRuntime(ref, nextWorker, 'reattach-binding', undefined, 'reattach-lineage');
+    const reattached = store.bindRuntime(ref, reattach, nextWorker, identity, undefined, 'reattach-binding');
+    expect(reattached).toMatchObject({ ref: old, phase: 'starting', promptReady: false });
+    // A worker reattach deliberately requires a fresh readiness observation;
+    // the new binding then acts as the proven lineage root for refinements.
+    store.apply(ref, { type: 'runtime_ready', runtime: reattached.ref });
+    const successor = store.reserveRuntime(ref, nextWorker, 'semantic-successor',
+      'reattach-binding', 'reattach-lineage', 'attested_spawn_descendant');
+    const refined = store.bindRuntime(ref, successor, nextWorker,
+      { ...identity, physicalId: 'pid:456:start:200', nativeSessionId: 'native_two' }, undefined, 'semantic-successor');
+    expect(refined).toMatchObject({ phase: 'ready', promptReady: true });
+    expect(store.execution(ref, execution.ref.executionId)).toMatchObject({ phase: 'running', runtime: refined.ref });
+  });
   it('ignores old ready while retaining the old runtime exit fact', () => {
     const store = open(); const old = bind(store); const candidate = store.reserveRuntime(ref, worker); const current = store.bindRuntime(ref, candidate, worker, { ...identity, physicalId: 'pid:456:start:200' });
     store.apply(ref, { type: 'runtime_ready', runtime: current.ref });
@@ -146,5 +190,11 @@ describe('session identity and state contract', () => {
     const next = scope.beginRuntime(); scope.assign(next.bindingId, { runtimeId: 'runtime_two', epoch: 2 });
     await vi.advanceTimersByTimeAsync(11);
     expect(received[0].scope.runtime).toEqual({ runtimeId: 'runtime_one', epoch: 1 });
+  });
+  it('declares a refinement predecessor only within the same physical lineage', () => {
+    const scope = new WorkerSessionEventScope(ref, worker); const first = scope.beginRuntime(undefined, 'physical-one');
+    const semanticSuccessor = scope.beginRuntime(undefined, 'physical-one', 'attested_spawn_descendant');
+    expect(semanticSuccessor.refinesBindingId).toBe(first.bindingId);
+    expect(scope.beginRuntime(undefined, 'physical-two').refinesBindingId).toBeUndefined();
   });
 });

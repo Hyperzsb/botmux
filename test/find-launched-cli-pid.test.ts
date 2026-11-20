@@ -179,6 +179,11 @@ function runWorkerWiring(late: boolean, options: {
     programStatusRelayLaunched: options.relayLaunched ?? false,
     effectiveBackendType: options.backendType ?? 'tmux',
     actuallyReattachedPersistent: options.reattached ?? false,
+    // This harness owns only the PID-wiring slice. The authorization helper's
+    // state semantics are exercised through its real function in the session
+    // contract gateway tests; here it must preserve and expose the bounded
+    // resolver call site while executing the wrapped PID update.
+    applyAttestedRuntimeIdentityRefinement: vi.fn((apply: () => void) => apply()),
     publishLocalProcessAttestation: vi.fn(() => true), observeCursorCliSessionId: vi.fn(), observeAntigravityCliSessionId: vi.fn(), observeZcodeCliSessionId: vi.fn(),
     setTimeout: scheduler.schedule, log: vi.fn(),
   };

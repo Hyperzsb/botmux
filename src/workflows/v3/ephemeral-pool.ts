@@ -495,11 +495,13 @@ async function runNodeImpl(
         if (event.type === 'runtime_binding_started' || event.type === 'runtime_binding') {
           if (!controller.admitsRegistration(event.type, event.bindingId, event.sessionContract, bootstrap.worker)) return;
           if (event.type === 'runtime_binding_started') {
-            controller.reserveBinding(event.bindingId, bootstrap.worker);
+            controller.reserveBinding(event.bindingId, bootstrap.worker, event.refinesBindingId,
+              event.physicalLineageId, event.refinementProof);
             worker.send({ type: 'runtime_contract_reserved', bindingId: event.bindingId, runtime: controller.store.binding(controller.ref, event.bindingId)?.ref, mayStart: !['closed', 'closing'].includes(controller.store.read(controller.ref)!.lifecycle) });
           }
           else {
-            const runtime = controller.bindRuntime(event.bindingId, bootstrap.worker, event.identity, event.operationId);
+            const runtime = controller.bindRuntime(event.bindingId, bootstrap.worker, event.identity, event.operationId,
+              event.refinesBindingId, event.physicalLineageId, event.refinementProof);
             worker.send({ type: 'runtime_contract_assigned', bindingId: event.bindingId, runtime: runtime.ref, mayExecute: runtime.phase !== 'retiring',
               executions: controller.store.executions(controller.ref).filter(execution => execution.runtime?.runtimeId === runtime.ref.runtimeId).map(execution => execution.ref),
               admissionStates: controller.store.executions(controller.ref).map(({ ref, runtime, phase }) => ({ ref, runtime, phase })) });

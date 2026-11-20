@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
-import { sameRuntime, type ContractSessionRef, type WorkerRef, type RuntimeRef, type ExecutionRef, type SessionEventContext, type RuntimeIdentity, type ExecutionAdmissionState } from './session-contract.js';
+import { sameRuntime, type ContractSessionRef, type WorkerRef, type RuntimeRef, type ExecutionRef, type SessionEventContext, type RuntimeIdentity, type ExecutionAdmissionState, type RuntimeRefinementProof } from './session-contract.js';
 
 export interface CapturedSessionOrigin {
   bindingId: string;
@@ -11,6 +11,10 @@ export interface CapturedSessionOrigin {
 export interface RuntimeEventBinding {
   bindingId: string;
   physicalId: string;
+  /** Direct semantic predecessor within the same physical CLI lineage. */
+  refinesBindingId?: string;
+  refinementProof?: RuntimeRefinementProof;
+  identityRefinementAuthorization?: { from: RuntimeIdentity; to: RuntimeIdentity };
   runtime?: RuntimeRef;
   proposedRuntime?: RuntimeRef;
   operationId?: string;
@@ -41,13 +45,17 @@ export class WorkerSessionEventScope {
   private pendingReady?: PendingRuntimeReady;
   private sequence = 0;
   constructor(readonly session: ContractSessionRef, readonly worker: WorkerRef) {}
-  beginRuntime(operationId?: string, physicalId: string = randomUUID()): RuntimeEventBinding {
-    const value: RuntimeEventBinding = { bindingId: randomUUID(), physicalId, ...(operationId ? { operationId } : {}) };
+  beginRuntime(operationId?: string, physicalId: string = randomUUID(), refinementProof?: RuntimeRefinementProof): RuntimeEventBinding {
+    const predecessor = this.current;
+    const value: RuntimeEventBinding = { bindingId: randomUUID(), physicalId,
+      ...(predecessor?.physicalId === physicalId && refinementProof
+        ? { refinesBindingId: predecessor.bindingId, refinementProof } : {}),
+      ...(operationId ? { operationId } : {}) };
     if (this.pendingReady) {
       if (this.pendingReady.physicalId === physicalId) this.pendingReady.bindingId = value.bindingId;
       else this.pendingReady = undefined;
     }
-    this.predecessors.set(value.bindingId, this.current);
+    this.predecessors.set(value.bindingId, predecessor);
     this.bindings.set(value.bindingId, value); this.current = value; return value;
   }
   assign(bindingId: string, runtime: RuntimeRef): boolean {

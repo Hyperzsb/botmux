@@ -6,7 +6,7 @@ import { sessionContractStore, type SessionContractStore } from '../services/ses
 import {
   contractReadiness, sameWorker, sameRuntime, sameExecution, type ContractSessionRef, type WorkerRef, type RuntimeRef,
   type RuntimeIdentity, type SessionEventContext, type ContractEvent, type ExecutionRef, type ControlKind,
-  type ControlOperation, type RuntimeContract,
+  type ControlOperation, type RuntimeContract, type RuntimeRefinementProof,
   sessionContractsEnabled,
   contractTerminalStatus,
   samePhysicalRuntimeIdentity,
@@ -71,17 +71,19 @@ export class SessionController {
     this.store.bindWorker(this.ref, worker); this.refresh(); return { version: 2, session: this.ref, worker,
       executions: this.store.executions(this.ref).map(({ ref, runtime, phase }) => ({ ref, runtime, phase })) };
   }
-  reserveBinding(bindingId: string, worker: WorkerRef): RuntimeRef {
+  reserveBinding(bindingId: string, worker: WorkerRef, refinesBindingId?: string,
+    physicalLineageId?: string, refinementProof?: RuntimeRefinementProof): RuntimeRef {
     const state = this.store.read(this.ref)!;
     if (!sameWorker(state.worker, worker)) throw new Error('stale_runtime_registration');
-    const value = this.store.reserveRuntime(this.ref, worker, bindingId); this.refresh(); return value;
+    const value = this.store.reserveRuntime(this.ref, worker, bindingId, refinesBindingId, physicalLineageId, refinementProof); this.refresh(); return value;
   }
-  bindRuntime(bindingId: string, worker: WorkerRef, identity: RuntimeIdentity, operationId?: string): RuntimeContract {
+  bindRuntime(bindingId: string, worker: WorkerRef, identity: RuntimeIdentity, operationId?: string,
+    refinesBindingId?: string, physicalLineageId?: string, refinementProof?: RuntimeRefinementProof): RuntimeContract {
     if (this.abortedBindings.has(bindingId)) throw new Error('runtime_reservation_abandoned');
     const existing = this.store.binding(this.ref, bindingId);
     if (existing && !this.store.bindingProducer(this.ref, bindingId, worker)) throw new Error('runtime_binding_producer_mismatch');
-    const proposed = existing ?? { ref: this.reserveBinding(bindingId, worker) };
-    const runtime = this.store.bindRuntime(this.ref, proposed.ref, worker, identity, operationId); this.refresh(); return runtime;
+    const proposed = { ref: this.reserveBinding(bindingId, worker, refinesBindingId, physicalLineageId, refinementProof) };
+    const runtime = this.store.bindRuntime(this.ref, proposed.ref, worker, identity, operationId, bindingId); this.refresh(); return runtime;
   }
   bindingMayStart(bindingId: string): boolean {
     return !this.abortedBindings.has(bindingId) && this.store.binding(this.ref, bindingId)?.phase === 'starting';

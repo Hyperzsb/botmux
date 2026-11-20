@@ -82,7 +82,7 @@ describe('cursor plan B worker wiring (on #2009)', () => {
   it('spawnCli re-validates the frozen replyDelivery=transcript against the resolved sandbox mode and degrades to send', () => {
     const start = source.indexOf('function spawnCli');
     expect(start).toBeGreaterThanOrEqual(0);
-    const spawnBody = source.slice(start, start + 60000);
+    const spawnBody = source.slice(start);
     const anchor = 'lastResolvedSandboxMode = sandboxMode;';
     const predicate = 'supportsTranscriptReplyDeliveryForBot(cfg.cliId, { sandbox: sandboxMode })';
     const predAt = spawnBody.indexOf(predicate);

@@ -22484,7 +22484,8 @@ function setupWorkerHandlers(
       if (!sessionController.admitsRegistration(msg.type, msg.bindingId, metadata, contractWorker) || ds.worker !== worker) return;
       try {
         if (msg.type === 'runtime_binding_started') {
-          sessionController.reserveBinding(msg.bindingId, contractWorker);
+          sessionController.reserveBinding(msg.bindingId, contractWorker, msg.refinesBindingId,
+            msg.physicalLineageId, msg.refinementProof);
           await sessionController.flushPrimary();
           const state = sessionController.store.read(sessionController.ref)!;
           if (ds.worker !== worker || !sameWorker(state.worker, contractWorker)) return;
@@ -22526,7 +22527,8 @@ function setupWorkerHandlers(
           worker.send({ type: 'runtime_binding_aborted_ack', bindingId: msg.bindingId });
         }
         else {
-          const runtime = sessionController.bindRuntime(msg.bindingId, contractWorker, msg.identity, msg.operationId);
+          const runtime = sessionController.bindRuntime(msg.bindingId, contractWorker, msg.identity, msg.operationId,
+            msg.refinesBindingId, msg.physicalLineageId, msg.refinementProof);
           await sessionController.flushPrimary();
           if (ds.worker !== worker || !sameWorker(sessionController.store.read(sessionController.ref)!.worker, contractWorker)) return;
           worker.send({ type: 'runtime_contract_assigned', bindingId: msg.bindingId, runtime: runtime.ref, mayExecute: runtime.phase !== 'retiring',

@@ -23,6 +23,7 @@ export interface RuntimeIdentity {
   nativeGeneration?: string;
   proof: 'process_start' | 'native_generation' | 'persistent_lineage' | 'opaque';
 }
+export type RuntimeRefinementProof = 'attested_spawn_descendant';
 export type SessionLifecycle = 'active' | 'suspending' | 'suspended' | 'resuming' | 'closing' | 'closed';
 export type RuntimePhase = 'starting' | 'ready' | 'retiring' | 'stopped' | 'unresolved';
 export type ExecutionPhase = 'queued' | 'submitting' | 'accepted' | 'running' | 'waiting_input' | 'blocked' | 'reconciling' | 'succeeded' | 'failed' | 'cancelled';
@@ -93,7 +94,7 @@ export type ContractEvent =
   | { type: 'worker_lost'; worker: WorkerRef }
   | { type: 'runtime_reserved'; runtime: RuntimeContract }
   | { type: 'runtime_epoch_floor'; epoch: number }
-  | { type: 'runtime_bound'; runtime: RuntimeContract; operationId?: string }
+  | { type: 'runtime_bound'; runtime: RuntimeContract; operationId?: string; refinedFrom?: RuntimeRef }
   | { type: 'runtime_ready'; runtime: RuntimeRef }
   | { type: 'runtime_busy'; runtime: RuntimeRef }
   | { type: 'runtime_lost'; runtime: RuntimeRef; confirmed: boolean; reason?: string }

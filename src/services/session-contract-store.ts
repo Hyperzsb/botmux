@@ -8,14 +8,14 @@ import {
   reduceSessionContract, reusableRuntimeIdentity, sameRuntime, samePhysicalRuntimeIdentity, canSupersedeControlOperation,
   type ContractSessionRef, type SessionContract, type RuntimeContract, type RuntimeIdentity, type RuntimeRef,
   type ExecutionContract, type ExecutionRef, type ControlOperation, type ControlKind, type ContractEvent,
-  type ContractTransition, type ContractTransitionInput, type WorkerRef,
+  type ContractTransition, type ContractTransitionInput, type WorkerRef, type RuntimeRefinementProof,
 } from './session-contract.js';
 
 export class SessionContractConflict extends Error {
   constructor(readonly currentRevision: number) { super('session_contract_revision_conflict'); }
 }
 export interface SessionContractSnapshot {
-  version: 2;
+  version: 2 | 3;
   session: SessionContract;
   tables: Record<string, Array<Record<string, unknown>>>;
 }
@@ -52,8 +52,14 @@ const contractSchema = `
       CREATE TABLE IF NOT EXISTS deferred_events(session_key TEXT NOT NULL,binding_id TEXT NOT NULL,event_id TEXT NOT NULL,sequence INTEGER NOT NULL,value TEXT NOT NULL,PRIMARY KEY(session_key,event_id));
       CREATE TABLE IF NOT EXISTS observation_watermarks(session_key TEXT NOT NULL,producer TEXT NOT NULL,runtime_id TEXT NOT NULL,sequence INTEGER NOT NULL,PRIMARY KEY(session_key,producer,runtime_id));
       CREATE TABLE IF NOT EXISTS events(session_key TEXT NOT NULL,event_id TEXT NOT NULL,type TEXT NOT NULL,decision TEXT NOT NULL,value TEXT NOT NULL,revision INTEGER NOT NULL,PRIMARY KEY(session_key,event_id));
-      CREATE TABLE IF NOT EXISTS runtime_bindings(session_key TEXT NOT NULL,binding_id TEXT NOT NULL,runtime_id TEXT NOT NULL,worker_id TEXT NOT NULL,generation INTEGER NOT NULL,PRIMARY KEY(session_key,binding_id));
+      CREATE TABLE IF NOT EXISTS runtime_bindings(session_key TEXT NOT NULL,binding_id TEXT NOT NULL,runtime_id TEXT NOT NULL,worker_id TEXT NOT NULL,generation INTEGER NOT NULL,lineage_id TEXT,predecessor_binding_id TEXT,refinement_proof TEXT,PRIMARY KEY(session_key,binding_id));
       CREATE TABLE IF NOT EXISTS runtime_producers(session_key TEXT NOT NULL,runtime_id TEXT NOT NULL,worker_id TEXT NOT NULL,generation INTEGER NOT NULL,PRIMARY KEY(session_key,runtime_id,worker_id,generation));`;
+function ensureRuntimeBindingSchema(db: DatabaseSyncLike): void {
+  const columns = new Set((db.prepare('PRAGMA table_info(runtime_bindings)').all() as Array<{ name: string }>).map(column => column.name));
+  for (const name of ['lineage_id', 'predecessor_binding_id', 'refinement_proof']) {
+    if (!columns.has(name)) db.exec(`ALTER TABLE runtime_bindings ADD COLUMN ${name} TEXT;`);
+  }
+}
 
 /** One transaction commits identity/state facts and the compatible read model.
  * Historic entities remain separate from the current runtime selection. */
@@ -80,7 +86,7 @@ export class SessionContractStore {
     this.filename = join(dir, 'sessions.db');
     this.connection = this.ownedDatabase = openDatabaseSyncOrThrow(this.filename);
     this.db.exec('PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;');
-    this.db.exec(contractSchema);
+    this.db.exec(contractSchema); ensureRuntimeBindingSchema(this.db);
     chmodSync(this.filename, 0o600);
     const identity = statSync(this.filename, { bigint: true });
     this.databaseIdentity = { device: identity.dev, inode: identity.ino };
@@ -116,7 +122,7 @@ export class SessionContractStore {
     const previous = this.db; this.db = db; this.transactionDepth++;
     // A borrowed Session connection may have been recreated. Schema creation
     // participates in the caller's transaction and is retried after rollback.
-    try { this.db.exec(contractSchema); return work(); } finally { this.transactionDepth--; this.db = previous; }
+    try { this.db.exec(contractSchema); ensureRuntimeBindingSchema(this.db); return work(); } finally { this.transactionDepth--; this.db = previous; }
   }
   atomic<T>(work: () => T): T { return this.transaction(work); }
   snapshot(ref: ContractSessionRef): SessionContractSnapshot {
@@ -124,12 +130,14 @@ export class SessionContractStore {
       const session = this.read(ref); if (!session) throw new Error('contract_session_missing');
       const tables = Object.fromEntries(snapshotTables.map(table => [table,
         this.db.prepare(`SELECT * FROM ${table} WHERE session_key=? ORDER BY rowid`).all(sessionKey(ref)) as Array<Record<string, unknown>>]));
-      return structuredClone({ version: 2, session, tables });
+      // v3 adds runtime binding lineage/proof columns. New readers retain v2
+      // compatibility; old readers reject v3 before attempting column writes.
+      return structuredClone({ version: 3 as const, session, tables });
     });
   }
   restore(snapshot: SessionContractSnapshot): void {
     const ref = snapshot.session.ref; const key = sessionKey(ref);
-    if (snapshot.version !== 2 || ref.appId !== this.appId) throw new Error('invalid_contract_checkpoint');
+    if ((snapshot.version !== 2 && snapshot.version !== 3) || ref.appId !== this.appId) throw new Error('invalid_contract_checkpoint');
     this.transaction(() => {
       const allocatedEpoch = Math.max(this.read(ref)?.runtimeEpoch ?? 0, this.epochFloors.get(key) ?? 0);
       for (const table of snapshotTables) {
@@ -332,21 +340,69 @@ export class SessionContractStore {
       return true;
     });
   }
-  reserveRuntime(ref: ContractSessionRef, worker: WorkerRef, bindingId?: string): RuntimeRef {
+  private rememberRuntimeRefinement(ref: ContractSessionRef, bindingId: string, worker: WorkerRef,
+    predecessorBindingId?: string, physicalLineageId?: string, refinementProof?: RuntimeRefinementProof): void {
+    if (physicalLineageId === undefined) {
+      if (predecessorBindingId || refinementProof) throw new Error('runtime_refinement_lineage_unproven');
+      return;
+    }
+    if (!physicalLineageId || physicalLineageId.length > 256 || /[\0\r\n]/.test(physicalLineageId)) throw new Error('invalid_runtime_lineage');
+    if (predecessorBindingId === bindingId) throw new Error('runtime_refinement_cycle');
+    if (predecessorBindingId) {
+      if (!refinementProof) throw new Error('runtime_refinement_proof_missing');
+      const predecessor = this.db.prepare(`SELECT binding_id FROM runtime_bindings
+        WHERE session_key=? AND binding_id=? AND worker_id=? AND generation=? AND lineage_id=?`)
+        .get(sessionKey(ref), predecessorBindingId, worker.workerId, worker.generation, physicalLineageId) as { binding_id: string } | undefined;
+      if (!predecessor) throw new Error('runtime_refinement_predecessor_unproven');
+    } else if (refinementProof) throw new Error('runtime_refinement_predecessor_missing');
+    const existing = this.db.prepare('SELECT lineage_id,predecessor_binding_id,refinement_proof FROM runtime_bindings WHERE session_key=? AND binding_id=?')
+      .get(sessionKey(ref), bindingId) as { lineage_id: string | null; predecessor_binding_id: string | null; refinement_proof: string | null } | undefined;
+    if (!existing) throw new Error('runtime_binding_missing');
+    if (existing.lineage_id !== null && (existing.lineage_id !== physicalLineageId
+      || (existing.predecessor_binding_id ?? undefined) !== predecessorBindingId
+      || (existing.refinement_proof ?? undefined) !== refinementProof)) throw new Error('runtime_refinement_conflict');
+    if (existing.lineage_id === null) this.db.prepare(`UPDATE runtime_bindings
+      SET lineage_id=?,predecessor_binding_id=?,refinement_proof=? WHERE session_key=? AND binding_id=?`)
+      .run(physicalLineageId, predecessorBindingId ?? null, refinementProof ?? null, sessionKey(ref), bindingId);
+  }
+  private refinementPredecessor(ref: ContractSessionRef, bindingId: string, proposed: RuntimeRef, worker: WorkerRef):
+    { runtime: RuntimeContract; proof: RuntimeRefinementProof } | undefined {
+    const row = this.db.prepare(`SELECT predecessor.runtime_id AS runtime_id,successor.refinement_proof AS refinement_proof
+      FROM runtime_bindings successor JOIN runtime_bindings predecessor
+        ON predecessor.session_key=successor.session_key AND predecessor.binding_id=successor.predecessor_binding_id
+          AND predecessor.lineage_id=successor.lineage_id
+      WHERE successor.session_key=? AND successor.binding_id=? AND successor.runtime_id=?
+        AND successor.worker_id=? AND successor.generation=? AND predecessor.worker_id=? AND predecessor.generation=?`)
+      .get(sessionKey(ref), bindingId, proposed.runtimeId,
+        worker.workerId, worker.generation, worker.workerId, worker.generation) as { runtime_id: string; refinement_proof: RuntimeRefinementProof } | undefined;
+    const runtime = row ? this.runtime(ref, row.runtime_id) : undefined;
+    return runtime && row!.refinement_proof === 'attested_spawn_descendant'
+      ? { runtime, proof: row!.refinement_proof } : undefined;
+  }
+  reserveRuntime(ref: ContractSessionRef, worker: WorkerRef, bindingId?: string,
+    refinesBindingId?: string, physicalLineageId?: string, refinementProof?: RuntimeRefinementProof): RuntimeRef {
     return this.transaction(() => {
       const bound = bindingId ? this.binding(ref, bindingId) : undefined;
-      if (bound) return bound.ref;
+      if (bound) {
+        if (!this.bindingProducer(ref, bindingId!, worker)) throw new Error('runtime_binding_producer_mismatch');
+        this.rememberRuntimeRefinement(ref, bindingId!, worker, refinesBindingId, physicalLineageId, refinementProof);
+        return bound.ref;
+      }
       const state = this.read(ref); if (!state) throw new Error('contract_session_missing');
       const epoch = Math.max(state.runtimeEpoch, this.epochFloors.get(sessionKey(ref)) ?? 0) + 1;
       const runtime: RuntimeContract = { ref: { runtimeId: randomUUID(), epoch }, worker, phase: 'starting', promptReady: false, promptReadySequence: 0 };
       const result = this.applyInside(ref, { type: 'runtime_reserved', runtime }, randomUUID(), state.revision);
       if (result.decision !== 'applied') throw new Error('runtime_reservation_failed');
-      if (bindingId) this.db.prepare('INSERT INTO runtime_bindings(session_key,binding_id,runtime_id,worker_id,generation) VALUES(?,?,?,?,?)').run(sessionKey(ref), bindingId, runtime.ref.runtimeId, worker.workerId, worker.generation);
+      if (bindingId) {
+        this.db.prepare('INSERT INTO runtime_bindings(session_key,binding_id,runtime_id,worker_id,generation) VALUES(?,?,?,?,?)').run(sessionKey(ref), bindingId, runtime.ref.runtimeId, worker.workerId, worker.generation);
+        this.rememberRuntimeRefinement(ref, bindingId, worker, refinesBindingId, physicalLineageId, refinementProof);
+      }
       return runtime.ref;
     });
   }
-  bindRuntime(ref: ContractSessionRef, proposed: RuntimeRef, worker: WorkerRef, identity: RuntimeIdentity, operationId?: string): RuntimeContract {
+  bindRuntime(ref: ContractSessionRef, proposed: RuntimeRef, worker: WorkerRef, identity: RuntimeIdentity, operationId?: string, bindingId?: string): RuntimeContract {
     return this.transaction(() => {
+      const state = this.read(ref); if (!state) throw new Error('contract_session_missing');
       const previous = this.runtime(ref);
       const reserved = this.runtime(ref, proposed.runtimeId);
       if (!reserved || !sameRuntime(reserved.ref, proposed)) throw new Error('runtime_reservation_missing');
@@ -397,10 +453,30 @@ export class SessionContractStore {
           if (uncertainOnly && complete) reuse = candidate;
         }
       }
+      const predecessor = bindingId ? this.refinementPredecessor(ref, bindingId, proposed, worker) : undefined;
+      const identityTransferProven = predecessor?.proof === 'attested_spawn_descendant'
+        && previous?.identity?.proof === 'process_start' && identity.proof === 'process_start'
+        && previous.identity.backend === identity.backend;
+      const refinement = !reuse && previous && predecessor && identityTransferProven
+        && sameRuntime(previous.ref, predecessor.runtime.ref)
+        && proposed.epoch > previous.ref.epoch && !!previous.identity
+        && !['retiring', 'stopped', 'unresolved'].includes(previous.phase)
+        && ['active', 'resuming'].includes(state.lifecycle)
+        && (operationId ? state.activeOperationId === operationId : !state.activeOperationId)
+        ? previous : undefined;
       const runtime: RuntimeContract = { ...(reuse ?? reserved), worker, identity,
-        ...(!enriching ? { phase: 'starting' as const, promptReady: false } : {}) };
-      const result = this.applyInside(ref, { type: 'runtime_bound', runtime, ...(operationId ? { operationId } : {}) }, randomUUID());
+        ...(!enriching && !refinement ? { phase: 'starting' as const, promptReady: false } : {}),
+        ...(refinement ? { phase: refinement.phase, promptReady: refinement.promptReady,
+          promptReadySequence: refinement.promptReadySequence } : {}) };
+      const result = this.applyInside(ref, { type: 'runtime_bound', runtime,
+        ...(operationId ? { operationId } : {}), ...(refinement ? { refinedFrom: refinement.ref } : {}) }, randomUUID());
       if (!['applied', 'historical'].includes(result.decision)) throw new Error(`runtime_binding_${result.decision}`);
+      if (result.decision === 'applied' && refinement && !sameRuntime(refinement.ref, runtime.ref)) {
+        for (const execution of this.executions(ref).filter(value => sameRuntime(value.runtime, refinement.ref) && !terminalPhase(value.phase))) {
+          execution.runtime = runtime.ref; execution.revision++;
+          this.saveEntity(ref, 'execution', execution.ref.executionId, execution.phase, execution);
+        }
+      }
       if (result.decision === 'applied' && previous && !sameRuntime(previous.ref, runtime.ref) && !['stopped', 'unresolved'].includes(previous.phase)) {
         this.saveEntity(ref, 'runtime', previous.ref.runtimeId, 'retiring', { ...previous, phase: 'retiring', promptReady: false });
       }

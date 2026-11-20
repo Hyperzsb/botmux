@@ -29,7 +29,7 @@ function fixture() {
   const store = new SessionContractStore(data, appId); handles.push(store);
   const ds = { larkAppId: appId, chatId: 'oc_test', session: { sessionId: ref.sessionId, larkAppId: appId, status: 'active' }, cliReadyGeneration: 0 } as DaemonSession;
   const controller = new SessionController(ds, store); const worker = controller.bindWorker(1).worker;
-  const runtime = controller.reserveBinding('binding-old', worker);
+  const runtime = controller.reserveBinding('binding-old', worker, undefined, 'fixture-lineage');
   controller.bindRuntime('binding-old', worker, { backend: 'tmux', physicalId: '111:start1', nativeSessionId: 'native1', proof: 'process_start' });
   const context = (sequence: number, scope: any = { runtime }) => ({ version: 2 as const, session: ref, producer: worker, eventId: `${worker.workerId}:${sequence}`, sequence, scope });
   return { data, appId, ref, store, ds, controller, worker, runtime, context };
@@ -452,6 +452,9 @@ describe('contract gateway and real worker boundaries', () => {
     const s = fixture(); const scope = new WorkerSessionEventScope(s.ref, s.worker);
     const active = scope.beginRuntime(activeOperationId, 'physical-lineage');
     scope.assign(active.bindingId, s.runtime); active.identity = previous;
+    if (replaces) active.identityRefinementAuthorization = {
+      from: previous, to: { ...observed, nativeSessionId: 'native1' },
+    };
     const sent: any[] = [];
     const observedRuntimeBindingHandshakes = new Map();
     const observe = loadWorkerFunction<(nativeSessionId: string) => void>('observeContractNativeSession', {
@@ -464,6 +467,7 @@ describe('contract gateway and real worker boundaries', () => {
       runtimeIdentityForContract: () => observed,
       confirmedRuntimeIdentityChanged,
       reusableRuntimeIdentity,
+      takeRuntimeRefinementProof: () => replaces ? 'attested_spawn_descendant' : undefined,
       send: (message: any) => sent.push(message),
     });
     scope.run(active, () => observe('native1'));
@@ -474,10 +478,12 @@ describe('contract gateway and real worker boundaries', () => {
     expect(current.operationId).toBe(replaces ? liveOperationId : activeOperationId);
     const operation = liveOperationId ? { operationId: liveOperationId } : {};
     expect(sent).toEqual(replaces ? [
-      { type: 'runtime_binding_started', bindingId: current.bindingId, ...operation },
-      { type: 'runtime_binding', bindingId: current.bindingId, identity: current.identity, ...operation },
+      { type: 'runtime_binding_started', bindingId: current.bindingId, physicalLineageId: current.physicalId,
+        refinesBindingId: active.bindingId, refinementProof: 'attested_spawn_descendant', ...operation },
+      { type: 'runtime_binding', bindingId: current.bindingId, identity: current.identity, physicalLineageId: current.physicalId,
+        refinesBindingId: active.bindingId, refinementProof: 'attested_spawn_descendant', ...operation },
     ] : [
-      { type: 'runtime_binding', bindingId: active.bindingId, identity: active.identity, ...operation },
+      { type: 'runtime_binding', bindingId: active.bindingId, identity: active.identity, physicalLineageId: active.physicalId, ...operation },
     ]);
     const pending = [...observedRuntimeBindingHandshakes.values()][0];
     if (pending?.timer) clearTimeout(pending.timer);
@@ -489,7 +495,7 @@ describe('contract gateway and real worker boundaries', () => {
     const cancel = s.controller.beginControl('cancel', 'cancel-active', execution).operation;
     s.controller.controlStarted(cancel.operationId);
     const scope = new WorkerSessionEventScope(s.ref, s.worker);
-    const previous = scope.beginRuntime(undefined, 'physical-lineage');
+    const previous = scope.beginRuntime(undefined, 'fixture-lineage');
     scope.assign(previous.bindingId, s.runtime);
     previous.bindingId = 'binding-old';
     previous.identity = { backend: 'tmux', physicalId: '111:start1', proof: 'process_start' };
@@ -502,6 +508,7 @@ describe('contract gateway and real worker boundaries', () => {
       cliSpawnGeneration: 1,
       runtimeIdentityForContract: () => ({ backend: 'tmux', physicalId: '222:start2', proof: 'process_start' }),
       confirmedRuntimeIdentityChanged, reusableRuntimeIdentity,
+      takeRuntimeRefinementProof: () => 'attested_spawn_descendant',
       pendingRuntimeReservations: new Map(),
       closeRequested: false,
       stopBridgeWatcher: vi.fn(), stopScreenshotLoop: vi.fn(), killCli: vi.fn(),
@@ -557,6 +564,8 @@ describe('contract gateway and real worker boundaries', () => {
     const previous = scope.beginRuntime('restart-live', 'physical-lineage');
     scope.assign(previous.bindingId, s.runtime);
     previous.identity = { backend: 'tmux', physicalId: '111:start1', proof: 'process_start' };
+    previous.identityRefinementAuthorization = { from: previous.identity,
+      to: { backend: 'tmux', physicalId: '222:start2', nativeSessionId: 'native-real', proof: 'process_start' } };
     const observedRuntimeBindingHandshakes = new Map(); const sent: any[] = [];
     const env: any = {
       workerSessionEventScope: scope, observedRuntimeBindingHandshakes,
@@ -564,6 +573,7 @@ describe('contract gateway and real worker boundaries', () => {
       closeRequested: false,
       runtimeIdentityForContract: () => ({ backend: 'tmux', physicalId: '222:start2', proof: 'process_start' }),
       confirmedRuntimeIdentityChanged, reusableRuntimeIdentity,
+      takeRuntimeRefinementProof: () => 'attested_spawn_descendant',
       send: (message: any) => sent.push(message),
     };
     const observe = loadWorkerFunction<(nativeSessionId: string) => void>('observeContractNativeSession', env);
@@ -583,8 +593,10 @@ describe('contract gateway and real worker boundaries', () => {
     const successor = scope.currentBinding()!;
     expect(successor).not.toBe(stale);
     expect(sent.slice(-2)).toEqual([
-      { type: 'runtime_binding_started', bindingId: successor.bindingId },
-      { type: 'runtime_binding', bindingId: successor.bindingId, identity: successor.identity },
+      { type: 'runtime_binding_started', bindingId: successor.bindingId, physicalLineageId: successor.physicalId,
+        refinesBindingId: previous.bindingId, refinementProof: 'attested_spawn_descendant' },
+      { type: 'runtime_binding', bindingId: successor.bindingId, identity: successor.identity, physicalLineageId: successor.physicalId,
+        refinesBindingId: previous.bindingId, refinementProof: 'attested_spawn_descendant' },
     ]);
     expect(env.killCli).toBeUndefined();
   });
@@ -638,11 +650,11 @@ describe('contract gateway and real worker boundaries', () => {
     const previous = scope.beginRuntime(undefined, 'physical-lineage');
     scope.assign(previous.bindingId, s.runtime);
     previous.identity = { backend: 'tmux', physicalId: '111:start1', proof: 'process_start' };
-    const stale = scope.beginRuntime('settled-restart', 'physical-lineage');
+    const stale = scope.beginRuntime('settled-restart', 'physical-lineage', 'attested_spawn_descendant');
     stale.identity = { backend: 'tmux', physicalId: '222:start2', nativeSessionId: 'native-real', proof: 'process_start' };
     const observedRuntimeBindingHandshakes = new Map([['physical-lineage', {
       scope, physicalId: 'physical-lineage', backend: undefined, spawnGeneration: 1,
-      identity: stale.identity, binding: stale, operationId: 'settled-restart',
+      identity: stale.identity, binding: stale, operationId: 'settled-restart', refinementProof: 'attested_spawn_descendant',
     }]]);
     const sent: any[] = []; const killCli = vi.fn();
     const ready = vi.fn();
@@ -661,8 +673,10 @@ describe('contract gateway and real worker boundaries', () => {
     expect(successor.operationId).toBeUndefined();
     expect(successor.identity).toEqual(stale.identity);
     expect(sent.slice(-2)).toEqual([
-      { type: 'runtime_binding_started', bindingId: successor.bindingId },
-      { type: 'runtime_binding', bindingId: successor.bindingId, identity: successor.identity },
+      { type: 'runtime_binding_started', bindingId: successor.bindingId, physicalLineageId: successor.physicalId,
+        refinesBindingId: previous.bindingId, refinementProof: 'attested_spawn_descendant' },
+      { type: 'runtime_binding', bindingId: successor.bindingId, identity: successor.identity, physicalLineageId: successor.physicalId,
+        refinesBindingId: previous.bindingId, refinementProof: 'attested_spawn_descendant' },
     ]);
     expect(killCli).not.toHaveBeenCalled();
     await receive({ type: 'runtime_contract_assigned', bindingId: successor.bindingId,
@@ -847,6 +861,7 @@ describe('contract gateway and real worker boundaries', () => {
     const publish = loadWorkerFunction<(binding: any) => Promise<void>>('publishRuntimeContract', {
       workerSessionEventScope: scope, activeRestartAttemptId: undefined,
       runtimeIdentityForContract: () => identity, confirmedRuntimeIdentityChanged,
+      takeRuntimeRefinementProof: () => undefined,
       send: (message: any) => sent.push(message),
     });
 
@@ -854,10 +869,109 @@ describe('contract gateway and real worker boundaries', () => {
     const replacement = scope.currentBinding()!;
     expect(replacement).not.toBe(launcher);
     expect(replacement.operationId).toBeUndefined();
+    expect(replacement.physicalId).not.toBe(launcher.physicalId);
     expect(sent).toEqual([
-      { type: 'runtime_binding_started', bindingId: replacement.bindingId },
-      { type: 'runtime_binding', bindingId: replacement.bindingId, identity },
+      { type: 'runtime_binding_started', bindingId: replacement.bindingId, physicalLineageId: replacement.physicalId },
+      { type: 'runtime_binding', bindingId: replacement.bindingId, identity, physicalLineageId: replacement.physicalId },
     ]);
+  });
+  it('grants execution transfer only to stable identity or one consumed descendant attestation', () => {
+    const targetMatches = loadWorkerFunction<(authorized: any, observed: any) => boolean>(
+      'authorizedRefinementTargetMatches', {});
+    const take = loadWorkerFunction<(binding: any, previous: any, next: any) => string | undefined>(
+      'takeRuntimeRefinementProof', { reusableRuntimeIdentity, authorizedRefinementTargetMatches: targetMatches });
+    const previous = { backend: 'tmux', physicalId: '111:start1', proof: 'process_start' as const };
+    const enriched = { ...previous, nativeSessionId: 'native-one' };
+    expect(take({}, previous, enriched)).toBeUndefined();
+    const replacement = { backend: 'tmux', physicalId: '222:start2', proof: 'process_start' as const };
+    expect(take({}, previous, replacement)).toBeUndefined();
+    const binding = { identityRefinementAuthorization: { from: previous, to: replacement } };
+    expect(take(binding, previous, { ...replacement, nativeSessionId: 'native-two' }))
+      .toBe('attested_spawn_descendant');
+    expect(binding.identityRefinementAuthorization).toBeUndefined();
+    expect(take(binding, previous, replacement)).toBeUndefined();
+  });
+  it('mints descendant authorization only while the bounded resolver updates the same binding', () => {
+    const previous = { backend: 'tmux', physicalId: '111:start1', proof: 'process_start' as const };
+    const replacement = { backend: 'tmux', physicalId: '222:start2', proof: 'process_start' as const };
+    const binding: any = { identity: previous };
+    let current: any = binding; let observed: any = previous;
+    const scope = { currentBinding: () => current };
+    const refine = loadWorkerFunction<(apply: () => void) => void>('applyAttestedRuntimeIdentityRefinement', {
+      workerSessionEventScope: scope, runtimeIdentityForContract: () => observed,
+      confirmedRuntimeIdentityChanged,
+    });
+
+    refine(() => { observed = replacement; });
+    expect(binding.identityRefinementAuthorization).toEqual({ from: previous, to: replacement });
+
+    binding.identityRefinementAuthorization = undefined; observed = previous;
+    refine(() => { current = { identity: replacement }; observed = replacement; });
+    expect(binding.identityRefinementAuthorization).toBeUndefined();
+  });
+  it('atomically carries readiness and a live execution across a proven semantic runtime refinement', async () => {
+    const s = fixture();
+    expect(s.controller.ingest({ type: 'prompt_ready', sessionContract: s.context(1) }, s.worker).kind).toBe('current');
+    const execution = s.controller.admitInput('opening-turn', 1);
+    s.store.bindQueuedExecution(s.ref, execution, s.runtime);
+    s.store.apply(s.ref, { type: 'execution_phase', execution, runtime: s.runtime, phase: 'running' });
+    const worker = { send: vi.fn() }; s.ds.worker = worker as any;
+    const legacy = vi.fn();
+    const hostScope: any = { sessionController: s.controller, contractWorker: s.worker, ds: s.ds, worker,
+      sameWorker, sameRuntime, logger: { warn: vi.fn(), debug: vi.fn() }, t: 'test', handleLegacyWorkerMessage: legacy };
+    const host = loadWorkerPoolClosure<(message: any) => Promise<void>>('handleWorkerMessage', hostScope);
+    hostScope.handleWorkerMessage = host;
+    const bindingId = 'binding-semantic-successor';
+    const registration = (sequence: number) => ({ ...s.context(sequence, {}), bindingId });
+
+    await host({ type: 'runtime_binding_started', bindingId, refinesBindingId: 'binding-old', physicalLineageId: 'fixture-lineage',
+      refinementProof: 'attested_spawn_descendant',
+      sessionContract: registration(2) });
+    await host({ type: 'runtime_binding', bindingId, refinesBindingId: 'binding-old', physicalLineageId: 'fixture-lineage',
+      refinementProof: 'attested_spawn_descendant',
+      identity: { backend: 'tmux', physicalId: '222:start2', nativeSessionId: 'native2', proof: 'process_start' },
+      sessionContract: registration(3) });
+
+    const successor = s.store.binding(s.ref, bindingId)!;
+    expect(successor.ref).not.toEqual(s.runtime);
+    expect(successor).toMatchObject({ phase: 'ready', promptReady: true, promptReadySequence: 1 });
+    expect(s.store.runtime(s.ref, s.runtime.runtimeId)).toMatchObject({ phase: 'retiring', promptReady: false });
+    expect(s.store.execution(s.ref, execution.executionId)).toMatchObject({ phase: 'running', runtime: successor.ref });
+    expect(s.store.read(s.ref)).toMatchObject({ activeRuntime: successor.ref, readinessSequence: 1 });
+    expect(s.store.snapshot(s.ref).tables.runtime_bindings).toContainEqual(expect.objectContaining({
+      binding_id: bindingId, lineage_id: 'fixture-lineage', predecessor_binding_id: 'binding-old',
+      refinement_proof: 'attested_spawn_descendant',
+    }));
+    const refinedEvent = s.store.snapshot(s.ref).tables.events
+      .filter(row => row.type === 'runtime_bound')
+      .map(row => JSON.parse(String(row.value)))
+      .find(event => event.refinedFrom);
+    expect(refinedEvent).toMatchObject({ refinedFrom: s.runtime, runtime: { ref: successor.ref } });
+
+    const screen = { type: 'screen_update', status: 'working', content: 'TRAE is running', turnId: execution.turnId,
+      dispatchAttempt: execution.dispatchAttempt,
+      sessionContract: { ...s.context(4, { runtime: successor.ref, execution }), bindingId } };
+    await host(screen);
+    expect(legacy).toHaveBeenCalledWith(screen);
+    expect(s.store.runtime(s.ref)?.promptReady).toBe(false);
+  });
+  it('does not transfer a live execution to an unproven process replacement', () => {
+    const s = fixture();
+    expect(s.controller.ingest({ type: 'prompt_ready', sessionContract: s.context(1) }, s.worker).kind).toBe('current');
+    const execution = s.controller.admitInput('old-turn');
+    s.store.bindQueuedExecution(s.ref, execution, s.runtime);
+    s.store.apply(s.ref, { type: 'execution_phase', execution, runtime: s.runtime, phase: 'running' });
+    expect(() => s.controller.reserveBinding('forged-refinement', s.worker, 'binding-old', 'different-lineage', 'attested_spawn_descendant'))
+      .toThrow('runtime_refinement_predecessor_unproven');
+    expect(s.store.binding(s.ref, 'forged-refinement')).toBeUndefined();
+    const replacement = s.controller.reserveBinding('actual-process-replacement', s.worker);
+    s.controller.bindRuntime('actual-process-replacement', s.worker,
+      { backend: 'tmux', physicalId: '333:start3', nativeSessionId: 'native3', proof: 'process_start' });
+    expect(s.store.runtime(s.ref, replacement.runtimeId)).toMatchObject({ phase: 'starting', promptReady: false });
+    expect(s.store.execution(s.ref, execution.executionId)?.runtime).toEqual(s.runtime);
+    expect(s.controller.ingest({ type: 'screen_update', status: 'working', turnId: execution.turnId,
+      sessionContract: { ...s.context(2, { runtime: replacement, execution }), bindingId: 'actual-process-replacement' } }, s.worker))
+      .toMatchObject({ kind: 'reject', reason: 'execution_scope_unproven' });
   });
   it('holds a ready edge through refusal and delivers it once to an assigned same-lineage successor', async () => {
     vi.useFakeTimers();
