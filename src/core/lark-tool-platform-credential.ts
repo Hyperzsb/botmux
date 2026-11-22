@@ -16,13 +16,15 @@
  *                                         one (keeps the owner's wider scopes);
  *                                         otherwise the platform grant
  *   credentialSource = platform         → the platform grant only
- * `triggerUserAuth` must cover lark-cli for the platform to be consulted at all.
+ * Either `triggerUserAuth` or a valid fixed `toolIdentity` must cover lark-cli
+ * for the platform to be consulted at all.
  *
  * Who the credential belongs to is decided by the daemon (the turn's sender or
  * a verified delegation target), never by the CLI.
  */
 import type { BotConfig } from '../bot-registry.js';
 import { credentialSourceOf, triggerUserAuthApplies } from '../services/trigger-user-auth.js';
+import { isInvalidToolIdentity } from '../services/tool-identity-config.js';
 import {
   platformAuthorizeUrl,
   platformRefusalReason,
@@ -34,9 +36,17 @@ import {
 export type BoundLarkPlatformPolicy = 'off' | 'prefer-bot-app' | 'platform-only';
 
 /** How the platform participates in a bound session's `--as user` for this bot. */
-export function boundLarkPlatformPolicy(bot: Pick<BotConfig, 'triggerUserAuth'>): BoundLarkPlatformPolicy {
-  if (!triggerUserAuthApplies(bot.triggerUserAuth, 'lark-cli')) return 'off';
-  const source = credentialSourceOf(bot.triggerUserAuth);
+export function boundLarkPlatformPolicy(
+  bot: Pick<BotConfig, 'triggerUserAuth' | 'toolIdentity' | 'toolIdentityInvalid'>,
+): BoundLarkPlatformPolicy {
+  const source = triggerUserAuthApplies(bot.triggerUserAuth, 'lark-cli')
+    ? credentialSourceOf(bot.triggerUserAuth)
+    : bot.toolIdentityInvalid === undefined
+      && bot.toolIdentity && !isInvalidToolIdentity(bot.toolIdentity)
+      && bot.toolIdentity.tools.includes('lark-cli')
+      ? bot.toolIdentity.credentialSource
+      : undefined;
+  if (!source) return 'off';
   if (source === 'local') return 'off';
   return source === 'platform' ? 'platform-only' : 'prefer-bot-app';
 }

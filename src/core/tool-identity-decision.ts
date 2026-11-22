@@ -55,20 +55,23 @@ export interface ToolIdentityReplyTargetFields {
 }
 
 /**
- * Build the record for an automatic-turn freeze. `source === 'none'` with no
- * user is a HOST decision (native execution chosen by policy); a non-none
- * source without a usable user is a DENIED decision (fail closed, never
- * native). This mapping is the single place that makes a persisted
+ * Build the record for an automatic-turn freeze. An explicit failure is always
+ * DENIED. Otherwise `source === 'none'` with no user is a HOST decision (native
+ * execution chosen by policy), while a non-none source without a usable user
+ * is DENIED. This mapping is the single place that makes a persisted
  * `automationUser: null` distinguishable from "ambiguous old record".
  */
 export function buildAutomaticTurnDecision(input: {
   user?: ToolExecutionPrincipal | null;
   source?: TurnExecutionUserSource;
   tools?: readonly TriggerUserAuthTool[];
+  failure?: ToolIdentityFailure;
   frozenAt?: Date;
   policy?: NormalizedToolIdentityPolicy;
 }): ToolIdentityDecisionRecord {
-  const mode: ToolIdentityDecisionMode = input.user
+  const mode: ToolIdentityDecisionMode = input.failure
+    ? 'denied'
+    : input.user
     ? 'managed_user'
     : (input.source ?? 'none') === 'none' ? 'host' : 'denied';
   return {
@@ -76,9 +79,9 @@ export function buildAutomaticTurnDecision(input: {
     authority: 'automatic',
     mode,
     ...(input.source !== undefined ? { source: input.source } : {}),
-    ...(input.user ? { user: input.user } : {}),
-    ...(input.tools?.length ? { tools: [...input.tools] } : {}),
-    ...(mode === 'denied' ? { failure: 'invalid_identity' as const } : {}),
+    ...(mode !== 'denied' && input.user ? { user: input.user } : {}),
+    ...(input.tools !== undefined ? { tools: [...input.tools] } : {}),
+    ...(mode === 'denied' ? { failure: input.failure ?? 'invalid_identity' as const } : {}),
     frozenAt: (input.frozenAt ?? new Date()).toISOString(),
     ...(input.policy ? { baseline: structuredClone({
       perTurnTools: input.policy.perTurnTools,
@@ -116,7 +119,7 @@ export function toolIdentityDecisionFromReplyTarget(
     mode,
     ...(source !== undefined ? { source } : {}),
     ...(user ? { user } : {}),
-    ...(entry.automationIdentityTools?.length ? { tools: [...entry.automationIdentityTools] } : {}),
+    ...(entry.automationIdentityTools !== undefined ? { tools: [...entry.automationIdentityTools] } : {}),
     ...(mode === 'denied' ? { failure: 'invalid_identity' as const } : {}),
     frozenAt: entry.updatedAt ?? new Date(0).toISOString(),
   };

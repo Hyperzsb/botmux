@@ -145,11 +145,27 @@ export function automationIdentityTools(config: {
 }
 
 /** Tool scope for an explicit task/connector Run as. It follows the bot's
- *  ordinary per-turn policy; the bot-level default's `tools` belong only to
- *  that default and must not narrow an unrelated explicit selection. */
+ * ordinary per-turn policy. When that policy is off, a fixed tool assignment
+ * defines the already-managed scope; a bound lark-cli is included alongside
+ * it because the application binding is independently managed. */
 export function explicitAutomationIdentityTools(config: {
   automationIdentity?: AutomationIdentitySetting;
   triggerUserAuth?: TriggerUserAuthConfig | null;
+  toolIdentity?: {
+    tools?: readonly TriggerUserAuthTool[];
+    invalid?: string;
+  } | null;
+  larkToolBinding?: boolean;
 }): TriggerUserAuthTool[] {
-  return automationIdentityTools({ ...config, automationIdentity: undefined });
+  if (config.triggerUserAuth?.enabled && config.triggerUserAuth.tools.length) {
+    return [...config.triggerUserAuth.tools];
+  }
+  const fixed = config.toolIdentity;
+  if (fixed && typeof fixed.invalid !== 'string' && fixed.tools?.length) {
+    return [...new Set([
+      ...fixed.tools,
+      ...(config.larkToolBinding === true ? ['lark-cli' as const] : []),
+    ])];
+  }
+  return [...DEFAULT_AUTOMATION_IDENTITY_TOOLS];
 }

@@ -1,4 +1,5 @@
-import { parseToolIdentityConfig } from '../services/tool-identity-config.js';
+import { isInvalidToolIdentity, parseToolIdentityConfig } from '../services/tool-identity-config.js';
+import { isInvalidAutomationIdentity, parseAutomationIdentityConfig } from '../services/automation-identity-config.js';
 import { defaultSummaryRangePrefs, summaryRangeFromLegacyContentTriggers } from '../services/summary-range-store.js';
 import { selectionKeyForBot } from '../setup/cli-selection.js';
 import { normalizeReplyFooter } from '../services/reply-footer.js';
@@ -354,19 +355,30 @@ export function sparseOverridesFromRawBotConfig(rawEntry: any): {
   quotaFallbackBot: any;
   autoInviteOwnerOnGroupAdd: any;
   automationIdentity: any;
+  automationIdentityInvalid: string | null;
   toolIdentity: any;
+  toolIdentityInvalid: string | null;
   larkToolBinding: boolean | undefined;
   askOptionLayout: any;
   trustSameOwnerBots: boolean | undefined;
   grantDelegateBots: string[] | undefined;
 } {
+  const automationIdentity = parseAutomationIdentityConfig(
+    rawEntry?.automationIdentity,
+    rawEntry?.larkAppId,
+  ).value;
+  const toolIdentity = parseToolIdentityConfig(rawEntry?.toolIdentity, rawEntry?.larkAppId).value;
   return {
     quotaFallbackBot: rawEntry?.quotaFallbackBot,
     autoInviteOwnerOnGroupAdd: rawEntry?.autoInviteOwnerOnGroupAdd,
     // Offline rows keep showing the saved selection when the daemon is down.
-    automationIdentity: rawEntry?.automationIdentity && typeof rawEntry.automationIdentity === 'object'
-      ? rawEntry.automationIdentity : null,
-    toolIdentity: parseToolIdentityConfig(rawEntry?.toolIdentity, rawEntry?.larkAppId).value ?? null,
+    automationIdentity: automationIdentity && !isInvalidAutomationIdentity(automationIdentity)
+      ? automationIdentity : null,
+    automationIdentityInvalid: automationIdentity && isInvalidAutomationIdentity(automationIdentity)
+      ? automationIdentity.invalid : null,
+    toolIdentity: toolIdentity && !isInvalidToolIdentity(toolIdentity) ? toolIdentity : null,
+    toolIdentityInvalid: toolIdentity && isInvalidToolIdentity(toolIdentity)
+      ? toolIdentity.invalid : null,
     larkToolBinding: rawEntry?.larkToolBinding === true ? true : false,
     askOptionLayout: rawEntry?.askOptionLayout,
     // 默认开：显式 false 不从这里带回，离线行会把已关闭的同机信任显示成开启。

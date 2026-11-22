@@ -860,24 +860,29 @@ async function triggerSessionTurnAdmitted(
   rememberTriggerTurn(triggerId, req.source.type);
   let executionUser = internal?.executionUser;
   let trustedCaller = executionUser ? automationTrustedCaller(executionUser) : undefined;
-  let executionUserSource: import('../services/automation-identity.js').AutomationIdentitySource | undefined =
-    executionUser ? 'connector' : undefined;
+  let executionUserSource: import('../services/automation-identity.js').AutomationIdentitySource =
+    executionUser ? 'connector' : 'none';
   let executionUserTools: import('../services/trigger-user-auth.js').TriggerUserAuthTool[] | undefined;
   const prepareExecutionIdentity = async (target: DaemonSession): Promise<void> => {
-    if (!executionUser) return;
-    executionUserTools ??= explicitAutomationIdentityTools(getBot(target.larkAppId).config);
-    assertAutomationSession(executionUser, target, executionUserTools);
+    const botConfig = getBot(target.larkAppId).config;
+    const identityPolicy = normalizeToolIdentityPolicy(botConfig);
+    executionUserTools ??= explicitAutomationIdentityTools(botConfig);
+    const missingProvenance = !executionUser && executionUserSource === 'none'
+      && identityPolicy.perTurnTools.length > 0;
+    if (executionUser) assertAutomationSession(executionUser, target, executionUserTools);
     inheritTriggerReplyAnchor(target, triggerId);
     target.session.replyTargets ??= {};
     target.session.replyTargets[triggerId] = { ...target.session.replyTargets[triggerId],
-      updatedAt: new Date().toISOString(), senderOpenId: executionUser.openId, automationUser: executionUser,
+      updatedAt: new Date().toISOString(),
+      ...(executionUser ? { automationUser: executionUser } : {}),
       toolIdentityDecision: buildAutomaticTurnDecision({
-        user: executionUser,
+        user: executionUser ?? null,
         source: executionUserSource,
         tools: executionUserTools,
-        policy: normalizeToolIdentityPolicy(getBot(target.larkAppId).config),
+        ...(missingProvenance ? { failure: 'missing_provenance' as const } : {}),
+        policy: identityPolicy,
       }),
-      ...(executionUserSource ? { automationIdentitySource: executionUserSource } : {}),
+      automationIdentitySource: executionUserSource,
       ...(executionUserTools ? { automationIdentityTools: executionUserTools } : {}) };
     sessionStore.updateSession(target.session);
     await prepareExternalTurnIdentity(target, triggerId);
@@ -1360,10 +1365,10 @@ async function triggerSessionTurnAdmitted(
       );
       return { ok: false, errorCode: 'trigger_failed', error };
     }
+    executionUserSource = resolved.source;
+    executionUserTools = resolved.tools;
     if (resolved.user) {
       executionUser = resolved.user;
-      executionUserSource = resolved.source;
-      executionUserTools = resolved.tools;
       trustedCaller = automationTrustedCaller(executionUser);
       logger.info(
         `[trigger] execution identity source=${resolved.source} user=${executionUser.openId} `
@@ -1493,7 +1498,7 @@ async function triggerSessionTurnAdmitted(
     // credential preparation still cannot dispatch into the old occupant.
     const beforeIdentity = existingAdmission();
     if (beforeIdentity.rejection) return beforeIdentity.rejection;
-    if (executionUser) await prepareExecutionIdentity(target);
+    await prepareExecutionIdentity(target);
     const afterIdentity = existingAdmission();
     if (afterIdentity.rejection) return afterIdentity.rejection;
     const workerIsLive = afterIdentity.workerIsLive;
@@ -1981,7 +1986,6 @@ async function triggerSessionTurnAdmitted(
     const nowIso = new Date(now).toISOString();
     session.larkAppId = larkAppId;
     session.scope = scope;
-    if (executionUser) { session.ownerOpenId = executionUser.openId; session.ownerUnionId = executionUser.unionId; }
     if (shouldOpenOwnTopic && topicMessage === null) session.externalTriggerTopicless = true;
     if (requestedHeadlessId) {
       session.headless = {
@@ -2052,7 +2056,6 @@ async function triggerSessionTurnAdmitted(
     // retry payload if a write-ahead hook/fork throws before acceptance.
     if (trustedCaller) {
       newDs.pendingTrustedCaller = trustedCaller;
-      newDs.pendingSender = { openId: executionUser!.openId, name: executionUser!.name, type: 'user' };
       newDs.pendingTurnId = triggerId;
     }
     newDs.pendingPrompt = prompt;
@@ -2101,17 +2104,15 @@ async function triggerSessionTurnAdmitted(
   }
   const newDs = claim.ds;
   const session = newDs.session;
-  if (executionUser) {
-    try { await prepareExecutionIdentity(newDs); }
-    catch (error) {
-      await withActiveSessionKeyLock(deps.activeSessions, key, () => {
-        if (deps.activeSessions.get(key) === newDs) {
-          deps.activeSessions.delete(key);
-          sessionStore.closeSession(session.sessionId);
-        }
-      });
-      throw error;
-    }
+  try { await prepareExecutionIdentity(newDs); }
+  catch (error) {
+    await withActiveSessionKeyLock(deps.activeSessions, key, () => {
+      if (deps.activeSessions.get(key) === newDs) {
+        deps.activeSessions.delete(key);
+        sessionStore.closeSession(session.sessionId);
+      }
+    });
+    throw error;
   }
 
   if (useAutoWt) {

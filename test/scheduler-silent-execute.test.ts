@@ -253,6 +253,10 @@ function forkedPayload(): any {
 
 beforeEach(() => {
   BOT.config.topicUnavailablePolicy = 'legacy';
+  delete (BOT.config as any).triggerUserAuth;
+  delete (BOT.config as any).automationIdentity;
+  delete (BOT.config as any).toolIdentity;
+  delete (BOT.config as any).larkToolBinding;
   store.clear();
   sessionSeq = 0;
   forkWorkerMock.mockClear();
@@ -373,6 +377,33 @@ describe('executeScheduledTask — silent thread fire', () => {
       expect(forkWorkerMock).toHaveBeenCalledOnce();
     } finally {
       delete c.triggerUserAuth;
+    }
+  });
+
+  it.each([false, true])('preserves a fixed tool identity scope when lark binding is %s', async larkToolBinding => {
+    const c = BOT.config as any;
+    const fixedUser = { larkAppId: APP, openId: 'ou_fixed', unionId: 'on_fixed' };
+    c.triggerUserAuth = { enabled: false, tools: [], fallback: 'none' };
+    c.toolIdentity = { user: fixedUser, tools: ['bytedcli'], credentialSource: 'local' };
+    c.larkToolBinding = larkToolBinding;
+    const access = await import('../src/im/lark/event-dispatcher.js');
+    const gate = vi.spyOn(access, 'canOperate').mockReturnValue(true);
+    try {
+      const active = new Map<string, DaemonSession>();
+      await executeScheduledTask(
+        baseTask({ rootMessageId: ROOT, scope: 'thread', silent: true }),
+        active,
+        refreshCliVersion,
+      );
+      const turnId = forkedTurnId();
+      const ds = active.get(sessionKey(ROOT, APP))!;
+      expect(ds.session.replyTargets?.[turnId]).toMatchObject({
+        automationUser: fixedUser,
+        automationIdentitySource: 'automatic_default',
+        automationIdentityTools: ['bytedcli'],
+      });
+    } finally {
+      gate.mockRestore();
     }
   });
 

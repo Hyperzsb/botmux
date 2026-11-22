@@ -59,7 +59,7 @@ const zh = {
 
   'automation.runAs': '执行身份',
   'automation.defaultIdentity': '默认身份（保持原有行为）',
-  'automation.runAsHelp': '可选择曾向此机器人发送消息的用户。受管工具使用所选用户的授权，缺少授权时拒绝执行；不需要开启按触发人鉴权。',
+  'automation.runAsHelp': '可选择曾向此机器人发送消息的用户。受管工具使用所选用户的授权，缺少授权时拒绝执行；工具必须已由按触发人鉴权、固定执行用户或显式 lark-cli 应用绑定提供受管能力。',
   'automation.loading': '正在加载用户…',
   'automation.noUsers': '暂无使用记录；请先向此机器人发送消息。',
   'automation.loadError': '无法加载用户列表。',
@@ -2718,6 +2718,7 @@ const zh = {
   'botDefaults.larkToolBindingSaved': '已保存，下个会话生效',
   'botDefaults.sectionToolIdentity': '固定执行用户',
   'botDefaults.toolIdentityHelp': '选择一位真人作为本 Bot 的固定执行用户。某工具的按触发人鉴权关闭时，普通会话内该工具以这位用户的身份执行（凭证仍来自其本人授权，不复制、不借用机器账号）；自动轮次（定时任务 / Webhook / 入群自动开工）里，它的优先级排在任务自己的 Run as 与「主动开工」默认身份之后。按触发人鉴权开启的工具仍以当轮触发人执行。显式配置但不可用时该工具拒绝调用，不会回退宿主机登录。',
+  'botDefaults.toolIdentityInvalid': '保存的固定执行用户配置无法加载（{reason}）。受影响工具不会回退到宿主凭据；请重新选择、调整工具范围或清除配置。',
   'botDefaults.toolIdentitySaved': '已保存；新会话生效，运行中的会话 /restart 后生效',
   'botDefaults.sectionCodexAuth': 'Codex 登录凭证',
   'botDefaults.codexAuthSyncLabel': 'Codex 凭证策略',
@@ -4817,7 +4818,7 @@ const en: Record<keyof typeof zh, string> = {
 
   'automation.runAs': 'Run as',
   'automation.defaultIdentity': 'Default identity (existing behavior)',
-  'automation.runAsHelp': 'Choose someone who has messaged this bot. Managed tools use this user’s authorization and refuse calls without it; trigger-user authentication does not need to be enabled.',
+  'automation.runAsHelp': 'Choose someone who has messaged this bot. Managed tools use this user’s authorization and refuse calls without it; each tool must already be managed by per-turn authentication, a fixed execution user, or explicit lark-cli application binding.',
   'automation.loading': 'Loading users…',
   'automation.noUsers': 'No users yet. Send a message to this bot first.',
   'automation.loadError': 'Could not load users.',
@@ -7474,6 +7475,7 @@ const en: Record<keyof typeof zh, string> = {
   'botDefaults.larkToolBindingSaved': 'Saved; takes effect next session',
   'botDefaults.sectionToolIdentity': 'Fixed execution user',
   'botDefaults.toolIdentityHelp': 'Pick one verified human as this bot\'s fixed execution user. For tools whose per-turn sender policy is OFF, ordinary chats run that tool as this user (credentials stay that person\'s own — never copied, never the machine account). For automatic turns (schedules / webhooks / group-entry auto-start) it is the lowest-priority default, after the task\'s own Run as and the automatic-only default. Tools with per-turn sender policy ON still run as the current sender. A configured-but-unusable assignment refuses the tool instead of falling back to host login.',
+  'botDefaults.toolIdentityInvalid': 'The saved fixed execution user could not be loaded ({reason}). Affected tools will not fall back to host credentials; select the user again, adjust the tool scope, or clear it.',
   'botDefaults.toolIdentitySaved': 'Saved; applies to new sessions, /restart for live ones',
   'botDefaults.sectionCodexAuth': 'Codex login credentials',
   'botDefaults.codexAuthSyncLabel': 'Codex credential policy',

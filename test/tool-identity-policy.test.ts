@@ -57,6 +57,7 @@ const {
   parseToolIdentityConfig,
   senderLoginTools,
   senderToolCredentialSource,
+  wrapperIdentityTools,
 } = await import('../src/services/tool-identity-config.js');
 const { selectTurnExecutionUser, selectToolCredential } = await import('../src/core/tool-identity-policy.js');
 const { buildAutomaticTurnDecision, toolIdentityDecisionFromReplyTarget } = await import('../src/core/tool-identity-decision.js');
@@ -73,6 +74,11 @@ function policy(overrides: Partial<ReturnType<typeof normalizeToolIdentityPolicy
 }
 
 describe('normalizeToolIdentityPolicy', () => {
+  it('installs every managed wrapper for a configured-but-invalid fixed identity', () => {
+    expect(wrapperIdentityTools({ toolIdentityInvalid: 'foreign_app' }))
+      .toEqual(['lark-cli', 'bytedcli', 'larkdev']);
+  });
+
   it('per-turn off leaves the per-tool baseline empty for every tool', () => {
     expect(policy({ triggerUserAuth: parseTriggerUserAuthConfig({ enabled: false, tools: ['lark-cli'] }) ?? undefined }).perTurnTools).toEqual([]);
     expect(policy().perTurnTools).toEqual([]);
@@ -249,6 +255,51 @@ describe('selectToolCredential (per-tool frozen decision)', () => {
     expect(selectToolCredential({ larkAppId: APP, tool: 'bytedcli', authority: 'human', policy: p, senderOpenId: 'ou_x', bindingInstalled: true }).mode).toBe('host');
   });
 
+  it('checks frozen failures and scope before an installed binding attaches a user', () => {
+    const p = policy({ triggerUserAuth: parseTriggerUserAuthConfig({ enabled: true, tools: ['lark-cli'] }) ?? undefined });
+    expect(selectToolCredential({
+      larkAppId: APP, tool: 'lark-cli', authority: 'automatic', policy: p,
+      bindingInstalled: true,
+      turn: { user: ALICE, source: 'task', tools: ['lark-cli'], failure: 'invalid_identity' },
+    })).toEqual({ mode: 'denied', reason: 'invalid_identity', source: 'task' });
+
+    expect(selectToolCredential({
+      larkAppId: APP, tool: 'lark-cli', authority: 'automatic', policy: p,
+      bindingInstalled: true,
+      turn: { user: ALICE, source: 'task', tools: ['bytedcli'] },
+    })).toEqual({ mode: 'bound_app', appId: APP });
+  });
+
+  it('an installed binding uses the valid fixed lark user and denies an invalid fixed assignment', () => {
+    const fixed = policy({
+      larkToolBinding: true,
+      toolIdentity: { user: ALICE, tools: ['lark-cli'], credentialSource: 'platform' },
+    });
+    expect(selectToolCredential({
+      larkAppId: APP, tool: 'lark-cli', authority: 'human', policy: fixed, bindingInstalled: true,
+    })).toEqual({ mode: 'bound_app', appId: APP, user: ALICE });
+
+    const invalid = policy({ larkToolBinding: true, toolIdentity: { invalid: 'cross-app user' } });
+    expect(selectToolCredential({
+      larkAppId: APP, tool: 'lark-cli', authority: 'human', policy: invalid, bindingInstalled: true,
+    })).toEqual({ mode: 'denied', reason: 'config_invalid', source: 'automatic_default' });
+
+    // An invalid fixed assignment must not override a tool governed by per-turn sender auth.
+    const invalidWithPerTurn = policy({
+      larkToolBinding: true,
+      triggerUserAuth: parseTriggerUserAuthConfig({ enabled: true, tools: ['lark-cli', 'bytedcli'] }) ?? undefined,
+      toolIdentity: { invalid: 'cross-app user' },
+    });
+    expect(selectToolCredential({
+      larkAppId: APP, tool: 'lark-cli', authority: 'human', policy: invalidWithPerTurn,
+      senderOpenId: 'ou_sender', bindingInstalled: true,
+    })).toEqual({ mode: 'bound_app', appId: APP });
+    expect(selectToolCredential({
+      larkAppId: APP, tool: 'bytedcli', authority: 'human', policy: invalidWithPerTurn,
+      senderOpenId: 'ou_sender',
+    })).toMatchObject({ mode: 'managed_user', source: 'sender', user: { openId: 'ou_sender' } });
+  });
+
   it('binding UNSET never becomes bound_app without an installed transport', () => {
     const d = selectToolCredential({ larkAppId: APP, tool: 'lark-cli', authority: 'human', policy: policy() });
     expect(d.mode).toBe('host');
@@ -306,6 +357,11 @@ describe('tool identity decision record (versioned freeze, plan §5.2/§8)', () 
     expect(buildAutomaticTurnDecision({ source: 'bot_default', tools: ['lark-cli'] })).toMatchObject({
       mode: 'denied', failure: 'invalid_identity',
     });
+    expect(buildAutomaticTurnDecision({
+      source: 'none', tools: ['lark-cli'], failure: 'missing_provenance',
+    })).toMatchObject({
+      mode: 'denied', source: 'none', failure: 'missing_provenance',
+    });
     // the record never carries credential material — only principal references
     const record = JSON.stringify(buildAutomaticTurnDecision({ user: ALICE, source: 'task' }));
     expect(record).not.toMatch(/token|secret|jwt|credential/i);
@@ -331,6 +387,26 @@ describe('tool identity decision record (versioned freeze, plan §5.2/§8)', () 
     // an ordinary human turn's reply target carries no decision
     expect(toolIdentityDecisionFromReplyTarget({ senderOpenId: 'ou_x' } as any)).toBeUndefined();
     expect(toolIdentityDecisionFromReplyTarget(undefined)).toBeUndefined();
+  });
+
+  it('preserves an explicit empty tool scope while omitted tools stay legacy-unscoped', () => {
+    const empty = buildAutomaticTurnDecision({ user: ALICE, source: 'task', tools: [] });
+    expect(empty.tools).toEqual([]);
+    expect(toolIdentityDecisionFromReplyTarget({ toolIdentityDecision: JSON.parse(JSON.stringify(empty)) }))
+      .toMatchObject({ tools: [] });
+    expect(toolIdentityDecisionFromReplyTarget({
+      automationUser: ALICE, automationIdentitySource: 'task', automationIdentityTools: [],
+    })).toMatchObject({ tools: [] });
+
+    const p = policy();
+    expect(selectToolCredential({
+      larkAppId: APP, tool: 'bytedcli', authority: 'automatic', policy: p,
+      turn: { user: ALICE, source: 'task', tools: [] },
+    })).toEqual({ mode: 'host', source: 'native_default' });
+    expect(selectToolCredential({
+      larkAppId: APP, tool: 'bytedcli', authority: 'automatic', policy: p,
+      turn: { user: ALICE, source: 'task' },
+    })).toMatchObject({ mode: 'managed_user', user: ALICE });
   });
 });
 
@@ -505,6 +581,19 @@ describe('fixed user persistence and independent tool policy', () => {
     expect(selectToolCredential({ larkAppId: APP, tool: 'bytedcli', authority: 'automatic', policy: p,
       turn: { user: ALICE, source: 'task', tools: ['lark-cli'] },
     })).toEqual({ mode: 'managed_user', source: 'automatic_default', user: BOB, credentialSource: 'local' });
+  });
+
+  it('uses the fixed tool scope for explicit Run as without splitting principals', () => {
+    const p = policy({
+      toolIdentity: { user: BOB, tools: ['bytedcli'], credentialSource: 'local' },
+    });
+    const selected = selectTurnExecutionUser({
+      larkAppId: APP, policy: p, explicit: ALICE, explicitSource: 'task', canUse: () => true,
+    });
+    expect(selected).toMatchObject({ user: ALICE, source: 'task', tools: ['bytedcli'] });
+    expect(selectToolCredential({
+      larkAppId: APP, tool: 'bytedcli', authority: 'automatic', policy: p, turn: selected,
+    })).toEqual({ mode: 'managed_user', source: 'task', user: ALICE, credentialSource: 'auto' });
   });
 
   it('lets only the fixed user manage fixed-tool credentials when sender auth is off', () => {

@@ -9,6 +9,7 @@ import { computeInputHash } from '../src/utils/canonical-input-hash.js';
 import { canonicalScheduleInput } from '../src/services/schedule-store.js';
 import type { ScheduledTask } from '../src/types.js';
 import * as sqliteCompat from '../src/services/sqlite-compat.js';
+import { backgroundAuthorityKey, backgroundCredentialPolicyKey } from '../src/core/background-execution-policy.js';
 
 const APP = 'cli_target';
 function task(id = 'a1b2c3d4', patch: Partial<ScheduledTask> = {}): ScheduledTask {
@@ -76,6 +77,30 @@ afterEach(() => {
   __setScheduleAuthorityBeforeCommitTestHook(undefined);
   store.close();
   rmSync(dataDir, { recursive: true, force: true });
+});
+
+describe('background execution authorization keys', () => {
+  it('changes when the task execution user changes', () => {
+    const original = task('run-as-key');
+    const changed = {
+      ...original,
+      runAsUser: { larkAppId: APP, openId: 'ou_runner', unionId: 'on_runner' },
+    };
+    expect(backgroundAuthorityKey(changed)).not.toBe(backgroundAuthorityKey(original));
+  });
+
+  it.each(['automationIdentity', 'toolIdentity'] as const)(
+    'changes when the bot %s policy changes',
+    field => {
+      const base = { larkAppId: APP, larkAppSecret: 'secret', cliId: 'traex' } as any;
+      const selected = {
+        user: { larkAppId: APP, openId: 'ou_runner', unionId: 'on_runner' },
+        tools: ['bytedcli'], credentialSource: 'local',
+      };
+      expect(backgroundCredentialPolicyKey({ ...base, [field]: selected }))
+        .not.toBe(backgroundCredentialPolicyKey(base));
+    },
+  );
 });
 
 describe('host-only schedule authority store', () => {

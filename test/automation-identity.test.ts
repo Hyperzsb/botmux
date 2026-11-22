@@ -236,6 +236,23 @@ describe('automation execution identity', () => {
     expect(hostResult.failure).toBeUndefined();
   });
 
+  it('scopes an explicit selection to the fixed tool assignment when per-turn auth is off', () => {
+    const fixed = {
+      user: { larkAppId: 'app_a', openId: 'ou_fixed', unionId: 'on_fixed' },
+      tools: ['bytedcli'],
+      credentialSource: 'local',
+    } as any;
+    const canUse = () => true;
+    expect(resolveAutomationIdentity({
+      appId: 'app_a', chatId: 'oc', config: { toolIdentity: fixed },
+      explicit: user, explicitSource: 'task', canUse,
+    })).toMatchObject({ user, source: 'task', tools: ['bytedcli'] });
+    expect(resolveAutomationIdentity({
+      appId: 'app_a', chatId: 'oc', config: { toolIdentity: fixed, larkToolBinding: true },
+      explicit: user, explicitSource: 'task', canUse,
+    })).toMatchObject({ user, source: 'task', tools: ['bytedcli', 'lark-cli'] });
+  });
+
   it('fails closed on an invalid or revoked configured identity instead of falling through', () => {
     const creator = { larkAppId: 'app_a', openId: 'ou_creator', unionId: 'on_creator' };
     const config = { larkToolBinding: true };

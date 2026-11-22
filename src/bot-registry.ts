@@ -1806,7 +1806,7 @@ export interface BotConfig {
   toolIdentityInvalid?: string;
   /**
    * lark-cli 应用绑定开关（显式 opt-in）。
-   * true：会话内 lark-cli 默认以当前 Bot 应用凭证以 bot 身份调用，支持 --as user 与 --profile 透传；
+   * true：会话内 lark-cli 默认以当前 Bot 应用凭证以 bot 身份调用；`--as user` 仍按当轮冻结身份解析，受管用户模式拒绝 profile/参数覆盖；
    * 未配置或 false：不安装托管包装器，完全沿用宿主机环境及按触发人鉴权规则。需 /restart 重启或新建会话生效。
    */
   larkToolBinding?: boolean;

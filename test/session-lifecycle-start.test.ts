@@ -9429,12 +9429,14 @@ describe('ordinary-turn recovery admission (scheduled turns, type-ahead)', () =>
     vi.useFakeTimers();
     vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code' }));
     const sessionReply = vi.fn(async () => 'om_card');
+    const prepareRawInputTurn = vi.fn(async () => undefined);
     initWorkerPool({
       sessionReply,
       getSessionWorkingDir: () => REPO,
       getActiveCount: () => 1,
       closeSession: vi.fn(),
       loadScheduledTaskForIdentity,
+      prepareRawInputTurn,
     });
     const ds = makeDs();
     forkWorker(ds, 'warm up', 'om_original');
@@ -9455,7 +9457,7 @@ describe('ordinary-turn recovery admission (scheduled turns, type-ahead)', () =>
       return true;
     });
     sessionReply.mockClear();
-    return { ds, worker, sessionReply };
+    return { ds, worker, sessionReply, prepareRawInputTurn };
   }
 
   function ackInput(worker: any, turnId: string) {
@@ -9565,6 +9567,80 @@ describe('ordinary-turn recovery admission (scheduled turns, type-ahead)', () =>
     await Promise.resolve();
     expect(ds.session.ordinaryTurnRecovery?.status).toBe('completed');
     expect(sessionReply).not.toHaveBeenCalled();
+  });
+
+  it('preserves a non-scheduled automatic turn run-as snapshot and caller on its recovery continuation', async () => {
+    const { ds, worker, prepareRawInputTurn } = await bootClaudeSession();
+    const original = 'om_join_automatic';
+    const automationUser = {
+      larkAppId: ds.larkAppId, openId: 'ou_auto_runner', unionId: 'on_auto_runner',
+    };
+    ds.session.replyTargets = {
+      [original]: {
+        automationUser,
+        automationIdentitySource: 'bot_default',
+        automationIdentityTools: ['bytedcli'],
+        toolIdentityDecision: {
+          v: 1, authority: 'automatic', mode: 'managed_user', source: 'bot_default',
+          user: automationUser, tools: ['bytedcli'], baseline: { perTurnTools: ['bytedcli'] },
+        },
+      },
+    } as any;
+    expect(sendWorkerInput(ds, 'automatic work', original)).toBe(true);
+    ackInput(worker, original);
+
+    worker.emit('message', {
+      type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: original,
+      status: 'failed', errorCode: 'provider_server_error', retryable: true,
+    });
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    const continuation = sentMessages(worker).find(message => message.turnId !== original)!;
+    expect(continuation.turnId).toMatch(/^bmx-recovery-/);
+    expect(continuation.trustedCaller).toMatchObject({
+      requestLarkAppId: ds.larkAppId,
+      requestUserOpenId: automationUser.openId,
+      requestUserUnionId: automationUser.unionId,
+      source: 'automation',
+    });
+    expect(ds.session.replyTargets?.[continuation.turnId]).toMatchObject({
+      automationUser,
+      automationIdentitySource: 'bot_default',
+      automationIdentityTools: ['bytedcli'],
+      toolIdentityDecision: expect.objectContaining({ mode: 'managed_user', user: automationUser }),
+    });
+    expect(prepareRawInputTurn).toHaveBeenCalledWith(ds, continuation.turnId);
+  });
+
+  it('preserves a host-mode scheduled decision even without an automation user', async () => {
+    const { ds, worker, prepareRawInputTurn } = await bootClaudeSession();
+    const decision = {
+      v: 1, authority: 'automatic', mode: 'host', source: 'none',
+      tools: [], baseline: { perTurnTools: [] },
+    } as const;
+    ds.session.replyTargets = {
+      [SCHEDULED_TURN]: {
+        toolIdentityDecision: decision,
+        automationIdentitySource: 'none',
+        automationIdentityTools: [],
+      },
+    } as any;
+    expect(sendWorkerInput(ds, 'host schedule', SCHEDULED_TURN)).toBe(true);
+    ackInput(worker, SCHEDULED_TURN);
+
+    worker.emit('message', {
+      type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: SCHEDULED_TURN,
+      status: 'failed', errorCode: 'provider_server_error', retryable: true,
+    });
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    const continuation = sentMessages(worker).find(message => message.turnId !== SCHEDULED_TURN)!;
+    expect(ds.session.replyTargets?.[continuation.turnId]).toMatchObject({
+      toolIdentityDecision: decision,
+      automationIdentitySource: 'none',
+      automationIdentityTools: [],
+    });
+    expect(prepareRawInputTurn).toHaveBeenCalledWith(ds, continuation.turnId);
   });
 
   it('bounds a scheduled turn to two continuations and then raises exactly one card', async () => {

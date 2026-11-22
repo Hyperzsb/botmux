@@ -32,6 +32,18 @@ afterAll(() => {
 });
 
 describe('schedule identity claim card callbacks', () => {
+  it('does not classify explicit/default/host scheduled turns as creator-claim gaps', async () => {
+    const { scheduledTurnNeedsCreatorProvenance } = await import('../src/core/schedule-identity-claim.js');
+    expect(scheduledTurnNeedsCreatorProvenance({
+      runAsUser: { openId: 'ou_explicit' }, perTurnTools: ['lark-cli'],
+    })).toBe(false);
+    expect(scheduledTurnNeedsCreatorProvenance({
+      frozenSource: 'bot_default', perTurnTools: ['lark-cli'],
+    })).toBe(false);
+    expect(scheduledTurnNeedsCreatorProvenance({ perTurnTools: [] })).toBe(false);
+    expect(scheduledTurnNeedsCreatorProvenance({ perTurnTools: ['lark-cli'] })).toBe(true);
+  });
+
   it.each([
     'schedule_identity_claim',
     'schedule_identity_reclaim',

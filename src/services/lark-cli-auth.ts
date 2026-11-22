@@ -513,6 +513,17 @@ function clearChallenge(openId: string): void {
   catch { /* already absent */ }
 }
 
+/** Remove only the device-code record this poll observed. An older poll must
+ * never delete a replacement login started while its lark-cli request was in
+ * flight. The read/remove pair is synchronous, so same-process replacement
+ * cannot interleave between the comparison and deletion. */
+function clearChallengeIfCurrent(openId: string, deviceCode: string): void {
+  try {
+    const raw = JSON.parse(readFileSync(challengePath(openId), 'utf8')) as { deviceCode?: unknown };
+    if (raw.deviceCode === deviceCode) clearChallenge(openId);
+  } catch { /* absent or malformed is already clear enough */ }
+}
+
 function deferAutomaticPoll(openId: string, deviceCode: string): void {
   const challenge = pendingLarkCliChallenge(openId);
   // Do not resurrect an expired request or change a replacement challenge.
@@ -606,7 +617,7 @@ export async function completeLarkCliLogin(
       if (!cliAuthEpochAllows(openId, home)) {
         return { state: 'failed', detail: 'login attempt was replaced or revoked' };
       }
-      clearChallenge(openId);
+      clearChallengeIfCurrent(openId, code);
       return { state: 'authorized' };
     }
     return { state: 'pending' };
@@ -626,7 +637,7 @@ export async function completeLarkCliLogin(
   const invalidCode = /device[_ ]code.*(?:invalid|unknown)|invalid.*device[_ ]code/i.test(raw);
   const expired = /expired[_ ]token|(?:device[_ ]code|authorization).*expired/i.test(raw);
   if (denied || invalidCode || expired) {
-    clearChallenge(openId);
+    clearChallengeIfCurrent(openId, code);
   } else {
     deferAutomaticPoll(openId, code);
   }
@@ -680,8 +691,10 @@ export async function materializeLarkCliHomeForSession(
   // a refreshed token is captured before the immutable-at-spawn bind is copied.
   // A transient verification failure does not discard an otherwise usable
   // stored login; the copied CLI still enforces its own token state.
+  const epochBefore = readCliAuthEpoch(openId);
   try { await runAsUser(openId, ['auth', 'status', '--json', '--verify']); }
   catch { /* best effort; copy the last known personal state */ }
+  if (readCliAuthEpoch(openId) !== epochBefore) return null;
 
   const root = join(sessionTempDir(sessionDataDir, sessionId), 'lark-cli-home');
   mkdirSync(root, { recursive: true, mode: 0o700 });
@@ -701,8 +714,16 @@ export async function materializeLarkCliHomeForSession(
         && path !== stateRoot && !path.startsWith(`${stateRoot}/`)
         && path !== challenge,
     });
+    if (readCliAuthEpoch(openId) !== epochBefore) {
+      rmSync(staging, { recursive: true, force: true });
+      return null;
+    }
     rmSync(target, { recursive: true, force: true });
     renameSync(staging, target);
+    if (readCliAuthEpoch(openId) !== epochBefore) {
+      rmSync(target, { recursive: true, force: true });
+      return null;
+    }
     return target;
   } catch (error) {
     rmSync(staging, { recursive: true, force: true });

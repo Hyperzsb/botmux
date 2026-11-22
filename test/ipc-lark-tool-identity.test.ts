@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { startIpcServer, setIpcAuthSecret, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
+import { automationExecutionToolScopeForExecution, startIpcServer, setIpcAuthSecret, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
 import * as workerPool from '../src/core/worker-pool.js';
 import * as bots from '../src/bot-registry.js';
 import * as identities from '../src/im/lark/identity-cache.js';
@@ -66,6 +66,21 @@ async function request(mode: string, accessKey = binding.accessKey) {
   });
 }
 describe('session application identity route', () => {
+  it('retains a closed detached session frozen tool scope when no live session exists', () => {
+    const detached = {
+      sessionId: 'tool-session', status: 'closed', replyTargets: {
+        'schedule:task:turn': {
+          automationIdentitySource: 'task', automationIdentityTools: ['bytedcli'],
+        },
+      },
+    } as any;
+    expect(automationExecutionToolScopeForExecution(
+      undefined,
+      detached,
+      'schedule:task:turn',
+    )).toEqual(['bytedcli']);
+  });
+
   it.skipIf(process.platform !== 'linux')('accepts a signed original peer through the trusted loopback proxy and binds it to the live turn', async () => {
     const cliRoot: ChildProcess = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
       stdio: 'ignore',
@@ -270,6 +285,29 @@ describe('session application identity route', () => {
     const user = await request('user');
     expect(await user.json()).toEqual({ ok: true, appId: 'cli_bound', mode: 'user', credentialType: 'user_access_token', credential: 'bound-user-token' });
     expect(tokens.resolveUserToken).toHaveBeenCalledWith('cli_bound', 'bound-secret', 'feishu', 'ou_sender');
+  });
+  it('uses the fixed lark-cli identity rather than the chat caller when per-turn auth is off', async () => {
+    const fixedUser = { larkAppId: 'cli_bound', openId: 'ou_fixed', unionId: 'on_fixed' };
+    vi.mocked(bots.getBot).mockReturnValue({
+      config: {
+        larkAppId: 'cli_bound', larkAppSecret: 'bound-secret', larkToolBinding: true,
+        toolIdentity: { user: fixedUser, tools: ['lark-cli'], credentialSource: 'local' },
+      },
+      resolvedAllowedUsers: [fixedUser.openId],
+      resolvedBlockedUsers: [],
+    } as any);
+    vi.mocked(identities.resolveVerifiedUserIdentity).mockImplementation(async (_app, openId) => ({
+      openId, unionId: openId === fixedUser.openId ? fixedUser.unionId : undefined, type: 'user',
+    } as any));
+    vi.mocked(tokens.resolveUserToken).mockImplementation(async (_app, _secret, _brand, openId) => `grant:${openId}`);
+
+    const response = await request('user');
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ credential: 'grant:ou_fixed' });
+    expect(tokens.resolveUserToken).toHaveBeenLastCalledWith(
+      'cli_bound', 'bound-secret', 'feishu', 'ou_fixed',
+    );
   });
   it('refuses managed Lark user identity when the frozen automation scope excludes lark-cli', async () => {
     session.session.replyTargets = {

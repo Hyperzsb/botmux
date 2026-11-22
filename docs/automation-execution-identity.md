@@ -13,7 +13,7 @@ open_id 只在签发它的应用内有效，因此选项与保存的身份均绑
 - `lark-cli`：显式托管应用绑定（`larkToolBinding: true`，现为显式 opt-in）本身就能执行 `--as user`，因此按触发人鉴权关闭时仍可使用 Run as。
 - `bytedcli` / `larkdev`：仍要求该工具已由 `triggerUserAuth` 托管（这两个工具没有应用级 bot 身份，只有按人凭据）。
 
-工具范围按以下优先级确定：Bot 的 `automationIdentity.tools`（若显式配置）→ `triggerUserAuth.tools`（若已开启）→ 仅 `lark-cli`。因此不会因为一个 Run as 选择静默打开全部个人工具。`fallback` 是兼容配置，当前凭据发布链路无论其值为 `bot-identity` 还是 `none`，在缺少用户凭据时均拒绝调用；选择执行用户不要求修改该全局配置。所选用户也必须满足目标 Bot 的操作权限；每次执行重新检查，撤销权限后后续运行拒绝执行。
+工具范围按以下优先级确定：Bot 的 `automationIdentity.tools`（只约束该自动默认）→ 显式 Run as 使用 `triggerUserAuth.tools`（若已开启），否则使用有效 `toolIdentity.tools`（显式 lark-cli 应用绑定会并入 `lark-cli`）→ 仅 `lark-cli`。因此不会因为一个 Run as 选择静默打开全部个人工具，也不会在按触发人鉴权关闭时把固定用户已配置的 bytedcli/larkdev 范围错误缩回 lark-cli。`fallback` 是兼容配置，当前凭据发布链路无论其值为 `bot-identity` 还是 `none`，在缺少用户凭据时均拒绝调用；选择执行用户不要求修改该全局配置。所选用户也必须满足目标 Bot 的操作权限；每次执行重新检查，撤销权限后后续运行拒绝执行。
 
 显式配置但不可用（用户被撤权、无法解析、工具无法在该 Bot/后端上执行）时 **fail closed**：本轮不使用任何执行用户，受管工具拒绝调用，不会回退到任务创建者、拉群操作人、会话 owner 或本机登录。定时任务会因此让该次 dispatch 失败并记录错误，而不是静默换人执行。
 
@@ -25,11 +25,11 @@ open_id 只在签发它的应用内有效，因此选项与保存的身份均绑
 
 Dashboard「Bot 默认设置 → 主动开工」提供同一套用户选择器，保存为 Bot 级 `automationIdentity: { user, tools, updatedAt }`。解析优先级：任务/Webhook connector 自己的 `runAsUser` → Bot 级默认 → 固定执行用户（`toolIdentity.defaultUser`）→ （按人鉴权开启时的）宿主验证过的来源（定时任务创建者）。各层只用于没有真人触发者的自动轮次。
 
-- **入群自动开工**（`autoStartOnGroupJoin`）：在该开关下方选择「自动开工执行身份」。没有自动默认或固定执行用户时，首轮明确使用宿主机现有登录，即使普通消息开启了按触发人鉴权。选择用户后按 Bot 自动默认 → 固定执行用户的优先级执行，不从邀请者或 session owner 推断凭据用户。`bot.added` 的操作人只有经过独立真人验证才登记为 sender / session owner；已知 bot 和未知 ID 保留为事件参与者，不提供个人授权。首轮身份决策与工具基线按实际 turnId 冻结，后续真人轮次仍按发送者鉴权。显式开启的 lark-cli 应用绑定保持其独立的应用认证规则。
+- **入群自动开工**（`autoStartOnGroupJoin`）：在该开关下方选择「自动开工执行身份」。选择用户后按 Bot 自动默认 → 固定执行用户的优先级执行。两者都未配置时不再关闭或绕过 Bot 的 `triggerUserAuth`：只有经独立真人验证且带有效 union_id 的操作人可作为本轮 provenance；由 bot 邀请、未知操作人或缺少 union_id 时，受按触发人策略管理的工具以 `missing_provenance` fail closed，未受管工具保持各自基线。只有该 Bot 本来就没有开启按触发人策略时，未分配的工具才沿用宿主原生身份。邀请者不会被写成消息 sender、session owner 或固定凭据用户；已知 bot 和未知 ID 只保留为事件参与者。首轮身份决策与工具基线按实际 turnId 冻结，后续真人轮次仍按发送者鉴权。显式开启的 lark-cli 应用绑定保持其独立的应用认证规则。
 - **定时任务**：任务未选择执行用户时使用 Bot 级默认；`automationIdentity` 配置了但不可用时该次 fire 直接失败，不会退回创建者。
 - **Webhook / 外部 trigger**：connector 未选择执行用户时使用 Bot 级默认。HTTP payload、headers、query 仍不能指定执行者。
 
-显式配置的入群身份不可用时仍 fail closed：身份或工具能力校验失败会拒绝本轮开工，个人授权缺失时受管工具拒绝调用，不回退宿主登录。未配置是明确的宿主执行选择，不等于授权失败；包装器只接受 daemon 发布的当轮 host 记录，缺失材料与其它轮次仍拒绝。
+显式配置的入群身份不可用时仍 fail closed：身份或工具能力校验失败会拒绝本轮开工，个人授权缺失时受管工具拒绝调用，不回退宿主登录。未配置表示继续执行 Bot 的正常工具策略：按触发人策略开启时需要上段所述的已验证真人 provenance，否则受管工具拒绝；该策略关闭时才是宿主执行选择。包装器只接受 daemon 发布并冻结的当轮决策，缺失材料与其它轮次仍拒绝。
 
 ## 兼容性迁移（旧 Bot）
 

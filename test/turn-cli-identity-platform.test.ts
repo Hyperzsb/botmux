@@ -48,6 +48,7 @@ const { publishTurnCliIdentity } = await import('../src/core/turn-cli-identity.j
 const { sessionIdentityPath } = await import('../src/core/cli-identity.js');
 const { parseTriggerUserAuthConfig } = await import('../src/services/trigger-user-auth.js');
 const { __setPlatformCredentialDepsForTest, noteInboundSenderUnionId, noteSenderUnionId, UNION_ID_SHARE_MS } = await import('../src/core/platform-credential-source.js');
+const { requestCredentialGrant } = await import('../src/platform/credential-grant-client.js');
 
 const APP = 'cli_bot';
 const ALICE = 'ou_alice';
@@ -472,6 +473,19 @@ describe('union_id lookup sharing', () => {
 });
 
 describe('regional tools with platform grants', () => {
+  it('rejects a larkdev platform grant that contains no regional JWT', async () => {
+    const result = await requestCredentialGrant({
+      tool: 'larkdev', unionId: 'on_alice', appId: APP, sessionId: SESSION, turnId: 'om_empty',
+    }, {
+      binding: BINDING,
+      http: { post: async () => ({ status: 200, json: {
+        ok: true, tool: 'larkdev', unionId: 'on_alice', expiresAt: Date.now() + 60_000,
+        variables: {},
+      } }) },
+    });
+    expect(result).toMatchObject({ ok: false, reason: 'invalid_response' });
+  });
+
   it('publishes only the larkdev sites granted to this human', async () => {
     grantResponse = { ok: true, value: {
       tool: 'larkdev', unionId: 'on_alice', expiresAt: Date.now() + 60_000,

@@ -69,7 +69,11 @@ function workerHostPair(s: ReturnType<typeof fixture>, spawnCliBody: () => Promi
   const pending: Promise<void>[] = [];
   const env: any = { workerSessionEventScope: workerScope, pendingRuntimeReservations: new Map(),
     activeRestartAttemptId: undefined, closeRequested: false, initialInputOwnershipPending: false,
-    spawnCliBody, publishRuntimeContract: vi.fn(), CliSpawnSupersededError: class extends Error {} };
+    spawnCliBody, publishRuntimeContract: vi.fn(), CliSpawnSupersededError: class extends Error {},
+    retryObservedRuntimeBindingAfterRefusal: vi.fn((bindingId: string) => {
+      workerScope.refuseBinding(bindingId);
+      return true;
+    }) };
   const metadata = loadWorkerFunction<(message: any) => any>('sessionEventMetadata', env);
   const receive = loadWorkerFunction<(message: any) => Promise<void>>('handleContractDaemonMessage', env);
   const worker = { send: vi.fn((message: any) => { void receive(message); return true; }) }; s.ds.worker = worker as any;
@@ -217,10 +221,7 @@ describe('replacement reservations are always settled', () => {
     await p.host(p.workerScope.run(p.previous, () => p.metadata({ type: 'claude_exit', code: 1 })));
     expect(p.legacy).toHaveBeenCalledWith(expect.objectContaining({ type: 'claude_exit' }));
   });
-  // BASELINE_FAILURE(1fef331d, 2026-11-11): currentBinding remains the refused
-  // proposed runtime and retryObservedRuntimeBindingAfterRefusal rejects while
-  // reading an absent value. Re-enable when the recovery implementation is fixed.
-  it.skip('releases a binding the host refuses and returns the worker to the surviving runtime', async () => {
+  it('releases a binding the host refuses and returns the worker to the surviving runtime', async () => {
     const s = fixture(); const p = workerHostPair(s);
     const execution = s.controller.admitInput('turn-running'); s.store.bindQueuedExecution(s.ref, execution, s.runtime);
     s.controller.beginControl('cancel', undefined, execution);
@@ -230,6 +231,7 @@ describe('replacement reservations are always settled', () => {
     await p.drain();
     expect(s.store.binding(s.ref, replacement.bindingId)).toMatchObject({ phase: 'stopped', reason: 'runtime_binding_refused' });
     expect(p.worker.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'runtime_binding_refused', bindingId: replacement.bindingId }));
+    expect(p.env.retryObservedRuntimeBindingAfterRefusal).toHaveBeenCalledWith(replacement.bindingId);
     expect(p.workerScope.currentBinding()).toBe(p.previous);
     expect(s.store.hasPendingRuntimeReplacement(s.ref, s.runtime)).toBe(false);
     await p.host(p.workerScope.run(p.previous, () => p.metadata({ type: 'claude_exit', code: 1 })));

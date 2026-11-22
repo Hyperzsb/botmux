@@ -2,7 +2,6 @@ import { isWorkflowNodeSessionMarker, workflowHandoffInputOptions } from './work
 import { deploymentContinuationCandidate, claimDeploymentContinuation, deploymentContinuationClaimCurrent, setDeploymentContinuation } from '../services/deployment-continuation.js';
 import { canTalk } from '../im/lark/event-dispatcher.js';
 import { assertAutomationSession, freezeAutomationTurnUser, resolveAutomationIdentity } from '../services/automation-identity.js';
-import { automationIdentityTools, explicitAutomationIdentityTools } from '../services/automation-identity-config.js';
 import { isSessionGroup, touchSessionGroup } from '../services/session-groups-store.js';
 import { renderStewardHintBlock } from './decision-board/model.js';
 import { buildZeroPromptInput, zeroPromptInjectionForBot, sessionPromptInjection, type PromptInjection } from './prompt-injection.js';
@@ -4640,10 +4639,7 @@ export async function executeScheduledTask(
   const automationIdentitySource: import('../services/automation-identity.js').AutomationIdentitySource =
     delegatedRun ? 'none'
       : automationIdentity?.source ?? 'none';
-  const automationTools = delegatedRun ? undefined
-    : automationIdentitySource === 'task'
-      ? explicitAutomationIdentityTools(bot.config)
-      : automationIdentityTools(bot.config);
+  const automationTools = delegatedRun ? undefined : automationIdentity?.tools;
   if (effectiveRunAsUser) task = { ...task, runAsUser: effectiveRunAsUser };
   if (automationIdentitySource !== 'none') {
     logger.info(

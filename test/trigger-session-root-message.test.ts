@@ -263,9 +263,24 @@ describe('triggerSessionTurn rootMessageId target', () => {
     const result = await triggerSessionTurn(request(), { larkAppId: APP, activeSessions }, { executionUser: user });
     expect(result.ok).toBe(true);
     const ds = activeSessions.get(sessionKey(ROOT, APP))!;
-    expect(ds.session.ownerOpenId).toBe(user.openId);
+    expect(ds.session.ownerOpenId).toBeUndefined();
+    expect(ds.session.ownerUnionId).toBeUndefined();
     expect(mockPrepareExternalTurnIdentity).toHaveBeenCalledWith(ds, result.triggerId);
-    expect(ds.session.replyTargets?.[result.triggerId!].automationUser).toEqual(user);
+    const target = ds.session.replyTargets?.[result.triggerId!];
+    expect(target?.senderOpenId).toBeUndefined();
+    expect(target?.automationUser).toEqual(user);
+    expect(target?.toolIdentityDecision).toMatchObject({
+      v: 1,
+      authority: 'automatic',
+      mode: 'managed_user',
+      source: 'connector',
+      user,
+      tools: ['bytedcli'],
+    });
+    expect(ds.pendingSender).toBeUndefined();
+    expect(ds.pendingTrustedCaller).toMatchObject({
+      requestUserOpenId: user.openId, requestUserUnionId: user.unionId, source: 'automation',
+    });
     expect(mockForkWorker.mock.calls.at(-1)?.[1].trustedCaller).toMatchObject({
       requestUserOpenId: user.openId, requestUserUnionId: user.unionId, source: 'automation',
     });
@@ -273,14 +288,71 @@ describe('triggerSessionTurn rootMessageId target', () => {
       .toBeLessThan(mockForkWorker.mock.invocationCallOrder.at(-1)!);
   });
 
+  it('freezes a host decision for a webhook without fabricating a human actor', async () => {
+    const activeSessions = new Map<string, DaemonSession>();
+
+    const result = await triggerSessionTurn(request(), { larkAppId: APP, activeSessions });
+
+    expect(result.ok).toBe(true);
+    const ds = activeSessions.get(sessionKey(ROOT, APP))!;
+    const target = ds.session.replyTargets?.[result.triggerId!];
+    expect(target).toMatchObject({
+      automationIdentitySource: 'none',
+      toolIdentityDecision: {
+        v: 1,
+        authority: 'automatic',
+        mode: 'host',
+        source: 'none',
+      },
+    });
+    expect(target).not.toHaveProperty('automationUser');
+    expect(target?.senderOpenId).toBeUndefined();
+    expect(ds.session.ownerOpenId).toBeUndefined();
+    expect(ds.session.ownerUnionId).toBeUndefined();
+    expect(ds.pendingSender).toBeUndefined();
+    expect(ds.pendingTrustedCaller).toBeUndefined();
+    expect(mockPrepareExternalTurnIdentity).toHaveBeenCalledWith(ds, result.triggerId);
+    expect(mockForkWorker.mock.calls.at(-1)?.[1].trustedCaller).toBeUndefined();
+  });
+
+  it('freezes a managed denial when a webhook has per-turn policy but no human provenance', async () => {
+    mockGetBot.mockReturnValue({
+      config: {
+        larkAppId: APP, cliId: 'claude-code', workingDir: '/tmp',
+        triggerUserAuth: { enabled: true, tools: ['lark-cli'], fallback: 'none' },
+      },
+      resolvedAllowedUsers: [], resolvedBlockedUsers: [], botName: 'Bot', botOpenId: 'ou_bot',
+    });
+    const activeSessions = new Map<string, DaemonSession>();
+
+    const result = await triggerSessionTurn(request(), { larkAppId: APP, activeSessions });
+
+    expect(result.ok).toBe(true);
+    const target = activeSessions.get(sessionKey(ROOT, APP))!
+      .session.replyTargets?.[result.triggerId!];
+    expect(target?.toolIdentityDecision).toMatchObject({
+      authority: 'automatic', mode: 'denied', source: 'none',
+      tools: ['lark-cli'], failure: 'missing_provenance',
+    });
+    expect(target?.senderOpenId).toBeUndefined();
+    expect(mockForkWorker.mock.calls.at(-1)?.[1].trustedCaller).toBeUndefined();
+  });
+
   it('does not accept an execution identity supplied in the external event data', async () => {
     const req = request();
     req.envelope.payload = { runAsOpenId: 'ou_payload', runAsUser: { larkAppId: APP, openId: 'ou_payload', unionId: 'on_payload' } };
     const activeSessions = new Map<string, DaemonSession>();
-    await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
-    expect(mockPrepareExternalTurnIdentity).not.toHaveBeenCalled();
+    const res = await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
+    expect(res.ok).toBe(true);
+    const ds = activeSessions.get(sessionKey(ROOT, APP));
+    const target = ds?.session.replyTargets?.[res.triggerId!];
+    expect(target?.automationUser).toBeUndefined();
+    expect(target?.toolIdentityDecision).toMatchObject({
+      authority: 'automatic', mode: 'host', source: 'none',
+    });
+    expect(JSON.stringify(target)).not.toContain('ou_payload');
     expect(mockForkWorker.mock.calls.at(-1)?.[1].trustedCaller).toBeUndefined();
-    expect(activeSessions.get(sessionKey(ROOT, APP))?.session.ownerOpenId).toBeUndefined();
+    expect(ds?.session.ownerOpenId).toBeUndefined();
   });
 
   it('keeps the localized topic seed by default', () => {

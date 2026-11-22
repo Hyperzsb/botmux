@@ -36,10 +36,12 @@ import {
   type LarkCliRunner,
 } from '../src/services/lark-cli-auth.js';
 import { sessionTempDir } from '../src/core/session-temp.js';
+import { bumpCliAuthEpoch } from '../src/services/cli-auth-epoch.js';
 
 const APP_ID = 'cli_aa8021c36af9dcde';
 const ALICE = 'ou_larkauth00000000000001';
 const BOB = 'ou_larkauth00000000000002';
+const REVOKED_DURING_COPY = 'ou_larkauth00000000000003';
 // Token filenames contain the personal app's app-scoped open_id, which is
 // deliberately different from the receiving Bot's sender open_id.
 const PERSONAL_OPEN = 'ou_personalapp000000000001';
@@ -355,6 +357,27 @@ describe('begin / complete device flow', () => {
     expect((await beginLarkCliLogin(ALICE))?.authUrl).toBe('https://v/2');
   });
 
+  it('an older successful poll does not clear a replacement login challenge', async () => {
+    provisionPersonalApp();
+    __setLarkCliRunnerForTest(async () => ({
+      ok: true,
+      stdout: JSON.stringify({ verification_url: 'https://v/old', device_code: 'dc-old' }),
+      stderr: '',
+    }));
+    await beginLarkCliLogin(ALICE);
+    __setLarkCliRunnerForTest(async () => {
+      simulateUserToken(ALICE);
+      writeFileSync(join(larkCliHomeFor(ALICE), '.botmux-login-challenge'), JSON.stringify({
+        deviceCode: 'dc-replacement', authUrl: 'https://v/replacement',
+        scopes: [...LARK_CLI_DEVICE_SCOPES], createdAt: Date.now(),
+      }));
+      return { ok: true, stdout: JSON.stringify({ status: 'ok' }), stderr: '' };
+    });
+
+    expect((await completeLarkCliLogin(ALICE, 'dc-old')).state).toBe('authorized');
+    expect(pendingLarkCliChallenge(ALICE)?.deviceCode).toBe('dc-replacement');
+  });
+
   it('returns null when personal app setup produces no trusted setup URL', async () => {
     __setLarkCliAppSetupRunnerForTest(async () => ({
       ok: false, stdout: '', stderr: 'setup failed',
@@ -500,6 +523,25 @@ describe('clear', () => {
     clearLarkCliAuth(ALICE);
     expect(hasLarkCliHome(ALICE)).toBe(false);
     expect(hasLarkCliHome(BOB)).toBe(true); // B untouched
+  });
+});
+
+describe('session HOME materialization revoke race', () => {
+  it('returns no copy when logout advances the auth epoch during verification', async () => {
+    simulateUserToken(REVOKED_DURING_COPY, { personalOpenId: PERSONAL_OPEN_B });
+    const dataDir = join(homeRoot, 'revoked-session-data');
+    const sessionId = 'sess-revoked-copy';
+    const tempRoot = sessionTempDir(dataDir, sessionId);
+    sessionTempRoots.push(tempRoot);
+    __setLarkCliRunnerForTest(async args => {
+      expect(args).toEqual(['auth', 'status', '--json', '--verify']);
+      bumpCliAuthEpoch(REVOKED_DURING_COPY);
+      clearLarkCliAuth(REVOKED_DURING_COPY);
+      return { ok: true, stdout: '{}', stderr: '' };
+    });
+
+    expect(await materializeLarkCliHomeForSession(REVOKED_DURING_COPY, dataDir, sessionId)).toBeNull();
+    expect(existsSync(join(tempRoot, 'lark-cli-home'))).toBe(false);
   });
 });
 

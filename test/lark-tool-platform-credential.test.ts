@@ -63,6 +63,21 @@ describe('policy', () => {
   ])('%j → %s', (tua, expected) => {
     expect(boundLarkPlatformPolicy(bot(tua))).toBe(expected);
   });
+
+  it('uses a valid fixed tool identity source when trigger-user auth is off', () => {
+    const user = { larkAppId: 'cli_bot', openId: 'ou_person', unionId: 'on_person' };
+    expect(boundLarkPlatformPolicy({
+      ...bot(), toolIdentity: { user, tools: ['lark-cli'], credentialSource: 'platform' },
+    })).toBe('platform-only');
+    expect(boundLarkPlatformPolicy({
+      ...bot(), toolIdentity: { user, tools: ['lark-cli'], credentialSource: 'auto' },
+    })).toBe('prefer-bot-app');
+    expect(boundLarkPlatformPolicy({
+      ...bot(),
+      toolIdentity: { user, tools: ['lark-cli'], credentialSource: 'platform' },
+      toolIdentityInvalid: 'foreign_app',
+    })).toBe('off');
+  });
 });
 
 describe('resolveBoundLarkUserCredential', () => {
@@ -70,6 +85,18 @@ describe('resolveBoundLarkUserCredential', () => {
     const { result } = resolve(bot(), null);
     expect(await result).toEqual({ ok: false, reason: 'bot_app_missing' });
     expect(grantCalls).toHaveLength(0);
+  });
+
+  it('a fixed lark-cli identity can require the platform even when trigger-user auth is off', async () => {
+    grantResponse = granted;
+    const user = { larkAppId: 'cli_bot', openId: 'ou_person', unionId: 'on_person' };
+    const fixedBot = {
+      ...bot(), toolIdentity: { user, tools: ['lark-cli'], credentialSource: 'platform' },
+    } as any;
+    const { result, tokenFn } = resolve(fixedBot, 'bot-app-token');
+    expect(await result).toMatchObject({ ok: true, appId: 'cli_platform', issuer: 'platform' });
+    expect(tokenFn).not.toHaveBeenCalled();
+    expect(grantCalls[0]).toMatchObject({ tool: 'lark-cli', unionId: 'on_person' });
   });
 
   it('delegated: asks the platform with the union_id from the dispatch and looks nobody up', async () => {

@@ -149,7 +149,13 @@ export function selectTurnExecutionUser(input: TurnExecutionUserInput): TurnExec
   const canUse = input.canUse ?? (() => true);
   const explicitTools: TriggerUserAuthTool[] = policy.perTurnTools.length
     ? [...policy.perTurnTools]
-    : ['lark-cli'];
+    : policy.fixedBotUser && !isInvalidToolIdentity(policy.fixedBotUser)
+      && policy.fixedBotUser.tools.length
+      ? [...new Set([
+          ...policy.fixedBotUser.tools,
+          ...(policy.larkToolBinding === true ? ['lark-cli' as const] : []),
+        ])]
+      : ['lark-cli'];
   const defaultTools: TriggerUserAuthTool[] = policy.automationDefault
   && !isInvalidAutomationIdentity(policy.automationDefault)
   && policy.automationDefault.tools?.length
@@ -218,9 +224,6 @@ export function selectTurnExecutionUser(input: TurnExecutionUserInput): TurnExec
 export interface ToolCredentialInput {
   larkAppId: string;
   tool: TriggerUserAuthTool;
-  /** Recorded on the decision for audit; does not change per-tool semantics
-   *  beyond what the authority/fact inputs already express. */
-  entry?: ToolIdentityEntry;
   /** Authority class admission established for the whole turn. */
   authority: 'delegated' | 'human' | 'automatic';
   policy: NormalizedToolIdentityPolicy;
@@ -258,14 +261,33 @@ export interface ToolCredentialInput {
 export function selectToolCredential(input: ToolCredentialInput): ToolCredentialDecision {
   const { tool, policy } = input;
 
+  // `undefined` is a legacy/unscoped record; an explicit empty array means
+  // this assignment governs zero tools. Preserve that distinction throughout
+  // freeze/restore so an empty scope can never broaden into every tool.
+  const assignmentApplies = input.turn?.tools === undefined || input.turn.tools.includes(tool);
+  if (assignmentApplies && input.turn?.failure) {
+    return { mode: 'denied', reason: input.turn.failure, source: input.turn.source ?? 'automatic_default' };
+  }
+  const fixed = policy.fixedBotUser;
+
   // An installed binding transport resolves `lark-cli` itself (bot/user roles
   // at call time; its managed route also serves delegated humans). The
   // per-turn publication must not also fire for it.
   if (tool === 'lark-cli' && input.bindingInstalled) {
+    if (!input.turn && input.authority !== 'delegated' && !policy.perTurnTools.includes('lark-cli')
+      && fixed && isInvalidToolIdentity(fixed)) {
+      return { mode: 'denied', reason: 'config_invalid', source: 'automatic_default' };
+    }
+    const user = assignmentApplies && input.turn?.user
+      ? input.turn.user
+      : !input.turn && input.authority !== 'delegated' && !policy.perTurnTools.includes('lark-cli')
+        && fixed && !isInvalidToolIdentity(fixed) && fixed.tools.includes('lark-cli')
+        ? fixed.user
+        : undefined;
     return {
       mode: 'bound_app',
       appId: policy.larkAppId,
-      ...(input.turn?.user ? { user: input.turn.user } : {}),
+      ...(user ? { user } : {}),
     };
   }
 
@@ -289,10 +311,6 @@ export function selectToolCredential(input: ToolCredentialInput): ToolCredential
   // Exclusion skips this ordinary assignment only. Delegated grant scope is
   // handled above and remains a denial; independent sender/fixed policies
   // still apply below.
-  const assignmentApplies = !input.turn?.tools || input.turn.tools.includes(tool);
-  if (assignmentApplies && input.turn?.failure) {
-    return { mode: 'denied', reason: input.turn.failure, source: input.turn.source ?? 'automatic_default' };
-  }
   if (assignmentApplies && input.turn?.user) {
     const source = input.turn.source;
     return {
@@ -318,7 +336,6 @@ export function selectToolCredential(input: ToolCredentialInput): ToolCredential
   // Off | Configured: the fixed bot user assignment governs this tool on
   // ordinary turns (plan §3.2 matrix). A configured-but-broken assignment
   // that would WIN is an error — never a silent native fallback (§3.2 rule 1).
-  const fixed = policy.fixedBotUser;
   if (fixed) {
     if (isInvalidToolIdentity(fixed)) {
       return { mode: 'denied', reason: 'config_invalid', source: 'automatic_default' };

@@ -27,7 +27,12 @@ export interface BackgroundExecutionRegistration {
 
 export function backgroundCredentialPolicyKey(bot: BotConfig): string {
   return computeInputHash({ triggerUserAuth: bot.triggerUserAuth ?? null,
-    larkToolBinding: bot.larkToolBinding === true, apiOnly: bot.apiOnly ?? false });
+    larkToolBinding: bot.larkToolBinding === true,
+    automationIdentity: bot.automationIdentity ?? null,
+    automationIdentityInvalid: bot.automationIdentityInvalid ?? null,
+    toolIdentity: bot.toolIdentity ?? null,
+    toolIdentityInvalid: bot.toolIdentityInvalid ?? null,
+    apiOnly: bot.apiOnly ?? false });
 }
 
 /** Only task definition and authorization belong here. rootMessageId is
@@ -41,6 +46,7 @@ export function backgroundAuthorityKey(task: ScheduledTask): string {
     // Creator/claimant identify the human whose credentials the job may use.
     ownerOpenId: task.ownerOpenId, ownerUnionId: task.ownerUnionId,
     creatorLarkAppId: task.creatorLarkAppId, runAsClaim: task.runAsClaim,
+    runAsUser: task.runAsUser ?? null,
     // Editing work or its scheduling definition requires a new registration.
     prompt: task.prompt, workingDir: task.workingDir, schedule: task.schedule, parsed: task.parsed,
     calendar: task.calendar, calendarDayType: task.calendarDayType,

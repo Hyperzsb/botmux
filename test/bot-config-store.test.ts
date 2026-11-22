@@ -88,6 +88,48 @@ describe('bot-config store', () => {
     return { registry, store, pinStreamingCardChange, sessionGroups };
   }
 
+  it('rejects a foreign-app automation identity without clearing the invalid state', async () => {
+    const existing = {
+      user: { larkAppId: 'cli_other', openId: 'ou_existing', unionId: 'on_existing' },
+      tools: ['bytedcli'],
+    };
+    const { registry, store } = await loaded({ larkAppId: 'cli_default', automationIdentity: existing });
+    const spec = store.findConfigField('automationIdentity')!;
+    const candidate = {
+      user: { larkAppId: 'cli_foreign', openId: 'ou_selected', unionId: 'on_selected' },
+      tools: ['lark-cli'],
+    };
+    const coerced = store.coerceConfigValue(spec, JSON.stringify(candidate));
+    expect(coerced.ok).toBe(true);
+    const before = readFileSync(configPath, 'utf8');
+
+    expect(await store.applyConfigField('cli_default', spec, (coerced as any).value))
+      .toMatchObject({ ok: false, reason: expect.stringContaining('invalid_automation_identity') });
+    expect(readFileSync(configPath, 'utf8')).toBe(before);
+    expect(registry.getBot('cli_default').config.automationIdentityInvalid).toBeTruthy();
+  });
+
+  it('round-trips fixed tool scope and credential source without dropping either', async () => {
+    const { registry, store } = await loaded({ larkAppId: 'cli_default' });
+    const spec = store.findConfigField('toolIdentity')!;
+    expect(spec.effect).toBe('next-session');
+    const selected = {
+      user: { larkAppId: 'cli_default', openId: 'ou_selected', unionId: 'on_selected' },
+      tools: ['bytedcli', 'larkdev'],
+      credentialSource: 'platform',
+    };
+    const coerced = store.coerceConfigValue(spec, JSON.stringify(selected));
+    expect(coerced.ok).toBe(true);
+    expect(await store.applyConfigField('cli_default', spec, (coerced as any).value))
+      .toMatchObject({ ok: true });
+    expect(readConfig().toolIdentity).toMatchObject({
+      tools: ['bytedcli', 'larkdev'], credentialSource: 'platform',
+    });
+    expect(registry.getBot('cli_default').config.toolIdentity).toMatchObject({
+      tools: ['bytedcli', 'larkdev'], credentialSource: 'platform',
+    });
+  });
+
   it('checks a picker model snapshot inside the file lock before writing effort', async () => {
     const { registry, store } = await loaded({ model: 'opus' });
     const { withFileLock } = await import('../src/utils/file-lock.js');

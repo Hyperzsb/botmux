@@ -132,6 +132,11 @@ import {
   STREAMING_CARD_BUTTON_IDS,
   type StreamingCardButtonId,
 } from '../../im/lark/streaming-card-buttons.js';
+import {
+  TRIGGER_USER_AUTH_TOOLS,
+  type TriggerUserAuthCredentialSource,
+  type TriggerUserAuthTool,
+} from '../../services/trigger-user-auth.js';
 
 /** The reasoning-effort selector, its option list and the save payload must all
  *  agree on which CLIs are configurable — they were three separate inline
@@ -4116,7 +4121,10 @@ export function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patc
         // Echo the daemon-normalized selection; it resolves the union id and
         // tool scope server-side, so never trust the local open_id alone.
         setAutomationUser(body?.automationIdentity?.user?.openId ?? '');
-        props.patchBot?.(bot.larkAppId, { automationIdentity: body?.automationIdentity ?? null });
+        props.patchBot?.(bot.larkAppId, {
+          automationIdentity: body?.automationIdentity ?? null,
+          automationIdentityInvalid: null,
+        });
       },
       errorText: res => responseErrorText(res),
     });
@@ -4465,22 +4473,47 @@ function LarkToolBindingSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
   );
 }
 
-function ToolIdentitySection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+function normalizedToolIdentityTools(bot: BotDefaultsRow): TriggerUserAuthTool[] {
+  const configured = bot.toolIdentity?.tools?.filter((tool): tool is TriggerUserAuthTool =>
+    (TRIGGER_USER_AUTH_TOOLS as readonly string[]).includes(tool));
+  return configured?.length ? configured : ['lark-cli'];
+}
+
+function normalizedToolIdentityCredentialSource(bot: BotDefaultsRow): TriggerUserAuthCredentialSource {
+  const source = bot.toolIdentity?.credentialSource;
+  return source === 'local' || source === 'platform' ? source : 'auto';
+}
+
+export function ToolIdentitySection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   const tr = useT();
   const { bot } = props;
   // 固定执行用户：与自动默认同一套用户选择器；保存路径由 daemon 解析 union id。
   const [toolUser, setToolUser] = useState(bot.toolIdentity?.user?.openId ?? '');
+  const [tools, setTools] = useState<TriggerUserAuthTool[]>(normalizedToolIdentityTools(bot));
+  const [credentialSource, setCredentialSource] = useState<TriggerUserAuthCredentialSource>(
+    normalizedToolIdentityCredentialSource(bot),
+  );
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<StatusMessage>(null);
 
   useEffect(() => {
     setToolUser(bot.toolIdentity?.user?.openId ?? '');
+    setTools(normalizedToolIdentityTools(bot));
+    setCredentialSource(normalizedToolIdentityCredentialSource(bot));
   }, [bot.larkAppId, bot.toolIdentity]);
+
+  function toggleTool(tool: TriggerUserAuthTool, checked: boolean): void {
+    setTools(current => checked
+      ? [...new Set([...current, tool])]
+      : current.filter(entry => entry !== tool));
+  }
 
   async function save(): Promise<void> {
     await saveBotField({
       request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/tool-identity`, {
         toolUserOpenId: toolUser || null,
+        toolTools: tools,
+        credentialSource,
       }),
       strict: false,
       setStatus,
@@ -4490,7 +4523,10 @@ function ToolIdentitySection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
         // Echo the daemon-normalized selection; it resolves the union id and
         // tool scope server-side, so never trust the local open_id alone.
         setToolUser(body?.toolIdentity?.user?.openId ?? '');
-        props.patchBot?.(bot.larkAppId, { toolIdentity: body?.toolIdentity ?? null });
+        props.patchBot?.(bot.larkAppId, {
+          toolIdentity: body?.toolIdentity ?? null,
+          toolIdentityInvalid: null,
+        });
       },
       errorText: res => responseErrorText(res),
     });
@@ -4500,14 +4536,43 @@ function ToolIdentitySection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
     <section className="bd-section">
       <h3 className="bd-section-title">{tr('botDefaults.sectionToolIdentity')}</h3>
       <div className="bd-row" data-field="tool-identity">
-        <AutomationUserPicker botId={bot.larkAppId} value={toolUser} onChange={setToolUser} />
-        <small className="schedule-form-help">{tr('botDefaults.toolIdentityHelp')}</small>
+        <AutomationUserPicker botId={bot.larkAppId} value={toolUser} onChange={setToolUser}
+          help={tr('botDefaults.toolIdentityHelp')} />
         {bot.toolIdentityInvalid
-          ? <small role="alert">{tr('botDefaults.automationIdentityInvalid', { reason: bot.toolIdentityInvalid })}</small>
+          ? <small role="alert">{tr('botDefaults.toolIdentityInvalid', { reason: bot.toolIdentityInvalid })}</small>
           : null}
       </div>
+      <div className="bd-row" data-field="tool-identity-tools">
+        <span>{tr('botDefaults.triggerUserAuthTools')}</span>
+        {TRIGGER_USER_AUTH_TOOLS.map(tool => (
+          <label key={tool} className="bd-inline-check">
+            <input
+              type="checkbox"
+              data-action={`tool-identity-tool-${tool}`}
+              checked={tools.includes(tool)}
+              disabled={busy}
+              onChange={event => toggleTool(tool, event.currentTarget.checked)}
+            />
+            <span>{tool}</span>
+          </label>
+        ))}
+      </div>
+      <div className="bd-row" data-field="tool-identity-source">
+        <span>{tr('botDefaults.triggerUserAuthSource')}</span>
+        <select
+          data-action="tool-identity-source"
+          value={credentialSource}
+          disabled={busy}
+          onChange={event => setCredentialSource(event.currentTarget.value as TriggerUserAuthCredentialSource)}
+        >
+          <option value="auto">{tr('botDefaults.triggerUserAuthSourceAuto')}</option>
+          <option value="platform">{tr('botDefaults.triggerUserAuthSourcePlatform')}</option>
+          <option value="local">{tr('botDefaults.triggerUserAuthSourceLocal')}</option>
+        </select>
+      </div>
       <div className="actions">
-        <button type="button" className="primary" data-action="save-tool-identity" disabled={busy} onClick={() => void save()}>
+        <button type="button" className="primary" data-action="save-tool-identity"
+          disabled={busy || (!!toolUser && tools.length === 0)} onClick={() => void save()}>
           {tr('botDefaults.save')}
         </button>
         <StatusSpan status={status} attr={{ 'data-tool-identity-status': '' }} />

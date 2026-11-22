@@ -18,6 +18,7 @@ import {
   claimCardLocation,
   createScheduleIdentityClaims,
   resolveScheduledRunIdentity,
+  scheduledTurnNeedsCreatorProvenance,
   type ScheduleIdentityClaimDeps,
 } from '../src/core/schedule-identity-claim.js';
 import { trustedCallerForScheduledTask } from '../src/core/scheduled-turn-provenance.js';
@@ -194,6 +195,22 @@ describe('resolveScheduledRunIdentity', () => {
       runAsClaim: { ...claim, unionId: 'ou_not_a_union' } };
     expect(resolveScheduledRunIdentity(task, APP, access(ALICE.open, BOB.open)))
       .toMatchObject({ ok: true, openId: ALICE.open, source: 'creator' });
+  });
+});
+
+describe('scheduledTurnNeedsCreatorProvenance', () => {
+  it('consults claims only for a per-turn governed task with no higher-priority assignment', () => {
+    expect(scheduledTurnNeedsCreatorProvenance({ perTurnTools: ['lark-cli'] })).toBe(true);
+    expect(scheduledTurnNeedsCreatorProvenance({
+      runAsUser: { openId: 'ou_explicit' }, perTurnTools: ['lark-cli'],
+    })).toBe(false);
+    expect(scheduledTurnNeedsCreatorProvenance({
+      frozenUser: { openId: 'ou_default' }, frozenSource: 'bot_default', perTurnTools: ['lark-cli'],
+    })).toBe(false);
+    expect(scheduledTurnNeedsCreatorProvenance({
+      frozenSource: 'automatic_default', perTurnTools: ['lark-cli'],
+    })).toBe(false);
+    expect(scheduledTurnNeedsCreatorProvenance({ perTurnTools: [] })).toBe(false);
   });
 });
 

@@ -10,6 +10,7 @@ import type { ScheduleAuthorityRecord } from '../services/schedule-authority-sto
 import { isAutoCompletedSchedule } from '../services/schedule-until-done.js';
 import * as sessionStore from '../services/session-store.js';
 import { readCliAuthEpoch } from '../services/cli-auth-epoch.js';
+import { assertAutomationUserAllowed, type AutomationUser } from '../services/automation-identity.js';
 import { readLinuxBootIdentity, readProcessStartIdentity } from '../utils/process-identity.js';
 import { cleanupBackgroundJobHome } from '../services/bytedcli-home.js';
 import { coordinationModeIsPrimary } from '../services/durable-coordination-runtime.js';
@@ -23,13 +24,20 @@ import { parseScheduledTurnId } from './scheduled-turn-provenance.js';
 import * as scheduler from './scheduler.js';
 import { publishTurnCliIdentity } from './turn-cli-identity.js';
 import { releaseActiveIdentityTurn } from './active-identity-turns.js';
+import { untrackBytedcliIdentityRenewal } from './bytedcli-identity-renewal.js';
 import { larkTransportEnabled, type DaemonSession } from './types.js';
 import { findActiveBySessionId, identityStorageModelForDaemonSession } from './worker-pool.js';
 
 export type DetachedIdentityRouteTool = 'lark-cli' | 'bytedcli' | 'codebase' | 'larkdev';
 export interface AuthorizedScheduledSessionContext {
   ds?: DaemonSession; session: Session; larkAppId: string; chatId: string; botConfig: BotConfig;
-  scheduledTurnId: string; taskId: string; authority: ScheduleAuthorityRecord; runIdentity: ScheduledRunIdentity;
+  scheduledTurnId: string; taskId: string; authority: ScheduleAuthorityRecord;
+  runIdentity: ScheduledRunIdentity | {
+    ok: true;
+    openId: string;
+    unionId: string;
+    source: 'frozen' | 'task';
+  };
 }
 export interface RegisteredBackgroundContext extends AuthorizedScheduledSessionContext { job: BackgroundExecutionRegistration }
 export const BACKGROUND_REGISTRATION_ROUTE = '/api/current-execution-background';
@@ -65,9 +73,28 @@ export function resolveAuthorizedScheduledSession(
     || !scheduleStore.effectiveScheduleChatIds(authority.task).includes(chatId)) return null;
   if (ds?.reportedIdentityModel ? identityStorageModelForDaemonSession(ds) !== 'proven'
     : !automaticallyClosed && readIdentityLayout(sessionDataDir, sessionId) !== 'proven') return null;
+  const explicitIdentity = (
+    user: AutomationUser,
+    source: 'frozen' | 'task',
+  ): AuthorizedScheduledSessionContext['runIdentity'] => {
+    try {
+      assertAutomationUserAllowed(user, larkAppId, chatId);
+      return { ok: true, openId: user.openId, unionId: user.unionId, source };
+    } catch {
+      return { ok: false, reason: 'creator_revoked', lapsedOpenId: user.openId };
+    }
+  };
+  const frozenUser = session.replyTargets?.[scheduledTurnId]?.automationUser;
+  const runIdentity = frozenUser !== undefined
+    ? frozenUser
+      ? explicitIdentity(frozenUser, 'frozen')
+      : { ok: false as const, reason: 'no_creator' as const }
+    : authority.task.runAsUser
+      ? explicitIdentity(authority.task.runAsUser, 'task')
+      : resolveScheduledRunIdentity(authority.task, larkAppId,
+          (openId, unionId) => canOperate(larkAppId, chatId, openId, unionId));
   return { ds, session, larkAppId, chatId, botConfig, scheduledTurnId, taskId, authority,
-    runIdentity: resolveScheduledRunIdentity(authority.task, larkAppId,
-      (openId, unionId) => canOperate(larkAppId, chatId, openId, unionId)) };
+    runIdentity };
 }
 
 /** The new supervisor registers itself before its verified launcher exits. */
@@ -209,6 +236,7 @@ export async function resolveDetachedScheduledExecutionIdentity(input: {
         } finally {
           // This cache is disposable, never an admitted ordinary message turn.
           releaseActiveIdentityTurn(input.sessionDataDir, input.sessionId, turnId);
+          untrackBytedcliIdentityRenewal(input.sessionDataDir, input.sessionId, turnId);
           // A dead-root row may already have been collected while the provider
           // awaited. Its late publication must not recreate orphan job state.
           let stable = false;

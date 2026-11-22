@@ -86,6 +86,25 @@ describe.skipIf(process.platform !== 'linux')('registered scheduled identity', (
     h.ds.managedTurnOrigin.turnId = turn; h.ds.managedTurnOrigin.callerOpenId = 'ou_other';
     expect(registerScheduledBackgroundExecution(input())).toBeNull();
   });
+  it('uses an explicit task run-as identity when the creator has no union id', async () => {
+    h.store.updateTask(app, 'abcd1234', (task: any) => ({
+      ...task,
+      ownerUnionId: undefined,
+      runAsUser: { larkAppId: app, openId: 'ou_runner', unionId: 'on_runner' },
+    }));
+    h.ds.managedTurnOrigin.callerOpenId = 'ou_runner';
+    const job = registerScheduledBackgroundExecution(input());
+    expect(job).toMatchObject({ openId: 'ou_runner', unionId: 'on_runner' });
+
+    h.ds = undefined;
+    h.store.close();
+    h.store = ScheduleAuthorityStore.open(h.root);
+    const identityDir = sessionIdentityDataDir(h.root, 's-bg');
+    mkdirSync(identityDir, { recursive: true });
+    writeFileSync(join(identityDir, 'identity-layout'), 'proven-v1');
+    const resolved = await resolveDetachedScheduledExecutionIdentity(input());
+    expect(resolved?.env).toContain("BOTMUX_IDENTITY_OPEN_ID='ou_runner'");
+  });
   it('refuses persistent engine roots and a process already present before the turn', () => {
     expect(registerScheduledBackgroundExecution({ ...input(), peer: { pid: process.pid,
       procStart: readProcessStartIdentity(process.pid)! } })).toBeNull();
@@ -140,6 +159,27 @@ describe.skipIf(process.platform !== 'linux')('registered scheduled identity', (
       h.jobs = undefined;
       expect(h.store.backgroundExecutions(app, 's-bg')).toEqual([]);
     });
+  it('retires a stored job after the task run-as identity changes', () => {
+    expect(registerScheduledBackgroundExecution(input())).not.toBeNull();
+    h.store.updateTask(app, 'abcd1234', (task: any) => ({
+      ...task,
+      runAsUser: { larkAppId: app, openId: 'ou_runner', unionId: 'on_runner' },
+    }));
+    expect(resolveRegisteredBackgroundContext(input())).toBeNull();
+    expect(h.store.backgroundExecutions(app, 's-bg')).toEqual([]);
+  });
+  it.each(['automationIdentity', 'toolIdentity'] as const)(
+    'retires a stored job after bot %s changes',
+    field => {
+      expect(registerScheduledBackgroundExecution(input())).not.toBeNull();
+      h.bot[field] = {
+        user: { larkAppId: app, openId: 'ou_runner', unionId: 'on_runner' },
+        tools: ['bytedcli'], credentialSource: 'local',
+      };
+      expect(resolveRegisteredBackgroundContext(input())).toBeNull();
+      expect(h.store.backgroundExecutions(app, 's-bg')).toEqual([]);
+    },
+  );
   it('rejects a peer matching two otherwise valid persisted registrations', () => {
     const job = registerScheduledBackgroundExecution(input())!;
     expect(resolveRegisteredBackgroundContext(input())?.job.id).toBe(job.id);

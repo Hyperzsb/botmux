@@ -297,6 +297,7 @@ export function freezeAutomationTurnUser(
   meta?: {
     source?: AutomationIdentitySource;
     tools?: readonly TriggerUserAuthTool[];
+    failure?: import('../core/tool-identity-policy.js').ToolIdentityFailure;
     policy?: NormalizedToolIdentityPolicy;
   },
 ): () => void {
@@ -315,6 +316,7 @@ export function freezeAutomationTurnUser(
       user: user ?? undefined,
       source: meta?.source,
       tools: meta?.tools,
+      failure: meta?.failure,
       ...(meta?.policy ? { policy: meta.policy }
         : ds.larkAppId ? { policy: normalizeToolIdentityPolicy(getBot(ds.larkAppId).config) } : {}),
     }),

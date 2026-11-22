@@ -133,6 +133,7 @@ export function trustedCallerForScheduledTask(
   larkAppId: string,
   executionUser?: AutomationUser | null,
 ): TrustedCaller | undefined {
+  if (executionUser === null) return undefined;
   if (executionUser !== undefined) task = { ...task, runAsUser: executionUser ?? undefined };
   if (task.runAsUser) {
     if (task.runAsUser.larkAppId !== larkAppId) return undefined;
@@ -266,6 +267,7 @@ export function authorizeScheduledTurn(input: {
     : readScheduledTaskForProvenance(input.dataDir, input.sessionLarkAppId, taskId);
   if (!task) return { error: 'task_not_found' };
   if (task.runAsUser && input.executionUser === undefined) return { error: 'task_identity_missing' };
+  if (input.executionUser === null) return { error: 'task_owner_missing' };
   if (input.executionUser !== undefined) task = { ...task, runAsUser: input.executionUser ?? undefined };
   if (task.enabled === false) {
     // A one-shot that ran, or an until-done task closed by its own run, keeps

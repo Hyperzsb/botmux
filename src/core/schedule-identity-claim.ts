@@ -50,6 +50,21 @@ export type ScheduledRunIdentity =
   | { ok: true; openId: string; unionId: string; source: 'claim' | 'creator' }
   | { ok: false; reason: ScheduleIdentityGapReason; lapsedOpenId?: string };
 
+/** Whether a scheduled turn still needs the legacy creator/claim provenance
+ * lane. Explicit task/default assignments and native host mode have already
+ * resolved their authority and must not create a spurious `no_creator` card. */
+export function scheduledTurnNeedsCreatorProvenance(input: {
+  runAsUser?: unknown;
+  frozenUser?: unknown;
+  frozenSource?: string;
+  perTurnTools: readonly unknown[];
+}): boolean {
+  const assignedSource = input.frozenSource === 'task'
+    || input.frozenSource === 'bot_default'
+    || input.frozenSource === 'automatic_default';
+  return !input.runAsUser && !input.frozenUser && !assignedSource && input.perTurnTools.length > 0;
+}
+
 /**
  * The identity a scheduled run of `task` on bot `larkAppId` may act as, or why
  * there is none. The single decision behind both credential publication and

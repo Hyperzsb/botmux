@@ -67,7 +67,11 @@ export interface CredentialGrantClientOptions {
 
 /** Env keys a grant may carry, per tool. Anything else is rejected: the
  *  platform must not be able to inject arbitrary environment into a session. */
-export const GRANT_VARIABLE_KEYS: Record<TriggerUserAuthTool, { required: readonly string[]; optional: readonly string[] }> = {
+export const GRANT_VARIABLE_KEYS: Record<TriggerUserAuthTool, {
+  required: readonly string[];
+  optional: readonly string[];
+  requiredAnyOf?: readonly string[];
+}> = {
   'lark-cli': {
     required: ['LARKSUITE_CLI_APP_ID', 'LARKSUITE_CLI_USER_ACCESS_TOKEN'],
     optional: [],
@@ -75,6 +79,7 @@ export const GRANT_VARIABLE_KEYS: Record<TriggerUserAuthTool, { required: readon
   larkdev: {
     required: [],
     optional: ['BYTECLOUD_CLI_API_JWT_TOKEN_CN', 'BYTECLOUD_CLI_API_JWT_TOKEN_I18N_TT', 'BYTECLOUD_CLI_API_JWT_TOKEN_I18N_BD', 'BYTECLOUD_CLI_API_JWT_TOKEN_EU_TTP', 'BYTECLOUD_CLI_API_JWT_TOKEN_US_TTP'],
+    requiredAnyOf: ['BYTECLOUD_CLI_API_JWT_TOKEN_CN', 'BYTECLOUD_CLI_API_JWT_TOKEN_I18N_TT', 'BYTECLOUD_CLI_API_JWT_TOKEN_I18N_BD', 'BYTECLOUD_CLI_API_JWT_TOKEN_EU_TTP', 'BYTECLOUD_CLI_API_JWT_TOKEN_US_TTP'],
   },
   bytedcli: {
     required: ['BYTEDCLI_USER_CLOUD_JWT'],
@@ -134,6 +139,9 @@ function pickVariables(tool: TriggerUserAuthTool, raw: unknown): Record<string, 
     if (rec[key] === undefined || rec[key] === null || rec[key] === '') continue;
     if (!isSafeValue(rec[key])) return `variable ${key} unsafe`;
     out[key] = rec[key] as string;
+  }
+  if (spec.requiredAnyOf && !spec.requiredAnyOf.some(key => isSafeValue(rec[key]))) {
+    return `at least one of ${spec.requiredAnyOf.join(', ')} is required`;
   }
   const allowed = new Set<string>([...spec.required, ...spec.optional]);
   const extra = Object.keys(rec).filter(k => !allowed.has(k));

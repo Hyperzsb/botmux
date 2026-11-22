@@ -540,7 +540,8 @@ async function publishDelegated(tool: TriggerUserAuthTool, args: PublishTurnIden
       turnId: args.turnId,
     }, stamped);
   }
-  if (localMint && args.turnId && args.storageModel === 'proven' && stamped.tool === 'bytedcli' && !('mode' in stamped)) {
+  if (localMint && args.turnId && args.storageModel === 'proven'
+    && (stamped.tool === 'bytedcli' || stamped.tool === 'larkdev') && !('mode' in stamped)) {
     trackBytedcliIdentityRenewal({
       sessionDataDir: args.sessionDataDir, sessionId: args.sessionId,
       credentialOpenId: user.credentialOpenId, identity: { ...stamped, turnId: args.turnId },
@@ -603,7 +604,8 @@ async function publishOne(
         turnId,
       }, stamped);
     }
-    if (localMint && turnId && storageModel === 'proven' && stamped.tool === 'bytedcli' && !('mode' in stamped)) {
+    if (localMint && turnId && storageModel === 'proven'
+      && (stamped.tool === 'bytedcli' || stamped.tool === 'larkdev') && !('mode' in stamped)) {
       trackBytedcliIdentityRenewal({
         sessionDataDir, sessionId, credentialOpenId: senderOpenId, identity: { ...stamped, turnId },
       });
@@ -627,7 +629,7 @@ async function publishOne(
       if (source === 'auto') {
         try {
           const local = await resolveIdentityFor(tool, botConfig, sessionSandbox, sessionDataDir, sessionId, senderOpenId);
-          if (local) return publish(local, tool === 'bytedcli');
+          if (local) return publish(local, tool === 'bytedcli' || tool === 'larkdev');
         } catch (error) {
           // The platform answer remains authoritative for this attempt. In
           // `auto`, a local store outage must not turn a platform refusal into
@@ -1062,7 +1064,8 @@ async function runTransientRetry(
       }
       writeSessionIdentity(entry.sessionDataDir, entry.sessionId,
         stamped, 'proven');
-      if (resolved.localMint && entry.tool === 'bytedcli' && stamped.tool === 'bytedcli' && !('mode' in stamped)) {
+      if (resolved.localMint && entry.tool === stamped.tool
+        && (stamped.tool === 'bytedcli' || stamped.tool === 'larkdev') && !('mode' in stamped)) {
         trackBytedcliIdentityRenewal({
           sessionDataDir: entry.sessionDataDir, sessionId: entry.sessionId,
           credentialOpenId: entry.credentialOpenId,

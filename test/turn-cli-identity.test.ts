@@ -68,6 +68,7 @@ const { noteSenderUnionId } = await import('../src/core/platform-credential-sour
 const { beginLarkCliLogin } = await import('../src/services/lark-cli-auth.js');
 const { prepareScheduledRecoveryRun } = await import('../src/core/scheduled-send.js');
 const { assertScheduledAuthorityCurrent, isManualScheduleRun, isManualScheduledTurn } = await import('../src/core/scheduled-turn-provenance.js');
+const { forgetBytedcliIdentityRenewals, trackedBytedcliRenewalCount } = await import('../src/core/bytedcli-identity-renewal.js');
 
 const APP = 'cli_bot';
 const ALICE = 'ou_alice';
@@ -77,13 +78,17 @@ const SESSION = 'sess-1';
 let dir: string;
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'botmux-turn-identity-'));
+  forgetBytedcliIdentityRenewals();
   byteCloudJwts.clear();
   larkHomes.clear();
   pendingChallenges.clear();
   resolveLarkCliHomeForTurn.mockClear();
   materializeLarkCliHomeForSession.mockClear();
 });
-afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+afterEach(() => {
+  forgetBytedcliIdentityRenewals();
+  rmSync(dir, { recursive: true, force: true });
+});
 
 function botConfig(triggerUserAuth: unknown = { enabled: true, tools: ['lark-cli'] }) {
   return {
@@ -401,6 +406,7 @@ describe('publishTurnCliIdentity — withholding removes, never inherits', () =>
     const config = botConfig({ enabled: true, tools: ['larkdev'] });
     const first = await publish(config, ALICE, 'turn-alice');
     expect(first.find(o => o.tool === 'larkdev')?.state).toBe('user');
+    expect(trackedBytedcliRenewalCount()).toBe(1);
     expect(identityBody('larkdev', 'turn-alice')).toContain("BYTECLOUD_CLI_API_JWT_TOKEN_CN='alice-cn'");
     expect(identityBody('larkdev', 'turn-alice')).toContain("BYTECLOUD_CLI_API_JWT_TOKEN_US_TTP='alice-us'");
 
@@ -672,7 +678,7 @@ describe('target daemon consumes signed message authority', () => {
     const ts = (await import('typescript')).default;
     const { deliverDispatchWithUser, resolveDispatchUser, dispatchCallerFromReply } = await import('../src/core/dispatch-user-delegation.js');
     const { pickTurnReplyTarget } = await import('../src/core/reply-target.js');
-    const { resolveScheduledRunIdentity } = await import('../src/core/schedule-identity-claim.js');
+    const { resolveScheduledRunIdentity, scheduledTurnNeedsCreatorProvenance } = await import('../src/core/schedule-identity-claim.js');
     const { buildUntilDoneRunPrompt, isAutoCompletedSchedule } = await import('../src/services/schedule-until-done.js');
     const { scheduleTimeZone } = await import('../src/utils/timezone.js');
     const source = ts.createSourceFile('daemon.ts', readFileSync('src/daemon.ts', 'utf8'), ts.ScriptTarget.Latest, true);
@@ -736,7 +742,7 @@ describe('target daemon consumes signed message authority', () => {
       // here because these sessions carry no ordinaryTurnRecovery).
       prepareScheduledRecoveryRun,
       assertScheduledAuthorityCurrent, isManualScheduleRun, isManualScheduledTurn,
-      resolveScheduledRunIdentity,
+      resolveScheduledRunIdentity, scheduledTurnNeedsCreatorProvenance,
       noteScheduledIdentityGap: vi.fn(),
       noteScheduledIdentityRestored: vi.fn(),
       isAutoCompletedSchedule, buildUntilDoneRunPrompt, scheduleTimeZone,
@@ -799,6 +805,10 @@ describe('target daemon consumes signed message authority', () => {
       await h.prepare(turnId);
       expect(identityBody('bytedcli', turnId)).toContain('fixed-execution');
       expect(identityBody('bytedcli', turnId)).not.toContain('sender-execution');
+    }
+    if (entry === 'schedule') {
+      expect(h.scopeValues.noteScheduledIdentityGap).not.toHaveBeenCalled();
+      expect(h.scopeValues.noteScheduledIdentityRestored).not.toHaveBeenCalled();
     }
     h.ds.initConfig = { identityTools: [] };
     const publisher = vi.fn();
@@ -979,6 +989,46 @@ describe('target daemon consumes signed message authority', () => {
     expect(env).not.toContain('creator-bob');
     expect(h.scopeValues.canOperate).toHaveBeenCalledWith(APP, 'oc_chat', ALICE, 'on_alice');
     expect(h.scopeValues.noteScheduledIdentityGap).not.toHaveBeenCalled();
+  });
+
+  it('does not ask for a claimant when an explicit task Run as is already frozen', async () => {
+    const h = await targetHarness();
+    const runAsUser = { larkAppId: APP, openId: ALICE, unionId: 'on_alice' };
+    directSchedule(h, { ownerOpenId: undefined, ownerUnionId: undefined, runAsUser });
+    h.ds.session.replyTargets[firstScheduledTurn] = {
+      automationUser: runAsUser,
+      automationIdentitySource: 'task',
+      automationIdentityTools: ['bytedcli'],
+    };
+    byteCloudJwts.set(ALICE, { cn: 'explicit-run-as' });
+
+    await h.run(firstScheduledTurn);
+
+    expect(identityBody('bytedcli', firstScheduledTurn)).toContain('explicit-run-as');
+    expect(h.scopeValues.noteScheduledIdentityGap).not.toHaveBeenCalled();
+    expect(h.scopeValues.noteScheduledIdentityRestored).not.toHaveBeenCalled();
+  });
+
+  it('does not ask for a claimant when the bot automatic default is already frozen', async () => {
+    const h = await targetHarness();
+    const automaticUser = { larkAppId: APP, openId: ALICE, unionId: 'on_alice' };
+    directSchedule(h, { ownerOpenId: undefined, ownerUnionId: undefined });
+    h.scopeValues.getBot = () => ({ config: {
+      ...botConfig({ enabled: true, tools: ['bytedcli'] }),
+      automationIdentity: { user: automaticUser, tools: ['bytedcli'] },
+    } });
+    h.ds.session.replyTargets[firstScheduledTurn] = {
+      automationUser: automaticUser,
+      automationIdentitySource: 'bot_default',
+      automationIdentityTools: ['bytedcli'],
+    };
+    byteCloudJwts.set(ALICE, { cn: 'bot-default-run-as' });
+
+    await h.run(firstScheduledTurn);
+
+    expect(identityBody('bytedcli', firstScheduledTurn)).toContain('bot-default-run-as');
+    expect(h.scopeValues.noteScheduledIdentityGap).not.toHaveBeenCalled();
+    expect(h.scopeValues.noteScheduledIdentityRestored).not.toHaveBeenCalled();
   });
 
   it.each([

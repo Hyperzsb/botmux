@@ -17,6 +17,10 @@
  */
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
+import {
+  buildAutomaticTurnDecision,
+  toolIdentityDecisionFromReplyTarget,
+} from '../src/core/tool-identity-decision.js';
 
 const workerSource = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
 const workerPoolSource = readFileSync(new URL('../src/core/worker-pool.ts', import.meta.url), 'utf8');
@@ -87,5 +91,22 @@ describe('F3 identity decision wiring (source structure guard)', () => {
       .split(/\n\s*},\n/)[0];
     expect(callback).toContain('handleIdentityDecisionFlip(ds, context).catch');
     expect(callback).not.toMatch(/void\s+handleIdentityDecisionFlip\(ds,\s*context\)\s*;/);
+  });
+});
+
+describe('frozen tool-scope serialization', () => {
+  it('keeps an explicit empty scope distinct from a legacy unscoped record', () => {
+    const empty = buildAutomaticTurnDecision({ source: 'none', tools: [] });
+    const unscoped = buildAutomaticTurnDecision({ source: 'none' });
+
+    expect(empty).toHaveProperty('tools', []);
+    expect(unscoped).not.toHaveProperty('tools');
+    expect(toolIdentityDecisionFromReplyTarget({
+      automationIdentitySource: 'none',
+      automationIdentityTools: [],
+    })).toHaveProperty('tools', []);
+    expect(toolIdentityDecisionFromReplyTarget({
+      automationIdentitySource: 'none',
+    })).not.toHaveProperty('tools');
   });
 });

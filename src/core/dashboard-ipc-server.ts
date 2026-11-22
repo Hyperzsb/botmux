@@ -2,9 +2,10 @@ import { ModelPinBusyError, modelPinClearError } from './model-pin.js';
 import { isSessionEffortChangeInFlight } from './worker-pool.js';
 import { scheduleActiveRuntimePatch } from './worker-pool.js';
 import { botModelPins, clearModelPins } from './model-pin-store.js';
-import { assertAutomationUserPolicy, listAutomationUsers, resolveAutomationUser, resolveFixedToolUser } from '../services/automation-identity.js';
+import { listAutomationUsers, resolveAutomationUser, resolveFixedToolUser } from '../services/automation-identity.js';
 import { automationIdentityTools } from '../services/automation-identity-config.js';
-import { managedSessionCapable } from '../services/tool-identity-config.js';
+import { managedSessionCapable, normalizeToolIdentityPolicy } from '../services/tool-identity-config.js';
+import { selectToolCredential } from './tool-identity-policy.js';
 import { toolIdentityDecisionFromReplyTarget } from './tool-identity-decision.js';
 import { getConnector } from '../services/connector-store.js';
 import { normalizeCodexProfile, scanCodexProfiles, validateCodexProfile, CodexProfileError } from '../services/codex-profiles.js';
@@ -3482,25 +3483,32 @@ function boundLarkToolRequest(req: IncomingMessage, sessionId: string, appId?: s
 }
 
 /** Frozen automation tool boundary for the exact execution-identity turn.
- *  `undefined` = an ordinary human/unscoped turn (no restriction); a defined
- *  array = automation turn, where a missing snapshot fails closed. Managed Lark
- *  bypasses `publishTurnCliIdentity`, so this endpoint must enforce the same
- *  boundary itself. */
+ *  `undefined` = an ordinary human or legacy/unscoped turn; a defined array is
+ *  an explicit automation boundary, including `[]` for zero managed tools.
+ *  Managed Lark bypasses `publishTurnCliIdentity`, so this endpoint must enforce
+ *  the same boundary itself. */
 function automationExecutionToolScope(
-  ds: DaemonSession | undefined,
+  session: Session | undefined,
   identityTurnId: string | undefined,
 ): readonly TriggerUserAuthTool[] | undefined {
-  if (!ds || !identityTurnId) return undefined;
-  const entry = ds.session.replyTargets?.[identityTurnId];
+  if (!session || !identityTurnId) return undefined;
+  const entry = session.replyTargets?.[identityTurnId];
   const decision = toolIdentityDecisionFromReplyTarget(entry);
-  if (decision?.authority === 'automatic') return decision.tools ?? [];
+  if (decision?.authority === 'automatic') return decision.tools;
   // A frozen snapshot is identified by either audit source or tool scope. If
-  // a legacy scope exists without source, still enforce it; a missing tools
-  // array on a known legacy automation turn is fail-closed.
+  // a legacy scope exists without source, still enforce it. A genuinely absent
+  // scope keeps the M3 legacy/unscoped meaning; an explicit [] stays restrictive.
   if (!entry || (entry.automationIdentitySource === undefined && entry.automationIdentityTools === undefined)) {
     return undefined;
   }
-  return entry.automationIdentityTools ?? [];
+  return entry.automationIdentityTools;
+}
+export function automationExecutionToolScopeForExecution(
+  activeSession: Session | undefined,
+  detachedSession: Session | undefined,
+  identityTurnId: string | undefined,
+): readonly TriggerUserAuthTool[] | undefined {
+  return automationExecutionToolScope(activeSession ?? detachedSession, identityTurnId);
 }
 function automationToolScopeExcluded(res: ServerResponse, tool: TriggerUserAuthTool): void {
   jsonRes(res, 403, {
@@ -3656,7 +3664,12 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
   }
   const identityTurnId = liveOrigin?.identityTurnId;
   const identityTurn = identityTurnId ?? turnId;
-  const initialAutomationScope = automationExecutionToolScope(ds, identityTurn);
+  const identitySession = ds?.session ?? detachedForUser?.session;
+  const initialAutomationScope = automationExecutionToolScopeForExecution(
+    ds?.session,
+    detachedForUser?.session,
+    identityTurn,
+  );
   if (initialAutomationScope !== undefined && !initialAutomationScope.includes('lark-cli')) {
     return automationToolScopeExcluded(res, 'lark-cli');
   }
@@ -3669,7 +3682,38 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
   if (delegated && (delegated.denialReason || !delegated.targetOpenId || !delegated.tools.includes('lark-cli'))) {
     return jsonRes(res, 403, { ok: false, error: delegatedError(delegated.denialReason ?? 'target user/tool access unavailable') });
   }
-  const sender = delegated?.targetOpenId ?? originSender;
+  const frozenDecision = toolIdentityDecisionFromReplyTarget(identitySession?.replyTargets?.[identityTurn]);
+  const larkDecision = selectToolCredential({
+    larkAppId: bot.larkAppId,
+    tool: 'lark-cli',
+    policy: normalizeToolIdentityPolicy(bot),
+    bindingInstalled: true,
+    authority: delegated ? 'delegated' : frozenDecision?.authority ?? (detachedForUser ? 'automatic' : 'human'),
+    senderOpenId: originSender,
+    turn: frozenDecision ? {
+      user: frozenDecision.user,
+      source: frozenDecision.source === 'sender' ? 'provenance' : frozenDecision.source,
+      tools: frozenDecision.tools,
+      failure: frozenDecision.failure,
+    } : undefined,
+  });
+  if (larkDecision.mode === 'denied') {
+    return jsonRes(res, 403, { ok: false, error: `tool_identity_${larkDecision.reason}` });
+  }
+  const selectedManagedUser = !delegated && larkDecision.mode === 'bound_app'
+    ? larkDecision.user
+    : undefined;
+  if (selectedManagedUser && (selectedManagedUser.larkAppId !== bot.larkAppId
+    || !selectedManagedUser.unionId?.startsWith('on_')
+    || !canOperate(bot.larkAppId, targetChatId, selectedManagedUser.openId, selectedManagedUser.unionId))) {
+    return jsonRes(res, 403, { ok: false, error: 'tool_identity_access_denied' });
+  }
+  if (selectedManagedUser?.unionId) {
+    noteSenderUnionId(bot.larkAppId, selectedManagedUser.openId, selectedManagedUser.unionId);
+  }
+  const sender = delegated?.targetOpenId
+    ?? selectedManagedUser?.openId
+    ?? originSender;
   if (!sender) {
     const automaticTurn = turnId.startsWith('schedule:')
       || turnId.startsWith('join_') || turnId.startsWith('trg_');
@@ -3693,7 +3737,8 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
   // app's availability range normally excludes them.
   const resolved = await resolveBoundLarkUserCredential({
     bot, openId: sender, sessionId: params.sessionId, turnId, delegated: !!delegated,
-    ...(delegated ? { unionId: delegated.unionId } : {}),
+    ...(delegated ? { unionId: delegated.unionId }
+      : selectedManagedUser?.unionId ? { unionId: selectedManagedUser.unionId } : {}),
     botAppToken: openId => resolveUserToken(bot.larkAppId, bot.larkAppSecret, normalizeBrand(bot.brand), openId),
   });
   const stableAfterAwait = liveOrigin?.turnId
@@ -3714,7 +3759,11 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
   // Re-check the frozen automation boundary AFTER the asynchronous credential
   // resolution: the scope must be unchanged and must still include lark-cli, or
   // a narrower/removed snapshot could leak a token the turn excludes.
-  const currentAutomationScope = automationExecutionToolScope(ds, identityTurn);
+  const currentAutomationScope = automationExecutionToolScopeForExecution(
+    ds?.session,
+    detachedForUser?.session,
+    identityTurn,
+  );
   if (JSON.stringify(currentAutomationScope) !== JSON.stringify(initialAutomationScope)
     || (currentAutomationScope !== undefined && !currentAutomationScope.includes('lark-cli'))) {
     return automationToolScopeExcluded(res, 'lark-cli');
@@ -3861,7 +3910,7 @@ for (const action of ['auth-request', 'auth-status']) {
     const identityTurnId = origin.identityTurnId ?? origin.turnId;
     // `auth-request` / `auth-status` mint or publish lark-cli user material, so
     // they obey the same frozen automation boundary as the identity endpoint.
-    const initialAutomationScope = automationExecutionToolScope(ds, identityTurnId);
+    const initialAutomationScope = automationExecutionToolScope(ds?.session, identityTurnId);
     if (initialAutomationScope !== undefined && !initialAutomationScope.includes('lark-cli')) {
       return automationToolScopeExcluded(res, 'lark-cli');
     }
@@ -3884,7 +3933,7 @@ for (const action of ['auth-request', 'auth-status']) {
       && ds.managedTurnOrigin?.turnId === turnId && ds.managedTurnOrigin?.capability === capability
       && (ds.managedTurnOrigin.identityTurnId ?? ds.managedTurnOrigin.turnId) === identityTurnId
       && ds.managedTurnOrigin?.dispatchAttempt === attempt && requestingUser() === callerOpenId
-      && JSON.stringify(automationExecutionToolScope(ds, identityTurnId)) === JSON.stringify(initialAutomationScope)
+      && JSON.stringify(automationExecutionToolScope(ds?.session, identityTurnId)) === JSON.stringify(initialAutomationScope)
       && JSON.stringify(getLarkToolDelegation(config.session.dataDir, params.sessionId, identityTurnId)) === JSON.stringify(delegated);
     // An accepted grant outlives its originating turn: the daemon-side poll
     // keeps completing the person's credential store while the session/app stay
@@ -7501,6 +7550,7 @@ ipcRoute('PATCH', '/api/schedules/:id', async (req, res, p) => {
   if (body === null || typeof body !== 'object') {
     return jsonRes(res, 400, { ok: false, error: 'body_must_be_object' });
   }
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
   const b = body as Record<string, unknown>;
   const updates: {
     runAsUser?: ScheduledTask['runAsUser'] | null;
@@ -7590,7 +7640,6 @@ ipcRoute('PATCH', '/api/schedules/:id', async (req, res, p) => {
     }
     updates.silent = b.silent;
   }
-  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
   if (b.model !== undefined || b.reasoningEffort !== undefined) {
     // The pairing is judged on the task as it will END UP, so an edit touching
     // only one half is still checked against the other half already stored.
@@ -11489,7 +11538,6 @@ ipcRoute('PUT', '/api/bot-automation-identity', requireBoundBot(async (req, res)
     // nothing is worse than refusing it now. Validate the NEW scope before
     // resolving the user so a stale default tool list cannot block repairing
     // both fields in one request.
-    assertAutomationUserPolicy(cachedLarkAppId, tools as TriggerUserAuthTool[]);
     const user = await resolveAutomationUser(cachedLarkAppId, raw, tools as TriggerUserAuthTool[]);
     if (!user) return jsonRes(res, 400, { ok: false, error: 'invalid_automation_user' });
     const value = {

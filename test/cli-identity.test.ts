@@ -1686,15 +1686,15 @@ printf %s "$?"
 
   it.each([['--as', 'user'], ['--as=user']])('accepts bytedcli explicit user role without replacing the selected credentials: %s', (...args) => {
     const bin = join(dir, 'bytedcli-role-user');
-    writeFileSync(bin, '#!/bin/sh\nprintf "%s|%s|%s" "$BYTECLOUD_AUTH_AS" "$BYTECLOUD_CLI_API_JWT_TOKEN_CN" "$*"\n', { mode: 0o755 });
+    writeFileSync(bin, '#!/bin/sh\nprintf "%s|%s|%s|%s" "$BYTECLOUD_AUTH_AS" "$BYTECLOUD_CLI_API_JWT_TOKEN_CN" "$BOTMUX_IDENTITY_OPEN_ID" "$*"\n', { mode: 0o755 });
     const wrapper = join(dir, 'bytedcli-user-wrapper');
     writeFileSync(wrapper, renderIdentityWrapper('bytedcli', bin), { mode: 0o755 });
     writeSessionIdentity(dir, SESSION, { tool: 'bytedcli', cloudJwts: { cn: 'selected-cn' }, turnId: 'turn-user' });
     publishActiveTurn(dir, SESSION, 'turn-user');
     expect(execFileSync(wrapper, [...args, '--site', 'cn', 'auth', 'status'], {
       encoding: 'utf8', env: { PATH: '/usr/bin:/bin', TMPDIR: dir, SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION,
-        BYTECLOUD_CLI_API_JWT_TOKEN_CN: 'inherited-other' },
-    })).toBe('user|selected-cn|' + [...args, '--site', 'cn', 'auth', 'status'].join(' '));
+        BOTMUX_IDENTITY_OPEN_ID: 'ou_host_owner', BYTECLOUD_CLI_API_JWT_TOKEN_CN: 'inherited-other' },
+    })).toBe('user|selected-cn||' + [...args, '--site', 'cn', 'auth', 'status'].join(' '));
   });
 
   it('refuses a bytedcli site whose turn JWT is missing and names the exact login command', () => {
@@ -1778,7 +1778,7 @@ printf %s "$?"
 
   it.each([
     ['--control-plane', /control plane 参数缺少值/],
-    ['--plane=UNKNOWN', /不支持为 larkdev control plane UNKNOWN/],
+    ['--plane=UNKNOWN', /不支持为 larkdev control plane unknown/],
   ])('refuses an unusable larkdev control-plane selector: %s', (selector, expected) => {
     const marker = join(dir, 'real-ran');
     const bin = join(dir, 'larkdev-real');
@@ -1798,6 +1798,38 @@ printf %s "$?"
       },
     })).toThrow(expected);
     expect(existsSync(marker)).toBe(false);
+  });
+
+  it('normalizes a mixed-case larkdev control plane before selecting its JWT', () => {
+    const bin = join(dir, 'larkdev-eu-real');
+    writeFileSync(bin, '#!/bin/sh\nprintf "%s|%s" "$BYTECLOUD_CLI_API_JWT_TOKEN_EU_TTP" "$*"\n', { mode: 0o755 });
+    const wrapper = join(dir, 'larkdev-eu-wrapper');
+    writeFileSync(wrapper, renderIdentityWrapper('larkdev', bin), { mode: 0o755 });
+    writeSessionIdentity(dir, SESSION, {
+      tool: 'larkdev', cloudJwts: { 'eu-ttp': 'alice-eu' }, turnId: 'turn-eu',
+    });
+    publishActiveTurn(dir, SESSION, 'turn-eu');
+
+    expect(execFileSync(wrapper, ['--plane', 'EU-TTP', 'auth', 'status'], {
+      encoding: 'utf8',
+      env: { PATH: '/usr/bin:/bin', TMPDIR: dir, SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION },
+    })).toBe('alice-eu|--plane EU-TTP auth status');
+  });
+
+  it('does not interpret larkdev-looking arguments after the option terminator', () => {
+    const bin = join(dir, 'larkdev-terminator-real');
+    writeFileSync(bin, '#!/bin/sh\nprintf "%s|%s" "$BYTECLOUD_CLI_API_JWT_TOKEN_CN" "$*"\n', { mode: 0o755 });
+    const wrapper = join(dir, 'larkdev-terminator-wrapper');
+    writeFileSync(wrapper, renderIdentityWrapper('larkdev', bin), { mode: 0o755 });
+    writeSessionIdentity(dir, SESSION, {
+      tool: 'larkdev', cloudJwts: { cn: 'alice-cn' }, turnId: 'turn-terminator',
+    });
+    publishActiveTurn(dir, SESSION, 'turn-terminator');
+
+    expect(execFileSync(wrapper, ['cmd', '--', '--plane', 'invalid'], {
+      encoding: 'utf8',
+      env: { PATH: '/usr/bin:/bin', TMPDIR: dir, SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION },
+    })).toBe('alice-cn|cmd -- --plane invalid');
   });
 
   it('runs larkdev with only this turn JWTs and a fresh auth directory', () => {

@@ -154,7 +154,7 @@ describe('authorizeScheduledTurn', () => {
     expect(authorizeScheduledTurn({
       turnId: TURN_ID, dataDir, sessionLarkAppId: appId, sessionChatId: chatId,
       executionUser: null, isOwnerAllowed: allow,
-    })).toMatchObject({ ownerOpenId: owner });
+    })).toEqual({ error: 'task_owner_missing' });
   });
 
   it('rejects a run snapshot scoped to another bot', () => {
@@ -392,7 +392,7 @@ describe('trustedCallerForScheduledTask', () => {
     });
     expect(task.ownerOpenId).toBe('ou_creator');
     expect(trustedCallerForScheduledTask(task, 'cli_other')).toBeUndefined();
-    expect(trustedCallerForScheduledTask(task, 'cli_target', null)?.requestUserOpenId).toBe('ou_creator');
+    expect(trustedCallerForScheduledTask(task, 'cli_target', null)).toBeUndefined();
   });
 
   const base = {

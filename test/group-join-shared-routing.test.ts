@@ -657,7 +657,9 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
     mocks.forkWorker.mockReturnValueOnce(true);
     mocks.listChatMemberOpenIds.mockResolvedValue(['ou_owner']);
     // Positive human evidence, as a real inviter who has messaged this bot has.
-    identities.recordIdentity(appId, { openId: 'ou_owner', type: 'user', source: 'sender' });
+    identities.recordIdentity(appId, {
+      openId: 'ou_owner', unionId: 'on_owner', type: 'user', source: 'sender',
+    });
     registry.registerBot({
       larkAppId: appId, larkAppSecret: 's', cliId: 'claude-code',
       allowedUsers: ['ou_owner'], autoStartOnGroupJoin: true,
@@ -670,13 +672,18 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
     expect(mocks.publishTurnCliIdentity).toHaveBeenCalledWith(expect.objectContaining({
       turnId: 'om_join_seed',
       senderOpenId: 'ou_owner',
-      decision: expect.objectContaining({ mode: 'host', baseline: expect.objectContaining({ perTurnTools: [] }) }),
+      decision: expect.objectContaining({
+        mode: 'managed_user',
+        source: 'provenance',
+        user: { larkAppId: appId, openId: 'ou_owner', unionId: 'on_owner' },
+        baseline: expect.objectContaining({ perTurnTools: ['lark-cli', 'bytedcli', 'larkdev'] }),
+      }),
     }));
     expect(mocks.forkWorker).toHaveBeenCalledOnce();
     expect(daemon.__testOnly_activeSessions.get(types.sessionKey(chatId, appId))).toBeDefined();
   });
 
-  it.each(['shared', 'chat', 'topic'] as const)('unconfigured %s opening freezes host execution without trusting an unknown inviter', async (mode) => {
+  it.each(['shared', 'chat', 'topic'] as const)('unconfigured %s opening freezes a managed denial for an unknown inviter', async (mode) => {
     const { daemon, registry, types } = modules;
     const appId = `app_join_host_${mode}`;
     const chatId = `oc_join_host_${mode}`;
@@ -694,13 +701,43 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
     expect(ds).toBeDefined();
     const target = Object.values(ds!.session.replyTargets ?? {})[0]!;
     expect(target.senderOpenId).toBeUndefined();
-    expect(target.participants).toEqual([{ openId: 'ou_unknown_inviter' }]);
     expect(target.toolIdentityDecision).toMatchObject({
-      authority: 'automatic', mode: 'host', source: 'none', baseline: { perTurnTools: [] },
+      authority: 'automatic', mode: 'denied', source: 'none', failure: 'missing_provenance',
+      baseline: { perTurnTools: ['lark-cli', 'bytedcli', 'larkdev'] },
     });
     expect(mocks.publishTurnCliIdentity).toHaveBeenCalledWith(expect.objectContaining({
       senderOpenId: undefined, decision: target.toolIdentityDecision,
     }));
+    expect(mocks.forkWorker).toHaveBeenCalledOnce();
+  });
+
+  it('unconfigured opening freezes a managed denial for a known bot inviter under per-turn auth', async () => {
+    const { daemon, registry, identities, types } = modules;
+    const appId = 'app_join_managed_bot_denied';
+    const chatId = 'oc_join_managed_bot_denied';
+    const operator = 'ou_automation_bot';
+    identities.recordIdentity(appId, {
+      openId: operator, type: 'bot', source: 'sender', name: 'Automation',
+    });
+    registry.registerBot({
+      larkAppId: appId, larkAppSecret: 's', cliId: 'traex', allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true, defaultWorkingDir: tempDir('managed-bot-denied'),
+      regularGroupReplyMode: 'shared',
+      triggerUserAuth: { enabled: true, tools: ['lark-cli', 'bytedcli', 'larkdev'], fallback: 'none' },
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, operator, appId);
+
+    const ds = daemon.__testOnly_activeSessions.get(types.sessionKey(chatId, appId));
+    expect(ds).toBeDefined();
+    const target = Object.values(ds!.session.replyTargets ?? {})[0]!;
+    expect(target.toolIdentityDecision).toMatchObject({
+      authority: 'automatic', mode: 'denied', source: 'none', failure: 'missing_provenance',
+    });
+    expect(mocks.publishTurnCliIdentity).toHaveBeenCalledWith(expect.objectContaining({
+      senderOpenId: undefined, decision: target.toolIdentityDecision,
+    }));
+    expect(mocks.forkWorker).toHaveBeenCalledOnce();
   });
 
   it.each(['shared', 'chat', 'topic'] as const)('freezes a fixed execution user on the %s opening', async (mode) => {

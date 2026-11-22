@@ -48,6 +48,7 @@ vi.mock('node:child_process', () => ({
 let auth: typeof import('../src/services/bytedcli-auth.js');
 let identity: typeof import('../src/core/cli-identity.js');
 let renewal: typeof import('../src/core/bytedcli-identity-renewal.js');
+let activeTurns: typeof import('../src/core/active-identity-turns.js');
 const SESSION = 'adversarial-session';
 const TURN = 'adversarial-turn';
 const ALICE = 'ou_alice';
@@ -55,6 +56,7 @@ const jwt = (seconds: number, tag: string) => `e30.${Buffer.from(JSON.stringify(
 function publish(seconds = 1200, tag = 'original', turnId = TURN) {
   const grant = { tool: 'bytedcli' as const, cloudJwt: jwt(seconds, tag), codeJwt: 'code', openId: ALICE, turnId };
   identity.writeSessionIdentity(home, SESSION, grant, 'proven');
+  activeTurns.registerActiveIdentityTurn(home, SESSION, turnId);
   renewal.trackBytedcliIdentityRenewal({ sessionDataDir: home, sessionId: SESSION, credentialOpenId: ALICE, identity: grant });
   return grant;
 }
@@ -66,6 +68,7 @@ beforeEach(async () => {
   auth = await import('../src/services/bytedcli-auth.js');
   identity = await import('../src/core/cli-identity.js');
   renewal = await import('../src/core/bytedcli-identity-renewal.js');
+  activeTurns = await import('../src/core/active-identity-turns.js');
   mkdirSync(auth.bytedcliHomeFor(ALICE), { recursive: true });
   writeFileSync(join(auth.bytedcliHomeFor(ALICE), 'authorized'), '{}');
   calls.length = 0; active = 0; maxActive = 0; cloudNumber = 0; defaultDelayMs = 1;
@@ -74,6 +77,7 @@ afterEach(() => {
   vi.restoreAllMocks();
   vi.useRealTimers();
   identity.forgetProvenIdentityContent(home, SESSION);
+  activeTurns.clearActiveIdentityTurns(home, SESSION);
   renewal.forgetBytedcliIdentityRenewals();
   rmSync(home, { recursive: true, force: true });
 });

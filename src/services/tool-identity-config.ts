@@ -302,6 +302,12 @@ export function wrapperIdentityTools(config: {
   toolIdentityInvalid?: string;
 }): TriggerUserAuthTool[] {
   const tools = new Set<TriggerUserAuthTool>();
+  if (config.toolIdentityInvalid !== undefined) {
+    // A retained-but-invalid assignment has lost its trustworthy scope. Install
+    // every managed wrapper so the later fail-closed decision cannot leak an
+    // unwrapped host credential for whichever tool the broken config intended.
+    return [...TRIGGER_USER_AUTH_TOOLS];
+  }
   if (config.triggerUserAuth?.enabled) {
     for (const tool of config.triggerUserAuth.tools ?? TRIGGER_USER_AUTH_DEFAULT_TOOLS) tools.add(tool);
   }
@@ -346,34 +352,6 @@ export function senderLoginTools(
 ): TriggerUserAuthTool[] {
   return TRIGGER_USER_AUTH_TOOLS.filter(tool =>
     senderToolCredentialSource(config, senderOpenId, tool) !== undefined);
-}
-
-/**
- * Effective automatic-default tool scope for the normalized policy (the same
- * precedence `automationIdentityTools` encodes, read off the normalized
- * shape): the explicit default's tools, then the per-turn tools, then the
- * managed lark binding alone.
- */
-export function normalizedAutomaticTools(policy: {
-  automationDefault: AutomationIdentitySetting | null;
-  perTurnTools: readonly TriggerUserAuthTool[];
-}): TriggerUserAuthTool[] {
-  if (policy.automationDefault && !isInvalidAutomationIdentity(policy.automationDefault)
-    && policy.automationDefault.tools?.length) {
-    return [...policy.automationDefault.tools];
-  }
-  if (policy.perTurnTools.length) return [...policy.perTurnTools];
-  return ['lark-cli'];
-}
-
-/**
- * Tool scope for an explicit task/connector Run as: it follows the bot's
- * ordinary per-turn policy, never the automatic default's narrower list.
- */
-export function normalizedExplicitTools(policy: {
-  perTurnTools: readonly TriggerUserAuthTool[];
-}): TriggerUserAuthTool[] {
-  return normalizedAutomaticTools({ ...policy, automationDefault: null });
 }
 
 /** Re-export so callers of the normalized layer need no second import path. */

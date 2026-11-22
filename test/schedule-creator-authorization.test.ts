@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { authorizeOwnerlessScheduleCreator, authorizeScheduleOperator,
   isScheduleOperatorAuthorization, requireScheduleCreatorUnionId,
   requireScheduleOperatorAuthorization } from '../src/core/schedule-creator-authorization.js';
+import { trustedCallerForScheduledTask } from '../src/core/scheduled-turn-provenance.js';
 
 describe('ownerless schedule creator authorization', () => {
   const base = { callerOpenId: 'ou_owner', allowedUsers: ['on_owner'], resolutionCache: { on_owner: 'ou_owner' }, resolvedAllowedUsers: ['ou_owner'] };
@@ -57,5 +58,15 @@ describe('same-app schedule operator admission', () => {
     expect(() => requireScheduleOperatorAuthorization(undefined)).toThrow('upgrade the owning daemon');
     expect(() => requireScheduleOperatorAuthorization({ ok: false, error: 'caller_not_allowed' })).toThrow('not an allowed bot operator');
     expect(() => requireScheduleOperatorAuthorization({ ok: true })).not.toThrow();
+  });
+});
+
+describe('explicitly frozen ownerless scheduled turns', () => {
+  it('never substitutes the creator after execution identity was frozen to null', () => {
+    const task = {
+      id: 'task-ownerless', ownerOpenId: 'ou_creator', ownerUnionId: 'on_creator',
+      creatorLarkAppId: 'cli_creator',
+    } as any;
+    expect(trustedCallerForScheduledTask(task, 'cli_session', null)).toBeUndefined();
   });
 });

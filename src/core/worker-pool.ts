@@ -975,6 +975,7 @@ import {
   parseScheduledTurnId,
   trustedCallerForScheduledTask,
 } from './scheduled-turn-provenance.js';
+import { automationTrustedCaller } from '../services/automation-identity.js';
 import { scheduledSessionRun } from './scheduled-send.js';
 import { inheritActiveTurnFinalSuppression, isTriggerFinalSuppressed } from './trigger-final-suppression.js';
 import { writeDeferredTopicBinding } from './deferred-topic-binding.js';
@@ -996,6 +997,10 @@ import {
   clearActiveIdentityTurns,
   releaseActiveIdentityTurn,
 } from './active-identity-turns.js';
+import {
+  untrackBytedcliIdentityRenewal,
+  untrackSessionBytedcliIdentityRenewals,
+} from './bytedcli-identity-renewal.js';
 import { clearAllSessionIdentities, collectProvenIdentityContents } from './cli-identity.js';
 import {
   identityBindingAllowsProven,
@@ -3056,13 +3061,16 @@ export function ensureOrdinaryTurnRecoveryAttached(
         sessionStore.updateSession(ds.session);
         return callbacks?.prepareRawInputTurn?.(ds, dispatch.turnId);
       }
-      if (!scheduledTaskId) return;
       const prior = ds.session.replyTargets?.[dispatch.logicalTurnId];
-      const snapshot = prior?.automationUser;
-      if (snapshot !== undefined) {
+      const frozenAutomatic = !!scheduledTaskId
+        || prior?.automationUser !== undefined
+        || prior?.toolIdentityDecision !== undefined;
+      if (!frozenAutomatic) return;
+      if (prior) {
         ds.session.replyTargets ??= {};
         ds.session.replyTargets[dispatch.turnId] = { ...ds.session.replyTargets[dispatch.turnId],
-          automationUser: snapshot,
+          ...(prior.automationUser !== undefined
+            ? { automationUser: prior.automationUser } : {}),
           // The versioned decision is part of the frozen identity: a recovery
           // re-dispatch replays the SAME admitted decision, not a re-derivation.
           ...(prior?.toolIdentityDecision !== undefined
@@ -3078,16 +3086,19 @@ export function ensureOrdinaryTurnRecoveryAttached(
     },
     enqueue: (dispatch: OrdinaryTurnRecoveryDispatch) => {
       if (!ordinaryTurnRecoveryEligible(ds) || !ordinaryTurnRecoveryStillOwnsSession(ds)) return false;
-      // A scheduled logical turn continues as the same scheduled turn: same
-      // task prefix on the id (minted above), the task creator as trustedCaller,
-      // and the fire's silent flag carried over so a silent task's continuation
-      // stays silent. Ordinary IM turns take none of this and keep their
-      // inherited reply context alone.
+      // A scheduled logical turn keeps its task prefix, creator and silent
+      // flag. Other automatic turns keep their frozen execution user; ordinary
+      // IM turns take neither automatic authority nor scheduled metadata.
       const scheduledTaskId = parseScheduledTurnId(dispatch.logicalTurnId);
       const appRecovery = isCodexAppCliId(sessionCliId(ds, botCfg));
+      const prior = ds.session.replyTargets?.[dispatch.logicalTurnId];
       const trustedCaller = scheduledTaskId
         ? scheduledContinuationTrustedCaller(ds, scheduledTaskId, dispatch.turnId)
-        : appRecovery ? codexAppRecoveryCaller(ds.session, ds.larkAppId, dispatch.logicalTurnId) : undefined;
+        : appRecovery
+          ? codexAppRecoveryCaller(ds.session, ds.larkAppId, dispatch.logicalTurnId)
+          : prior?.automationUser
+            ? automationTrustedCaller(prior.automationUser)
+            : undefined;
       if (appRecovery && !trustedCaller) return false;
       // Silence comes from the frozen per-turn attribute in the persisted
       // state, not from the runtime registry (which a daemon restart empties).
@@ -11243,6 +11254,10 @@ async function closeSessionBody(
   // Trigger-user credentials die with the session. These files hold a live user
   // token, so a closed session must not leave one on disk for a future session
   // (or an operator inspecting the data dir) to pick up.
+  // Retire in-memory renewals first: filesystem cleanup is best-effort and a
+  // failure in its first step must not leave a closed session on the timer.
+  try { untrackSessionBytedcliIdentityRenewals(config.session.dataDir, sessionId); }
+  catch { /* best-effort; absence is the desired state */ }
   try {
     clearAllSessionIdentities(config.session.dataDir, sessionId);
     clearActiveIdentityTurns(config.session.dataDir, sessionId);
@@ -22067,9 +22082,11 @@ function setupWorkerHandlers(
         // (envelope=B executes as A); release that retained anchor here too —
         // GC re-pins it if any still-live origin references the same id.
         releaseActiveIdentityTurn(config.session.dataDir, msg.sessionId, msg.turnId);
+        untrackBytedcliIdentityRenewal(config.session.dataDir, msg.sessionId, msg.turnId);
         const terminalIdentityTurn = ds.managedTurnOrigin?.identityTurnId;
         if (terminalIdentityTurn && terminalIdentityTurn !== msg.turnId) {
           releaseActiveIdentityTurn(config.session.dataDir, msg.sessionId, terminalIdentityTurn);
+          untrackBytedcliIdentityRenewal(config.session.dataDir, msg.sessionId, terminalIdentityTurn);
         }
         collectSessionTurnGarbage(ds);
         break;

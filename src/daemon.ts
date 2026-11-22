@@ -634,7 +634,11 @@ import { fetchRemoteSecretarySessions, fetchRemoteSecretaryTranscript, listSecre
 import { listSecretaryWatches } from './services/group-secretary-watch-store.js';
 import { publishTurnCliIdentity, trackTurnIdentityPublication, type DelegatedCliIdentity } from './core/turn-cli-identity.js';
 import { clearSingleIdentityArtifacts, forgetProvenIdentityContent } from './core/cli-identity.js';
-import { BYTEDCLI_RENEWAL_SWEEP_MS, renewExpiringBytedcliIdentities } from './core/bytedcli-identity-renewal.js';
+import {
+  BYTEDCLI_RENEWAL_SWEEP_MS,
+  renewExpiringBytedcliIdentities,
+  untrackSessionBytedcliIdentityRenewals,
+} from './core/bytedcli-identity-renewal.js';
 import { isLarkToolBound, type IdentityStorageModel } from './core/lark-tool-binding.js';
 import { getLarkToolDelegation } from './core/lark-tool-delegation.js';
 import { noteInboundSenderUnionId, noteSenderUnionId } from './core/platform-credential-source.js';
@@ -664,7 +668,7 @@ import {
   type ScheduledSendSettlement,
 } from './core/scheduled-send.js';
 import { markScheduleRunLogDelivered } from './services/schedule-run-log-store.js';
-import { claimCardLocation, createScheduleIdentityClaims, resolveScheduledRunIdentity, type ScheduledRunIdentity } from './core/schedule-identity-claim.js';
+import { claimCardLocation, createScheduleIdentityClaims, resolveScheduledRunIdentity, scheduledTurnNeedsCreatorProvenance, type ScheduledRunIdentity } from './core/schedule-identity-claim.js';
 import { TRIGGER_USER_AUTH_TOOLS, delegatesOnMention } from './services/trigger-user-auth.js';
 import { triggerSessionTurn, reconcileIdempotencyLeasesOnBoot, convergeIdempotentAsyncTurnOnWorkerExit, externalEventOpensOwnTopic } from './core/trigger-session.js';
 import {
@@ -4631,6 +4635,7 @@ async function handleIdentityDecisionFlip(
     clearSingleIdentityArtifacts(config.session.dataDir, ds.session.sessionId);
   } else {
     forgetProvenIdentityContent(config.session.dataDir, ds.session.sessionId);
+    untrackSessionBytedcliIdentityRenewals(config.session.dataDir, ds.session.sessionId);
   }
   // Re-check liveness AFTER the purge: an identity turn that terminated in the
   // meantime must stay purged with no replay (and no success record, so a
@@ -4736,18 +4741,34 @@ async function prepareScheduledTurnCliIdentity(ds: DaemonSession, turnId: string
     || !scheduleStore.effectiveScheduleChatIds(task).includes(ds.chatId)) {
     throw new Error('scheduled turn target does not match its authority');
   }
-  // The claimant from the claim card, else the creator (scheduledTaskRunAs).
-  // open_id is app-scoped. Ownerless/legacy tasks and people whose access was
-  // removed receive a denial, even if this session once held valid tokens.
-  const identity = resolveScheduledRunIdentity(task, ds.larkAppId,
-    (openId, unionId) => canOperate(ds.larkAppId, ds.chatId, openId, unionId));
-  const senderOpenId = identity.ok ? identity.openId : undefined;
-  // A scheduled run has no inbound event to learn the union_id from; the host
-  // authority recorded it with the creator or the claim.
-  if (identity.ok) {
-    noteSenderUnionId(ds.larkAppId, identity.openId, identity.unionId);
-    noteScheduledIdentityRestored(ds, task, turnId, identity);
-  } else noteScheduledIdentityGap(ds, task, turnId, identity);
+  const frozenUser = frozenDecision?.user;
+  if (task.runAsUser) {
+    // Explicit Run as is already the authority for this turn. Keep the union-id
+    // cache warm even when lark-cli is app-bound, but never ask the creator
+    // claim subsystem to manufacture a second principal.
+    noteSenderUnionId(ds.larkAppId, task.runAsUser.openId, task.runAsUser.unionId);
+  } else if (frozenUser?.unionId) {
+    noteSenderUnionId(ds.larkAppId, frozenUser.openId, frozenUser.unionId);
+  }
+  const creatorProvenanceRequired = scheduledTurnNeedsCreatorProvenance({
+    runAsUser: task.runAsUser,
+    frozenUser,
+    frozenSource: frozenDecision?.source,
+    perTurnTools: publicationPolicy.perTurnTools,
+  });
+  let senderOpenId = task.runAsUser?.openId ?? frozenUser?.openId;
+  if (creatorProvenanceRequired) {
+    // Only the provenance class consults the claimant/creator record. Host
+    // mode and higher-priority explicit/default assignments neither need nor
+    // emit a no_creator claim card.
+    const identity = resolveScheduledRunIdentity(task, ds.larkAppId,
+      (openId, unionId) => canOperate(ds.larkAppId, ds.chatId, openId, unionId));
+    senderOpenId = identity.ok ? identity.openId : undefined;
+    if (identity.ok) {
+      noteSenderUnionId(ds.larkAppId, identity.openId, identity.unionId);
+      noteScheduledIdentityRestored(ds, task, turnId, identity);
+    } else noteScheduledIdentityGap(ds, task, turnId, identity);
+  }
   await publishTurnCliIdentity({
     botConfig,
     policy: publicationPolicy,
@@ -28110,9 +28131,12 @@ async function handleBotAdded(
     // automation/bot operator.
     const cachedHuman = cachedOperator?.type === 'user'
       && ['sender', 'message_api', 'contact_api'].includes(cachedOperator.source ?? '');
-    const operatorIsHuman = !!operatorOpenId && !operatorIsBot
-      && (cachedHuman
-        || !!(await resolveVerifiedUserIdentity(larkAppId, operatorOpenId).catch(() => undefined)));
+    const verifiedHumanOperator = operatorOpenId && !operatorIsBot
+      ? (cachedHuman
+          ? cachedOperator
+          : await resolveVerifiedUserIdentity(larkAppId, operatorOpenId).catch(() => undefined))
+      : undefined;
+    const operatorIsHuman = !!verifiedHumanOperator;
     const humanOperatorOpenId = operatorIsHuman ? operatorOpenId : undefined;
     if (!forced) {
       const groupJoinGate = await evaluatePromptGate('chat.bot_added', {
@@ -28184,18 +28208,28 @@ async function handleBotAdded(
     // seed's reply target) carries a real execution identity. A configured but
     // invalid/revoked default is fail-closed: it must not fall through to the
     // inviter or the session owner.
-    // Group-entry defaults to native host execution. The event actor is never
-    // an implicit Run as selection, even when independently verified human.
-    // Explicit automatic/fixed assignments retain their existing precedence
-    // and fail-closed capability/access checks.
-    const joinHasAssignment = !!(botCfg.automationIdentity || botCfg.automationIdentityInvalid
-      || botCfg.toolIdentity || botCfg.toolIdentityInvalid);
-    const joinIdentityConfig = joinHasAssignment ? botCfg
-      : { ...botCfg, triggerUserAuth: undefined };
+    // Group entry uses the same per-tool policy as every automatic turn. A
+    // verified human operator with a union id may supply provenance; bot or
+    // unknown operators never do. Per-turn-on without either an assignment or
+    // that provenance is a managed denial, never host fallback (plan §3.2).
+    const joinIdentityConfig = botCfg;
+    const joinIdentityPolicy = normalizeToolIdentityPolicy(joinIdentityConfig);
+    const verifiedOperatorUnionId = verifiedHumanOperator && 'unionId' in verifiedHumanOperator
+      ? verifiedHumanOperator.unionId
+      : (humanOperatorOpenId ? getIdentity(larkAppId, humanOperatorOpenId)?.unionId : undefined);
     const joinAutomation = resolveAutomationIdentity({
       appId: larkAppId,
       chatId,
       config: joinIdentityConfig,
+      ...(operatorIsHuman && humanOperatorOpenId
+        && verifiedOperatorUnionId?.startsWith('on_')
+        ? { provenance: {
+            larkAppId,
+            openId: humanOperatorOpenId,
+            unionId: verifiedOperatorUnionId,
+            ...(verifiedHumanOperator.name ? { name: verifiedHumanOperator.name } : {}),
+          } }
+        : {}),
     });
     if (joinAutomation.failure) {
       // Refuse auto-start rather than dispatch a turn with no enforceable
@@ -28210,6 +28244,9 @@ async function handleBotAdded(
       return;
     }
     const joinAutomationUser = joinAutomation.user;
+    const joinMissingProvenance = !joinAutomationUser
+      && joinAutomation.source === 'none'
+      && joinIdentityPolicy.perTurnTools.length > 0;
     if (joinAutomationUser) groupJoinTrustedCaller = automationTrustedCaller(joinAutomationUser);
     // No automation default: a positively verified human inviter is the next
     // supported provenance. This deliberately does not depend on the lifecycle
@@ -28343,7 +28380,8 @@ async function handleBotAdded(
       freezeAutomationTurnUser(ds, turnId, joinAutomationUser ?? null, {
         source: joinAutomation.source,
         tools: joinAutomation.tools,
-        policy: normalizeToolIdentityPolicy(joinIdentityConfig),
+        ...(joinMissingProvenance ? { failure: 'missing_provenance' as const } : {}),
+        policy: joinIdentityPolicy,
       });
       sessionStore.updateSession(ds.session);
     };

@@ -739,3 +739,28 @@ it('shows the persisted fixed user on an offline bot with the same shape as a li
   const payload = botDefaultsPayload(raw, sparseOverridesFromRawBotConfig(raw));
   expect(payload.toolIdentity).toEqual({ user, tools: ['lark-cli'], credentialSource: 'platform' });
 });
+
+it('keeps invalid offline identity configs in dedicated recovery fields, never valid fields', () => {
+  const foreign = { larkAppId: 'cli_other', openId: 'ou_foreign', unionId: 'on_foreign' };
+  const raw = {
+    larkAppId: 'cli_test',
+    automationIdentity: { user: foreign, tools: ['lark-cli'] },
+    toolIdentity: { defaultUser: foreign, tools: ['bytedcli'], credentialSource: 'local' },
+  };
+  const overrides = sparseOverridesFromRawBotConfig(raw);
+  expect(overrides).toMatchObject({
+    automationIdentity: null,
+    automationIdentityInvalid: expect.stringContaining('does not match this bot'),
+    toolIdentity: null,
+    toolIdentityInvalid: expect.stringContaining('does not match this bot'),
+  });
+  const payload = botDefaultsPayload(raw, overrides);
+  expect(payload).toMatchObject({
+    automationIdentity: null,
+    automationIdentityInvalid: expect.stringContaining('does not match this bot'),
+    toolIdentity: null,
+    toolIdentityInvalid: expect.stringContaining('does not match this bot'),
+  });
+  expect(JSON.stringify(payload.automationIdentity)).not.toContain('invalid');
+  expect(JSON.stringify(payload.toolIdentity)).not.toContain('invalid');
+});

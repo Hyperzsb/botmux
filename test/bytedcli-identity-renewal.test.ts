@@ -11,7 +11,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 const renew = vi.fn();
-vi.mock('../src/services/bytedcli-auth.js', () => ({ renewBytedcliJwts: (openId: string) => renew(openId) }));
+vi.mock('../src/services/bytedcli-auth.js', () => ({
+  renewBytedcliJwts: (openId: string, site?: string) => site === undefined ? renew(openId) : renew(openId, site),
+}));
 
 const {
   trackBytedcliIdentityRenewal,
@@ -19,7 +21,9 @@ const {
   forgetBytedcliIdentityRenewals,
   trackedBytedcliRenewalCount,
   bytedcliIdentityExpiryMs,
+  untrackBytedcliIdentityRenewal,
 } = await import('../src/core/bytedcli-identity-renewal.js');
+const { registerActiveIdentityTurn, releaseActiveIdentityTurn, clearActiveIdentityTurns } = await import('../src/core/active-identity-turns.js');
 const {
   writeSessionIdentity,
   publishedIdentityShape,
@@ -49,6 +53,7 @@ function publish(cloudExp: number, i18nExp: number) {
     openId: ALICE,
   };
   writeSessionIdentity(dir, SESSION, identity, 'proven');
+  registerActiveIdentityTurn(dir, SESSION, TURN);
   trackBytedcliIdentityRenewal({ sessionDataDir: dir, sessionId: SESSION, credentialOpenId: ALICE, identity });
   return identity;
 }
@@ -60,6 +65,7 @@ beforeEach(() => {
 });
 afterEach(() => {
   forgetProvenIdentityContent(dir, SESSION);
+  clearActiveIdentityTurns(dir, SESSION);
   rmSync(dir, { recursive: true, force: true });
 });
 
@@ -128,6 +134,113 @@ describe('bytedcli identity renewal', () => {
     expect(await renewExpiringBytedcliIdentities()).toBe(0);
     expect(recallProvenIdentityContent(dir, SESSION, TURN, 'bytedcli')).toContain(identity.regionalCloudJwts.i18n);
     expect(trackedBytedcliRenewalCount()).toBe(1);
+  });
+
+  it('evicts a terminal turn and never renews its retained proven material', async () => {
+    publish(7200, 20 * 60);
+    releaseActiveIdentityTurn(dir, SESSION, TURN);
+    renew.mockResolvedValue({ cloudJwt: jwt('cn', 7200, 'must-not-run') });
+    expect(await renewExpiringBytedcliIdentities()).toBe(0);
+    expect(renew).not.toHaveBeenCalled();
+    expect(trackedBytedcliRenewalCount()).toBe(0);
+
+    publish(7200, 20 * 60);
+    untrackBytedcliIdentityRenewal(dir, SESSION, TURN);
+    expect(trackedBytedcliRenewalCount()).toBe(0);
+  });
+
+  it('backs off a failed site while refreshing regional JWTs from successful sites', async () => {
+    const now = Date.now();
+    const identity = {
+      tool: 'bytedcli' as const,
+      cloudJwts: {
+        cn: jwt('cn', 10 * 60, 'cn-old'),
+        'i18n-bd': jwt('i18n-bd', 10 * 60, 'bd-old'),
+      },
+      regionalCloudJwts: { i18n: jwt('i18n', 10 * 60, 'region-old') },
+      turnId: TURN,
+      openId: ALICE,
+    };
+    writeSessionIdentity(dir, SESSION, identity, 'proven');
+    registerActiveIdentityTurn(dir, SESSION, TURN);
+    trackBytedcliIdentityRenewal({ sessionDataDir: dir, sessionId: SESSION, credentialOpenId: ALICE, identity });
+    const freshBd = jwt('i18n-bd', 7200, 'bd-fresh');
+    const freshRegion = jwt('i18n', 7200, 'region-fresh');
+    renew.mockImplementation(async (_openId: string, site?: string) => {
+      if (site === 'cn') throw new Error('cn temporarily unavailable');
+      return { cloudJwt: freshBd, regionalCloudJwts: { i18n: freshRegion } };
+    });
+
+    expect(await renewExpiringBytedcliIdentities(() => now)).toBe(1);
+    expect(renew.mock.calls.map(call => call[1])).toEqual(['cn', 'i18n-bd']);
+    const body = recallProvenIdentityContent(dir, SESSION, TURN, 'bytedcli')!;
+    expect(body).toContain(freshBd);
+    expect(body).toContain(freshRegion);
+    expect(body).toContain(identity.cloudJwts.cn);
+
+    renew.mockClear();
+    expect(await renewExpiringBytedcliIdentities(() => now + 60_000)).toBe(0);
+    expect(renew).not.toHaveBeenCalled();
+  });
+
+  it('lets a failed-site retry deadline govern an expired regional JWT', async () => {
+    const now = Date.now();
+    const identity = {
+      tool: 'bytedcli' as const,
+      cloudJwts: {
+        cn: jwt('cn', 10 * 60, 'cn-old'),
+        'i18n-bd': jwt('i18n-bd', 10 * 60, 'bd-old'),
+      },
+      // The regional token has no site provenance. A successful site that
+      // returns no regional material must not be hammered while another site
+      // is in backoff and may be the only source able to replace it.
+      regionalCloudJwts: { i18n: jwt('i18n', 10 * 60, 'region-old') },
+      turnId: TURN,
+      openId: ALICE,
+    };
+    writeSessionIdentity(dir, SESSION, identity, 'proven');
+    registerActiveIdentityTurn(dir, SESSION, TURN);
+    trackBytedcliIdentityRenewal({ sessionDataDir: dir, sessionId: SESSION, credentialOpenId: ALICE, identity });
+    renew.mockImplementation(async (_openId: string, site?: string) => {
+      if (site === 'cn') throw new Error('cn temporarily unavailable');
+      return { cloudJwt: jwt('i18n-bd', 7200, `bd-fresh-${renew.mock.calls.length}`), codeJwt: 'code-fresh' };
+    });
+
+    // First failure gets 5m backoff; at its boundary a second failure gets 15m.
+    expect(await renewExpiringBytedcliIdentities(() => now)).toBe(1);
+    expect(await renewExpiringBytedcliIdentities(() => now + 5 * 60_000)).toBe(1);
+    expect(renew.mock.calls.map(call => call[1])).toEqual(['cn', 'i18n-bd', 'cn', 'i18n-bd']);
+    expect(recallProvenIdentityContent(dir, SESSION, TURN, 'bytedcli'))
+      .toContain(identity.regionalCloudJwts.i18n);
+
+    renew.mockClear();
+    expect(await renewExpiringBytedcliIdentities(() => now + 10 * 60_000)).toBe(0);
+    expect(await renewExpiringBytedcliIdentities(() => now + 15 * 60_000)).toBe(0);
+    expect(renew).not.toHaveBeenCalled();
+
+    // The failed site's 15m retry boundary, not the unrelated regional token,
+    // re-enables both site refreshes.
+    expect(await renewExpiringBytedcliIdentities(() => now + 20 * 60_000)).toBe(1);
+    expect(renew.mock.calls.map(call => call[1])).toEqual(['cn', 'i18n-bd']);
+  });
+
+  it('renews and explicitly untracks a locally minted larkdev turn', async () => {
+    const identity = {
+      tool: 'larkdev' as const,
+      cloudJwts: { cn: jwt('cn', 10 * 60, 'larkdev-old') },
+      turnId: TURN,
+      openId: ALICE,
+    };
+    writeSessionIdentity(dir, SESSION, identity, 'proven');
+    registerActiveIdentityTurn(dir, SESSION, TURN);
+    trackBytedcliIdentityRenewal({ sessionDataDir: dir, sessionId: SESSION, credentialOpenId: ALICE, identity });
+    const fresh = jwt('cn', 7200, 'larkdev-fresh');
+    renew.mockResolvedValueOnce({ cloudJwt: fresh });
+
+    expect(await renewExpiringBytedcliIdentities()).toBe(1);
+    expect(recallProvenIdentityContent(dir, SESSION, TURN, 'larkdev')).toContain(fresh);
+    untrackBytedcliIdentityRenewal(dir, SESSION, TURN);
+    expect(trackedBytedcliRenewalCount()).toBe(0);
   });
 
   it('drops the entry once the turn material is collected, without resurrecting it', async () => {
